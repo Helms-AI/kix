@@ -1,10 +1,14 @@
 //! Multi-backend embedding system with GPU acceleration support.
 //!
 //! This module provides a unified interface for different embedding backends:
-//! - **FastEmbed**: Default CPU-based backend (fast, no dependencies)
+//! - **Ollama**: Default backend using local Ollama server (GPU auto-detection)
 //! - **ONNX Runtime**: High-performance backend with GPU support (CUDA/Metal)
+//! - **FastEmbed**: CPU-based fallback backend
 
 mod traits;
+
+#[cfg(feature = "ollama-backend")]
+pub mod ollama;
 
 #[cfg(feature = "fastembed-backend")]
 pub mod fastembed;
@@ -44,7 +48,9 @@ impl std::fmt::Display for AccelerationMode {
 /// Available embedding backends
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
-    /// FastEmbed backend (CPU-only, default)
+    /// Ollama backend (default, GPU auto-detection)
+    Ollama,
+    /// FastEmbed backend (CPU-only fallback)
     FastEmbed,
     /// ONNX Runtime backend (supports GPU)
     OnnxRuntime,
@@ -53,6 +59,7 @@ pub enum BackendType {
 impl std::fmt::Display for BackendType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BackendType::Ollama => write!(f, "Ollama"),
             BackendType::FastEmbed => write!(f, "FastEmbed"),
             BackendType::OnnxRuntime => write!(f, "ONNX Runtime"),
         }
@@ -62,14 +69,34 @@ impl std::fmt::Display for BackendType {
 /// Creates the best available embedding backend based on features and hardware.
 ///
 /// Selection priority:
-/// 1. ONNX Runtime with CUDA (if cuda feature enabled and GPU available)
-/// 2. ONNX Runtime with Metal (if coreml feature enabled on Apple Silicon)
-/// 3. ONNX Runtime CPU (if onnx-backend feature enabled)
-/// 4. FastEmbed CPU (default fallback)
+/// 1. Ollama (if ollama-backend feature enabled and Ollama server is reachable)
+/// 2. ONNX Runtime with CUDA (if cuda feature enabled and GPU available)
+/// 3. ONNX Runtime with Metal (if coreml feature enabled on Apple Silicon)
+/// 4. ONNX Runtime CPU (if onnx-backend feature enabled)
+/// 5. FastEmbed CPU (fallback)
 pub fn create_best_backend(config: Option<BackendConfig>) -> Result<Box<dyn EmbeddingBackend>, EmbeddingError> {
     let config = config.unwrap_or_default();
 
-    // Try ONNX with CUDA first
+    // Try Ollama first (if enabled and available)
+    #[cfg(feature = "ollama-backend")]
+    {
+        if ollama::OllamaBackend::is_available() {
+            info!("Ollama detected - attempting Ollama backend");
+            match ollama::OllamaBackend::new(config.clone()) {
+                Ok(backend) => {
+                    info!("Ollama backend initialized successfully");
+                    return Ok(Box::new(backend));
+                }
+                Err(e) => {
+                    warn!("Failed to initialize Ollama backend: {}, falling back to other backends", e);
+                }
+            }
+        } else {
+            info!("Ollama not available at configured host, trying other backends");
+        }
+    }
+
+    // Try ONNX with CUDA
     #[cfg(feature = "onnx-cuda")]
     {
         if cuda_available() {
@@ -139,6 +166,18 @@ pub fn create_backend(backend_type: BackendType, config: Option<BackendConfig>) 
     let config = config.unwrap_or_default();
 
     match backend_type {
+        #[cfg(feature = "ollama-backend")]
+        BackendType::Ollama => {
+            let backend = ollama::OllamaBackend::new(config)?;
+            Ok(Box::new(backend))
+        }
+        #[cfg(not(feature = "ollama-backend"))]
+        BackendType::Ollama => {
+            Err(EmbeddingError::NoBackendAvailable(
+                "Ollama backend not available. Enable 'ollama-backend' feature.".to_string()
+            ))
+        }
+
         #[cfg(feature = "fastembed-backend")]
         BackendType::FastEmbed => {
             let backend = fastembed::FastEmbedBackend::new(config)?;

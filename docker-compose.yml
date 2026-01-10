@@ -1,6 +1,51 @@
 services:
+  # Ollama - Local LLM/Embedding server with GPU acceleration
+  # Automatically uses Metal (macOS) or CUDA (NVIDIA) when available
+  ollama:
+    image: ollama/ollama:latest
+    container_name: kix-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persist downloaded models
+      - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    # Uncomment for NVIDIA GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # Model setup job - pulls nomic-embed-text on first run
+  # Run with: docker compose run --rm ollama-setup
+  ollama-setup:
+    image: ollama/ollama:latest
+    container_name: kix-ollama-setup
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling nomic-embed-text model..."
+        ollama pull nomic-embed-text
+        echo "Model pull complete!"
+    profiles:
+      - setup
+
   # Kix API Server - serves REST API for the dashboard
-  # Uses ONNX Runtime backend with BGE-base embeddings (768 dimensions)
+  # Uses Ollama backend with nomic-embed-text embeddings (768 dimensions)
   kix-api:
     build:
       context: .
@@ -14,26 +59,30 @@ services:
     volumes:
       # Persist LanceDB data
       - kix-lancedb-data:/app/data/lancedb
-      # Persist ONNX model cache (BGE embeddings ~400MB)
+      # Persist model cache (fallback for non-Ollama backends)
       - kix-model-cache:/app/cache
     environment:
       - RUST_LOG=info
       - KIX_DB_PATH=/app/data/lancedb
       - KIX_API_PORT=3001
-      # ONNX embedding model configuration
-      - KIX_EMBEDDING_MODEL=${KIX_EMBEDDING_MODEL:-bge-base-en-v1.5}
-      - KIX_EMBEDDING_DIM=${KIX_EMBEDDING_DIM:-768}
-      # Cache directory for models
+      # Ollama embedding configuration (primary)
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=nomic-embed-text
+      - KIX_EMBEDDING_DIM=768
+      # Cache directory for fallback models
       - XDG_CACHE_HOME=/app/cache
       # Performance settings
       - MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000
     command: ["kix", "api", "--port", "3001", "--db-path", "/app/data/lancedb"]
+    depends_on:
+      ollama:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s  # Allow time for model download on first run
+      start_period: 30s
     restart: unless-stopped
 
   # React Dashboard served by nginx
@@ -64,33 +113,21 @@ services:
     environment:
       - RUST_LOG=info
       - KIX_DB_PATH=/app/data/lancedb
-      - KIX_EMBEDDING_MODEL=${KIX_EMBEDDING_MODEL:-bge-base-en-v1.5}
-      - KIX_EMBEDDING_DIM=${KIX_EMBEDDING_DIM:-768}
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=nomic-embed-text
+      - KIX_EMBEDDING_DIM=768
       - XDG_CACHE_HOME=/app/cache
       - MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000
     command: ["kix", "stats", "--db-path", "/app/data/lancedb"]
+    depends_on:
+      ollama:
+        condition: service_healthy
     profiles:
       - tools
 
-  # Model setup job (run with: docker compose run --rm kix-setup)
-  kix-setup:
-    build:
-      context: .
-      dockerfile: server/Dockerfile
-      args:
-        TARGET_CPU: ${TARGET_CPU:-x86-64-v3}
-    container_name: kix-setup
-    volumes:
-      - kix-model-cache:/app/cache
-    environment:
-      - RUST_LOG=info
-      - KIX_EMBEDDING_MODEL=${KIX_EMBEDDING_MODEL:-bge-base-en-v1.5}
-      - XDG_CACHE_HOME=/app/cache
-    command: ["kix", "setup"]
-    profiles:
-      - setup
-
 volumes:
+  ollama-models:
+    driver: local
   kix-lancedb-data:
     driver: local
   kix-model-cache:

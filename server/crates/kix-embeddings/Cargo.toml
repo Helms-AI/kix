@@ -6,8 +6,9 @@ license.workspace = true
 description = "Embedding generation and auto-tagging for Knowledge Indexer"
 
 [features]
-default = ["onnx-backend"]
-# Backend selection
+default = ["ollama-backend"]
+# Backend selection (Ollama is now the default - fast, local, GPU-accelerated)
+ollama-backend = ["reqwest"]
 fastembed-backend = ["fastembed"]
 onnx-backend = ["ort", "ureq", "dirs", "tokenizers"]
 onnx-cuda = ["onnx-backend", "ort/cuda"]
@@ -37,6 +38,10 @@ tokenizers = { version = "0.20", optional = true }
 # Keyword extraction for auto-tagging
 keyword_extraction = { version = "1.5", features = ["rake", "tf_idf"] }
 stop-words = "0.8"
+
+# HTTP client for Ollama backend
+reqwest = { version = "0.12", features = ["json", "blocking"], optional = true }
+serde_json = "1.0"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
