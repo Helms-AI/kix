@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kix-parser",
+    "crates/kix-embeddings",
+    "crates/kix-store",
+    "crates/kix-mcp",
+    "crates/kix-api",
+    "crates/kix-cli",
+    "crates/kix-sse",
+    "crates/kix-crawler",
+    "crates/kix-jobs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Knowledge Indexer"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# MCP
+rmcp = { version = "0.12", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+
+# HTML parsing
+scraper = "0.22"
+
+# PDF parsing
+pdf-extract = "0.7"
+
+# Embeddings
+fastembed = "5"
+
+# Vector database
+lancedb = "0.23"
+arrow-array = "56"
+arrow-schema = "56"
+
+# Web API
+axum = { version = "0.7", features = ["macros"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+# SSE and streaming
+tokio-stream = "0.1"
+futures-util = "0.3"
+
+# HTTP client for crawling
+reqwest = { version = "0.12", features = ["json", "stream", "cookies"] }
+
+# Job management
+dashmap = "6.1"
+crossbeam-queue = "0.3"
+
+# Persistence
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros"] }
+
+# URL handling
+url = "2.5"
+
+# Rate limiting
+governor = "0.6"
+
+# Browser automation (for JS rendering)
+playwright = "0.0.20"
+
+# Document parsing extensions
+calamine = "0.26"  # Excel parsing
+pulldown-cmark = "0.12"  # Markdown parsing
+csv = "1.3"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+glob = "0.3"
+indicatif = "0.17"
+
+# Memory allocator for better performance
+jemallocator = "0.5"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4"] }
+sha2 = "0.10"
+regex = "1.0"
+futures = "0.3"
+async-trait = "0.1"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }

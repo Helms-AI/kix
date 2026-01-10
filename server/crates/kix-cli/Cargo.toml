@@ -1,0 +1,32 @@
+[package]
+name = "kix-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for Knowledge Indexer"
+
+[[bin]]
+name = "kix"
+path = "src/main.rs"
+
+[dependencies]
+kix-parser = { path = "../kix-parser" }
+kix-embeddings = { path = "../kix-embeddings" }
+kix-store = { path = "../kix-store" }
+kix-mcp = { path = "../kix-mcp" }
+kix-api = { path = "../kix-api" }
+kix-jobs = { path = "../kix-jobs" }
+kix-sse = { path = "../kix-sse" }
+kix-crawler = { path = "../kix-crawler" }
+rmcp.workspace = true
+axum.workspace = true
+clap.workspace = true
+glob.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+jemallocator.workspace = true

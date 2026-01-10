@@ -1,0 +1,33 @@
+[package]
+name = "kix-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "REST API for Knowledge Indexer dashboard"
+
+[dependencies]
+kix-store = { path = "../kix-store" }
+kix-embeddings = { path = "../kix-embeddings" }
+kix-parser = { path = "../kix-parser" }
+kix-sse = { path = "../kix-sse" }
+kix-jobs = { path = "../kix-jobs" }
+kix-crawler = { path = "../kix-crawler" }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower-http.workspace = true
+tokio.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = { workspace = true }
+futures-util = { workspace = true }
+base64 = "0.22"
+moka = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+axum-test = "16"

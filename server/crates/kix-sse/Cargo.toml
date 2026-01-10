@@ -1,0 +1,36 @@
+[package]
+name = "kix-sse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Server-Sent Events for Knowledge Indexer"
+
+[dependencies]
+# Core dependencies
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures-util = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+dashmap = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = "0.5"
+http-body-util = "0.1"
+hyper = "1.5"

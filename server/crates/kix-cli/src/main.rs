@@ -1,0 +1,767 @@
+//! EIP CLI - Command-line interface for the EIP Knowledge System.
+
+// Use jemalloc as the global allocator for better performance
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use glob::glob;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::{error, info};
+
+use kix_api::{create_router, create_indexing_router, AppState, IndexingState};
+use kix_crawler::file_handler::FileHandler;
+use kix_embeddings::{DocumentChunker, EmbeddingGenerator, ensure_setup, is_setup, model_cache_dir};
+use kix_jobs::{JobExecutor, ExecutorConfig, JobQueue, QueueConfig};
+use kix_mcp::KixMcpServer;
+use kix_parser::{HtmlParser, PdfParser};
+use kix_sse::ConnectionManager;
+use kix_store::search::SearchFilters;
+use kix_store::KixStore;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::StreamableHttpService;
+
+#[derive(Parser)]
+#[command(name = "eip")]
+#[command(about = "Enterprise Integration Patterns Knowledge System", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+
+    /// Path to LanceDB database
+    #[arg(long, default_value = "./data/lancedb")]
+    db_path: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Index all content from the source directory
+    Index {
+        /// Path to content directory
+        #[arg(long)]
+        content_path: PathBuf,
+
+        /// Rebuild index from scratch
+        #[arg(long)]
+        rebuild: bool,
+    },
+
+    /// Start the MCP server (stdio transport)
+    Serve,
+
+    /// Start the MCP server over HTTP (streamable HTTP transport at /mcp)
+    ServeHttp {
+        /// Port to listen on
+        #[arg(short, long, default_value = "3002")]
+        port: u16,
+
+        /// Host to bind to
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+    },
+
+    /// Start the REST API for the dashboard
+    Api {
+        /// Port to listen on
+        #[arg(short, long, default_value = "3001")]
+        port: u16,
+    },
+
+    /// Test search from command line
+    Search {
+        /// Search query
+        query: String,
+
+        /// Number of results
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+
+        /// Search type: semantic, text, or hybrid
+        #[arg(short, long, default_value = "hybrid")]
+        search_type: String,
+
+        /// Filter by pattern type (messaging, conversation)
+        #[arg(long)]
+        pattern_type: Option<String>,
+    },
+
+    /// Show indexing statistics
+    Stats,
+
+    /// Create search indexes on existing data
+    CreateIndexes,
+
+    /// Download and setup embedding models
+    Setup {
+        /// Model name to download (default: bge-base-en-v1.5)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Force re-download even if model exists
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("eip=info".parse().unwrap()),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    let db_path_str = cli.db_path.to_string_lossy().to_string();
+
+    match cli.command {
+        Commands::Index {
+            content_path,
+            rebuild,
+        } => {
+            run_index(&db_path_str, &content_path, rebuild).await?;
+        }
+        Commands::Serve => {
+            run_serve(&db_path_str).await?;
+        }
+        Commands::ServeHttp { port, host } => {
+            run_serve_http(&db_path_str, &host, port).await?;
+        }
+        Commands::Api { port } => {
+            run_api(&db_path_str, port).await?;
+        }
+        Commands::Search {
+            query,
+            limit,
+            search_type,
+            pattern_type,
+        } => {
+            run_search(&db_path_str, &query, limit, &search_type, pattern_type).await?;
+        }
+        Commands::Stats => {
+            run_stats(&db_path_str).await?;
+        }
+        Commands::CreateIndexes => {
+            run_create_indexes(&db_path_str).await?;
+        }
+        Commands::Setup { model, force } => {
+            run_setup(model, force).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Index content from the source directory.
+async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Result<()> {
+    info!("Starting indexing...");
+    println!("Indexing content from: {:?}", content_path);
+    println!("Database path: {}", db_path);
+    println!("Rebuild: {}", rebuild);
+
+    // Auto-setup: download models if not present
+    auto_setup()?;
+
+    // Initialize embedder
+    println!("\nInitializing embedding model...");
+    let mut embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
+    println!("Embedding model initialized.");
+
+    // Initialize store
+    println!("\nInitializing database...");
+    let mut store = KixStore::new(db_path)
+        .await
+        .context("Failed to open database")?;
+
+    if rebuild {
+        println!("Rebuilding index from scratch...");
+        store
+            .clear_tables()
+            .await
+            .context("Failed to clear database")?;
+    }
+
+    // Initialize tables
+    store
+        .init_tables()
+        .await
+        .context("Failed to initialize tables")?;
+
+    // Find HTML files
+    let html_pattern = content_path
+        .join("**/patterns/**/*.html")
+        .to_string_lossy()
+        .to_string();
+    let html_files: Vec<PathBuf> = glob(&html_pattern)
+        .context("Failed to glob HTML files")?
+        .filter_map(|e| e.ok())
+        .filter(|p| !p.to_string_lossy().contains("toc.html"))
+        .collect();
+
+    // Find PDF files
+    let pdf_pattern = content_path
+        .join("**/docs/*.pdf")
+        .to_string_lossy()
+        .to_string();
+    let pdf_files: Vec<PathBuf> = glob(&pdf_pattern)
+        .context("Failed to glob PDF files")?
+        .filter_map(|e| e.ok())
+        .collect();
+
+    println!(
+        "\nFound {} HTML files and {} PDF files",
+        html_files.len(),
+        pdf_files.len()
+    );
+
+    let chunker = DocumentChunker::with_defaults();
+
+    // Process HTML files
+    if !html_files.is_empty() {
+        println!("\nProcessing HTML files...");
+        let pb = ProgressBar::new(html_files.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        let html_parser = HtmlParser::new();
+
+        for file_path in &html_files {
+            pb.set_message(
+                file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+            // Read file content
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to read {:?}: {}", file_path, e);
+                    pb.inc(1);
+                    continue;
+                }
+            };
+
+            let file_path_str = file_path.to_string_lossy().to_string();
+
+            match html_parser.parse(&content, &file_path_str) {
+                Ok(document) => {
+                    // Generate chunks
+                    let chunks = chunker.chunk(&document);
+
+                    if !chunks.is_empty() {
+                        // Generate embeddings for chunks
+                        let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+                        match embedder.embed_texts(&chunk_texts) {
+                            Ok(embeddings) => {
+                                if let Err(e) = store.insert_chunks(&chunks, &embeddings).await {
+                                    error!("Failed to store chunks: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to embed chunks: {}", e);
+                            }
+                        }
+                    }
+
+                    // Store document
+                    if let Err(e) = store.insert_documents(&[document]).await {
+                        error!("Failed to store document: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to parse {:?}: {}", file_path, e);
+                }
+            }
+
+            pb.inc(1);
+        }
+
+        pb.finish_with_message("HTML files processed");
+    }
+
+    // Process PDF files
+    if !pdf_files.is_empty() {
+        println!("\nProcessing PDF files...");
+        let pb = ProgressBar::new(pdf_files.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        let pdf_parser = PdfParser::new();
+
+        for file_path in &pdf_files {
+            pb.set_message(
+                file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+            let file_path_str = file_path.to_string_lossy().to_string();
+
+            match pdf_parser.parse(&file_path_str) {
+                Ok(document) => {
+                    // Generate chunks
+                    let chunks = chunker.chunk(&document);
+
+                    if !chunks.is_empty() {
+                        // Generate embeddings for chunks
+                        let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+                        match embedder.embed_texts(&chunk_texts) {
+                            Ok(embeddings) => {
+                                if let Err(e) = store.insert_chunks(&chunks, &embeddings).await {
+                                    error!("Failed to store chunks: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to embed chunks: {}", e);
+                            }
+                        }
+                    }
+
+                    // Store document
+                    if let Err(e) = store.insert_documents(&[document]).await {
+                        error!("Failed to store document: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to parse {:?}: {}", file_path, e);
+                }
+            }
+
+            pb.inc(1);
+        }
+
+        pb.finish_with_message("PDF files processed");
+    }
+
+    // Create indexes
+    println!("\nCreating search indexes...");
+    store
+        .create_indexes()
+        .await
+        .context("Failed to create indexes")?;
+
+    println!("\nIndexing complete!");
+
+    Ok(())
+}
+
+/// Start the MCP server with stdio transport.
+async fn run_serve(db_path: &str) -> Result<()> {
+    info!("Starting MCP server...");
+
+    // Auto-setup: download models if not present
+    auto_setup()?;
+
+    // Initialize embedder and store
+    let embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
+    let mut store = KixStore::new(db_path)
+        .await
+        .context("Failed to open database")?;
+    store
+        .init_tables()
+        .await
+        .context("Failed to initialize tables")?;
+
+    // Create MCP server
+    let server = KixMcpServer::new(store, embedder);
+
+    // Create stdio transport
+    let transport = rmcp::transport::io::stdio();
+
+    // Run the server
+    info!("MCP server listening on stdio...");
+    let running = rmcp::serve_server(server, transport).await?;
+
+    // Wait for the server to finish
+    running.waiting().await?;
+
+    Ok(())
+}
+
+/// Start the MCP server with HTTP streaming transport at /mcp.
+async fn run_serve_http(db_path: &str, host: &str, port: u16) -> Result<()> {
+    info!("Starting MCP HTTP server...");
+
+    // Auto-setup: download models if not present
+    auto_setup()?;
+
+    // Pre-initialize the embedder and store
+    let embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
+    let mut store = KixStore::new(db_path)
+        .await
+        .context("Failed to open database")?;
+    store
+        .init_tables()
+        .await
+        .context("Failed to initialize tables")?;
+
+    // Create a template server that will be cloned for each session
+    // KixMcpServer implements Clone since it uses Arc internally
+    let template_server = KixMcpServer::new(store, embedder);
+
+    // Create the streamable HTTP service with a factory function
+    let service = StreamableHttpService::new(
+        move || {
+            // Clone the server for each new session
+            // This works because KixMcpServer uses Arc<Mutex<>> internally
+            let server = template_server.clone();
+            Ok(server)
+        },
+        Arc::new(LocalSessionManager::default()),
+        Default::default(),
+    );
+
+    // Create Axum router with the MCP service at /mcp
+    let app = axum::Router::new().nest_service("/mcp", service);
+
+    // Start HTTP server
+    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    println!("MCP HTTP server listening at http://{}/mcp", addr);
+    info!("MCP HTTP server started at http://{}/mcp", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to listen for ctrl-c");
+            info!("Shutting down MCP HTTP server...");
+        })
+        .await?;
+
+    Ok(())
+}
+
+/// Start the REST API server.
+async fn run_api(db_path: &str, port: u16) -> Result<()> {
+    info!("Starting REST API server...");
+
+    // Auto-setup: download models if not present
+    auto_setup()?;
+
+    // Initialize embedder and store
+    let embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
+    let mut store = KixStore::new(db_path)
+        .await
+        .context("Failed to open database")?;
+    store
+        .init_tables()
+        .await
+        .context("Failed to initialize tables")?;
+
+    // Create app state for the main router
+    let state = AppState::new(store, embedder);
+
+    // Create indexing components
+    let job_queue = Arc::new(JobQueue::new(QueueConfig::default()));
+    let sse_manager = Arc::new(ConnectionManager::new(Default::default()));
+    let file_handler = Arc::new(FileHandler::with_defaults());
+
+    // Initialize file handler upload directory
+    file_handler.init().await?;
+
+    // Create indexing state
+    let indexing_state = IndexingState::new(
+        state.clone(),
+        job_queue.clone(),
+        sse_manager.clone(),
+        file_handler,
+    );
+
+    // Create and start the job executor
+    let executor_config = ExecutorConfig {
+        db_path: db_path.to_string(),
+        ..Default::default()
+    };
+
+    let mut executor = JobExecutor::new(job_queue.clone(), sse_manager.clone(), executor_config)
+        .await
+        .context("Failed to create job executor")?;
+    executor.start();
+
+    // Create routers
+    let main_router = create_router(state);
+    let indexing_router = create_indexing_router(indexing_state);
+
+    // Merge routers
+    let app = main_router.merge(indexing_router);
+
+    // Start server
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    println!("REST API server listening on http://{}", addr);
+    println!("Indexing API available at http://{}/api/indexing/*", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    // Use into_make_service_with_connect_info to provide SocketAddr to handlers
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for ctrl-c");
+        info!("Shutting down API server...");
+        executor.shutdown().await;
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Test search from command line.
+async fn run_search(
+    db_path: &str,
+    query: &str,
+    limit: usize,
+    search_type: &str,
+    pattern_type: Option<String>,
+) -> Result<()> {
+    info!("Running search...");
+    println!("Query: {}", query);
+    println!("Search type: {}", search_type);
+
+    // Auto-setup: download models if not present
+    auto_setup()?;
+
+    // Initialize embedder and store
+    let mut embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
+    let mut store = KixStore::new(db_path)
+        .await
+        .context("Failed to open database")?;
+    store
+        .init_tables()
+        .await
+        .context("Failed to initialize tables")?;
+
+    let filters = SearchFilters {
+        entry_type: pattern_type,
+        chunk_type: None,
+        tag: None,
+        source_domain: None,
+    };
+
+    // Perform search based on type
+    let results = match search_type {
+        "semantic" | "vector" => {
+            let embedding = embedder.embed_query(query)?;
+            store.vector_search(&embedding, limit, &filters).await?
+        }
+        "text" | "fts" => store.text_search(query, limit, &filters).await?,
+        _ => {
+            // Default to hybrid
+            let embedding = embedder.embed_query(query)?;
+            store
+                .hybrid_search(query, &embedding, limit, &filters)
+                .await?
+        }
+    };
+
+    println!("\n=== Search Results ===\n");
+
+    if results.is_empty() {
+        println!("No results found.");
+    } else {
+        for (i, result) in results.iter().enumerate() {
+            println!(
+                "{}. {} (Score: {:.4})",
+                i + 1,
+                result.entry_title,
+                result.score
+            );
+            println!(
+                "   Type: {} | Tags: {}",
+                result.entry_type,
+                result.tags.join(", ")
+            );
+            println!("   {}", truncate(&result.text, 200));
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+/// Show indexing statistics.
+async fn run_stats(db_path: &str) -> Result<()> {
+    info!("Getting statistics...");
+
+    let mut store = KixStore::new(db_path)
+        .await
+        .context("Failed to open database")?;
+    store
+        .init_tables()
+        .await
+        .context("Failed to initialize tables")?;
+
+    // Get all patterns
+    let patterns = store.list_all_patterns().await?;
+
+    let document = patterns
+        .iter()
+        .filter(|p| p.entry_type == "document")
+        .count();
+    let article = patterns
+        .iter()
+        .filter(|p| p.entry_type == "article")
+        .count();
+    let pdf = patterns.iter().filter(|p| p.entry_type == "pdf").count();
+
+    println!("\n=== EIP Knowledge System Statistics ===\n");
+    println!("Total entries indexed: {}", patterns.len());
+    println!("  - Documents: {}", document);
+    println!("  - Articles: {}", article);
+    println!("  - PDF documents: {}", pdf);
+
+    // Count tags
+    let mut tags_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for pattern in &patterns {
+        for tag in &pattern.tags {
+            *tags_count.entry(tag.clone()).or_insert(0) += 1;
+        }
+    }
+
+    println!("\nTags:");
+    let mut sorted_tags: Vec<_> = tags_count.into_iter().collect();
+    sorted_tags.sort_by(|a, b| b.1.cmp(&a.1));
+    for (tag, count) in sorted_tags.iter().take(10) {
+        println!("  - {}: {} entries", tag, count);
+    }
+
+    println!("\nDatabase path: {}", db_path);
+
+    Ok(())
+}
+
+/// Create search indexes on existing data.
+async fn run_create_indexes(db_path: &str) -> Result<()> {
+    info!("Creating search indexes...");
+
+    let mut store = KixStore::new(db_path)
+        .await
+        .context("Failed to open database")?;
+    store
+        .init_tables()
+        .await
+        .context("Failed to initialize tables")?;
+
+    println!("Creating search indexes...");
+    store
+        .create_indexes()
+        .await
+        .context("Failed to create indexes")?;
+
+    println!("Search indexes created successfully!");
+
+    Ok(())
+}
+
+/// Download and setup embedding models.
+async fn run_setup(model: Option<String>, force: bool) -> Result<()> {
+    println!("\n=== Embedding Model Setup ===\n");
+
+    // Set model via environment variable if specified
+    if let Some(ref model_name) = model {
+        std::env::set_var("KIX_EMBEDDING_MODEL", model_name);
+        println!("Model: {}", model_name);
+    } else {
+        let default_model = std::env::var("KIX_EMBEDDING_MODEL")
+            .unwrap_or_else(|_| "bge-base-en-v1.5".to_string());
+        println!("Model: {} (default)", default_model);
+    }
+
+    let cache_dir = model_cache_dir();
+    println!("Cache directory: {:?}", cache_dir);
+
+    // Check if already set up
+    if !force && is_setup() {
+        println!("\nModel is already downloaded and ready!");
+        println!("Use --force to re-download.");
+        return Ok(());
+    }
+
+    if force {
+        println!("\nForce re-download requested...");
+        // Remove existing files
+        let model_name = model.unwrap_or_else(|| {
+            std::env::var("KIX_EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "bge-base-en-v1.5".to_string())
+        });
+        let safe_name = model_name.replace("-", "_").replace("/", "_");
+        let model_path = cache_dir.join(format!("{}.onnx", safe_name));
+        let tokenizer_path = cache_dir.join(format!("{}_tokenizer.json", safe_name));
+        let _ = std::fs::remove_file(&model_path);
+        let _ = std::fs::remove_file(&tokenizer_path);
+    }
+
+    println!("\nDownloading model...");
+    let setup_info = ensure_setup().context("Failed to setup embedding model")?;
+
+    if setup_info.downloaded {
+        println!("\nModel downloaded successfully!");
+    } else {
+        println!("\nModel was already present.");
+    }
+
+    println!("\nSetup complete!");
+    println!("  Model: {}", setup_info.model_name);
+    println!("  Cache: {:?}", setup_info.cache_dir);
+
+    Ok(())
+}
+
+/// Ensure models are set up before starting the server.
+fn auto_setup() -> Result<()> {
+    if !is_setup() {
+        println!("First-time setup: downloading embedding model...");
+        match ensure_setup() {
+            Ok(info) => {
+                if info.downloaded {
+                    println!("Model downloaded: {}", info.model_name);
+                }
+            }
+            Err(e) => {
+                error!("Warning: Failed to auto-download model: {}", e);
+                error!("You may need to run 'eip setup' manually.");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Truncate text to a maximum length.
+fn truncate(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        text.to_string()
+    } else {
+        format!("{}...", &text[..max_len])
+    }
+}

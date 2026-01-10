@@ -1,0 +1,78 @@
+[package]
+name = "kix-crawler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "URL and file crawling for Knowledge Indexer"
+
+[dependencies]
+# Core dependencies
+tokio = { workspace = true }
+tokio-util = "0.7"
+futures = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+# HTTP and URL handling
+reqwest = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+
+# Rate limiting
+governor = { workspace = true }
+nonzero_ext = "0.3"
+
+# Data structures
+dashmap = { workspace = true }
+crossbeam-queue = { workspace = true }
+bloomfilter = "1.0"
+lru = "0.12"
+parking_lot = "0.12"
+
+# File system
+glob = { workspace = true }
+walkdir = "2.5"
+
+# Archive handling
+zip = "2.2"
+
+# Content parsing
+scraper = { workspace = true }
+regex = { workspace = true }
+mime = "0.3"
+quick-xml = "0.37"  # For sitemap XML parsing
+htmd = "0.1"        # For HTML to markdown conversion
+
+# Robots.txt
+robotparser = "0.11"
+
+# Browser automation (optional)
+playwright = { version = "0.0.20", optional = true }
+
+# Hashing for deduplication
+sha2 = { workspace = true }
+simhash = "0.2"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Storage integration
+kix-store = { path = "../kix-store" }
+kix-parser = { path = "../kix-parser" }
+kix-embeddings = { path = "../kix-embeddings" }
+
+[features]
+default = []
+browser = ["playwright"]
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3.14"

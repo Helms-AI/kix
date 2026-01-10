@@ -1,0 +1,27 @@
+[package]
+name = "kix-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content parsing for Knowledge Indexer (HTML, PDF, DOCX, Excel, Markdown, etc.)"
+
+[dependencies]
+scraper.workspace = true
+pdf-extract.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+sha2.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { workspace = true, features = ["v4"] }
+url = { workspace = true }
+
+# Extended parsers
+calamine = "0.26"        # Excel parsing
+csv = "1.3"              # CSV parsing
+pulldown-cmark = "0.12"  # Markdown parsing
+dotext = "0.1"           # DOCX text extraction
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

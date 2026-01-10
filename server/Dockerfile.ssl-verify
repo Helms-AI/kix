@@ -1,0 +1,35 @@
+# Runtime-only Dockerfile
+# Build the Rust binary on host first: cargo build --manifest-path server/Cargo.toml --release --package eip-cli
+# Build the client assets on host first: cd client && npm ci && npm run build
+
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built binary from host
+COPY ./server/target/release/eip /usr/local/bin/eip
+
+# Copy client static files from host
+COPY ./client/dist /app/client/dist
+
+# Create directories for data
+RUN mkdir -p /app/data/lancedb /app/_content
+
+# Default environment variables
+ENV EIP_DB_PATH=/app/data/lancedb
+ENV EIP_CONTENT_PATH=/app/_content
+ENV EIP_API_PORT=3001
+ENV RUST_LOG=info
+
+# Expose API port
+EXPOSE 3001
+
+# Default command: run API server
+CMD ["eip", "api", "--port", "3001", "--db-path", "/app/data/lancedb"]

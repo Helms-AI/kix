@@ -1,0 +1,45 @@
+# Build artifacts
+server/target/
+server/.fastembed_cache/
+client/node_modules/
+client/dist/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Docker files
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment and config
+.env
+.env.*
+*.local
+
+# Test and coverage
+coverage/
+*.test.*
+
+# Logs
+*.log
+logs/
+
+# Claude cache
+.claude/
