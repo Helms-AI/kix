@@ -53,11 +53,34 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies including Chromium for Playwright browser rendering
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     curl \
+    # Chromium dependencies for Playwright
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libxkbcommon0 \
+    libatspi2.0-0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libxshmfence1 \
+    libx11-6 \
+    libxcb1 \
+    libxext6 \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from rust builder
@@ -66,8 +89,8 @@ COPY --from=rust-builder /app/target/release/kix /usr/local/bin/kix
 # Copy client static files from client builder
 COPY --from=client-builder /app/client/dist /app/client/dist
 
-# Create directories for data and model cache
-RUN mkdir -p /app/data/lancedb /app/_content /app/cache/kix/models
+# Create directories for data, model cache, and Playwright browsers
+RUN mkdir -p /app/data/lancedb /app/_content /app/cache/kix/models /app/cache/playwright
 
 # Default environment variables
 ENV KIX_DB_PATH=/app/data/lancedb
@@ -79,6 +102,10 @@ ENV KIX_EMBEDDING_MODEL=bge-base-en-v1.5
 ENV KIX_EMBEDDING_DIM=768
 # Point cache directory to persistent storage
 ENV XDG_CACHE_HOME=/app/cache
+# Playwright browser configuration (browsers will be downloaded on first use)
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/cache/playwright
+# Disable browser sandbox for Docker (running as non-root or in container)
+ENV PLAYWRIGHT_CHROMIUM_SANDBOX=false
 
 # Expose API port
 EXPOSE 3001

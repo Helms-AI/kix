@@ -1,8 +1,10 @@
 // API response types
 export interface StatsResponse {
   total_entries: number;
-  messaging_entries: number;
-  conversation_entries: number;
+  document_entries: number;
+  article_entries: number;
+  pdf_entries: number;
+  code_entries: number;
   total_chunks: number;
   total_documents: number;
   categories: CategoryCount[];
@@ -82,4 +84,17 @@ export interface GraphEdge {
 export interface EntryGraphResponse {
   nodes: GraphNode[];
   edges: GraphEdge[];
+}
+
+export interface Chunk {
+  id: string;
+  entry_id: string;
+  text: string;
+  chunk_type?: ChunkType;
+  chunk_index?: number;
+}
+
+export interface ChunksResponse {
+  chunks: Chunk[];
+  total: number;
 }

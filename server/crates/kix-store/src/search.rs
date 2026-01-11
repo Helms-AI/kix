@@ -1,9 +1,9 @@
 //! Search operations for the Knowledge Indexer store.
 
-use arrow_array::{Array, RecordBatch, StringArray, Float32Array};
+use arrow_array::{Array, RecordBatch, StringArray, Float32Array, Int32Array};
 use futures::TryStreamExt;
 use lancedb::index::scalar::FullTextSearchQuery;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -28,7 +28,9 @@ pub struct SearchResult {
     /// Tags
     pub tags: Vec<String>,
     /// Chunk type (summary, content, code, header)
-    pub chunk_type: String,
+    pub chunk_type: Option<String>,
+    /// Source domain (e.g., "docs.example.com")
+    pub source_domain: Option<String>,
 }
 
 /// Filters for search queries.
@@ -120,6 +122,31 @@ pub struct EntrySummary {
     pub entry_type: String,
     /// Tags
     pub tags: Vec<String>,
+    /// Source type (url, file, etc.)
+    pub source_type: Option<String>,
+    /// Source domain (e.g., "docs.example.com")
+    pub source_domain: Option<String>,
+    /// Source path
+    pub source_path: Option<String>,
+    /// Created timestamp
+    pub created_at: Option<String>,
+    /// Updated timestamp
+    pub updated_at: Option<String>,
+}
+
+/// Chunk data for entry content display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryChunk {
+    /// Chunk ID
+    pub chunk_id: String,
+    /// Parent entry ID
+    pub entry_id: String,
+    /// Chunk text content
+    pub text: String,
+    /// Chunk type (summary, content, code, header)
+    pub chunk_type: Option<String>,
+    /// Chunk index/order
+    pub chunk_index: Option<i32>,
 }
 
 /// Search optimization parameters
@@ -150,17 +177,7 @@ impl KixStore {
             .nprobes(DEFAULT_NPROBES)
             // Re-rank more candidates for better quality
             .refine_factor(DEFAULT_REFINE_FACTOR)
-            .limit(limit)
-            .select(Select::columns(&[
-                "chunk_id",
-                "entry_id",
-                "entry_title",
-                "text",
-                "entry_type",
-                "tags",
-                "chunk_type",
-                "_distance",
-            ]));
+            .limit(limit);
 
         // Apply filters (post-filter for IVF indexes)
         if let Some(filter_str) = filters.to_filter_string() {
@@ -199,15 +216,6 @@ impl KixStore {
         let mut query = table
             .query()
             .full_text_search(FullTextSearchQuery::new(query_text.to_owned()))
-            .select(Select::columns(&[
-                "chunk_id",
-                "entry_id",
-                "entry_title",
-                "text",
-                "entry_type",
-                "tags",
-                "chunk_type",
-            ]))
             .limit(limit);
 
         // Apply filters
@@ -319,13 +327,6 @@ impl KixStore {
         let batches = table
             .query()
             .only_if(filter)
-            .select(Select::columns(&[
-                "id",
-                "title",
-                "description",
-                "entry_type",
-                "tags",
-            ]))
             .limit(1)
             .execute()
             .await
@@ -354,13 +355,6 @@ impl KixStore {
         let batches = table
             .query()
             .only_if(filter)
-            .select(Select::columns(&[
-                "id",
-                "title",
-                "description",
-                "entry_type",
-                "tags",
-            ]))
             .limit(1)
             .execute()
             .await
@@ -389,13 +383,6 @@ impl KixStore {
         let batches = table
             .query()
             .only_if(filter)
-            .select(Select::columns(&[
-                "id",
-                "title",
-                "description",
-                "entry_type",
-                "tags",
-            ]))
             .execute()
             .await
             .map_err(|e| StoreError::Query(e.to_string()))?
@@ -422,13 +409,6 @@ impl KixStore {
         let batches = table
             .query()
             .only_if(filter)
-            .select(Select::columns(&[
-                "id",
-                "title",
-                "description",
-                "entry_type",
-                "tags",
-            ]))
             .execute()
             .await
             .map_err(|e| StoreError::Query(e.to_string()))?
@@ -452,13 +432,6 @@ impl KixStore {
 
         let batches = table
             .query()
-            .select(Select::columns(&[
-                "id",
-                "title",
-                "description",
-                "entry_type",
-                "tags",
-            ]))
             .execute()
             .await
             .map_err(|e| StoreError::Query(e.to_string()))?
@@ -474,6 +447,65 @@ impl KixStore {
         Ok(summaries)
     }
 
+    /// Gets all chunks for a specific entry ID.
+    pub async fn get_chunks_by_entry_id(&self, entry_id: &str) -> Result<Vec<EntryChunk>, StoreError> {
+        let table = self
+            .chunks_table()
+            .ok_or_else(|| StoreError::Database("Chunks table not initialized".to_string()))?;
+
+        let filter = format!("entry_id = '{}'", entry_id.replace('\'', "''"));
+
+        let batches = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| StoreError::Query(e.to_string()))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| StoreError::Query(e.to_string()))?;
+
+        let mut chunks = Vec::new();
+        for batch in batches {
+            chunks.extend(Self::batch_to_entry_chunks(&batch)?);
+        }
+
+        // Sort by chunk_index if available
+        chunks.sort_by(|a, b| {
+            match (a.chunk_index, b.chunk_index) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.chunk_id.cmp(&b.chunk_id),
+            }
+        });
+
+        Ok(chunks)
+    }
+
+    /// Converts a RecordBatch to entry chunks.
+    fn batch_to_entry_chunks(batch: &RecordBatch) -> Result<Vec<EntryChunk>, StoreError> {
+        let chunk_ids = Self::get_string_column(batch, "chunk_id")?;
+        let entry_ids = Self::get_string_column(batch, "entry_id")?;
+        let texts = Self::get_string_column(batch, "text")?;
+        let chunk_types = Self::get_optional_string_column(batch, "chunk_type");
+        let chunk_indices = Self::get_optional_int_column(batch, "chunk_index");
+
+        let mut chunks = Vec::new();
+
+        for i in 0..batch.num_rows() {
+            chunks.push(EntryChunk {
+                chunk_id: chunk_ids[i].clone(),
+                entry_id: entry_ids[i].clone(),
+                text: texts[i].clone(),
+                chunk_type: chunk_types[i].clone(),
+                chunk_index: chunk_indices[i],
+            });
+        }
+
+        Ok(chunks)
+    }
+
     /// Converts a RecordBatch to search results with distance-based scores.
     fn batch_to_results(batch: &RecordBatch) -> Result<Vec<SearchResult>, StoreError> {
         let chunk_ids = Self::get_string_column(batch, "chunk_id")?;
@@ -482,7 +514,8 @@ impl KixStore {
         let texts = Self::get_string_column(batch, "text")?;
         let entry_types = Self::get_string_column(batch, "entry_type")?;
         let tags_json = Self::get_string_column(batch, "tags")?;
-        let chunk_types = Self::get_string_column(batch, "chunk_type")?;
+        let chunk_types = Self::get_optional_string_column(batch, "chunk_type");
+        let source_domains = Self::get_optional_string_column(batch, "source_domain");
 
         // Get scores - try _relevance_score first (hybrid), then _score, then _distance
         let relevance_scores = Self::get_float_column(batch, "_relevance_score").ok();
@@ -514,6 +547,7 @@ impl KixStore {
                 entry_type: entry_types[i].clone(),
                 tags,
                 chunk_type: chunk_types[i].clone(),
+                source_domain: source_domains[i].clone(),
             });
         }
 
@@ -531,7 +565,8 @@ impl KixStore {
         let texts = Self::get_string_column(batch, "text")?;
         let entry_types = Self::get_string_column(batch, "entry_type")?;
         let tags_json = Self::get_string_column(batch, "tags")?;
-        let chunk_types = Self::get_string_column(batch, "chunk_type")?;
+        let chunk_types = Self::get_optional_string_column(batch, "chunk_type");
+        let source_domains = Self::get_optional_string_column(batch, "source_domain");
 
         let mut results = Vec::new();
 
@@ -547,6 +582,7 @@ impl KixStore {
                 entry_type: entry_types[i].clone(),
                 tags,
                 chunk_type: chunk_types[i].clone(),
+                source_domain: source_domains[i].clone(),
             });
         }
 
@@ -560,6 +596,11 @@ impl KixStore {
         let descriptions = Self::get_string_column(batch, "description")?;
         let entry_types = Self::get_string_column(batch, "entry_type")?;
         let tags_json = Self::get_string_column(batch, "tags")?;
+        let source_types = Self::get_optional_string_column(batch, "source_type");
+        let source_domains = Self::get_optional_string_column(batch, "source_domain");
+        let source_paths = Self::get_optional_string_column(batch, "source_path");
+        let created_ats = Self::get_optional_string_column(batch, "created_at");
+        let updated_ats = Self::get_optional_string_column(batch, "updated_at");
 
         let mut summaries = Vec::new();
 
@@ -572,6 +613,11 @@ impl KixStore {
                 description: descriptions[i].clone(),
                 entry_type: entry_types[i].clone(),
                 tags,
+                source_type: source_types[i].clone(),
+                source_domain: source_domains[i].clone(),
+                source_path: source_paths[i].clone(),
+                created_at: created_ats[i].clone(),
+                updated_at: updated_ats[i].clone(),
             });
         }
 
@@ -606,6 +652,49 @@ impl KixStore {
             .ok_or_else(|| StoreError::Query(format!("Column '{}' is not a float", name)))?;
 
         Ok((0..array.len()).map(|i| array.value(i)).collect())
+    }
+
+    /// Helper to get an optional string column from a RecordBatch.
+    fn get_optional_string_column(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+        batch
+            .column_by_name(name)
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .map(|array| {
+                (0..array.len())
+                    .map(|i| {
+                        if array.is_null(i) {
+                            None
+                        } else {
+                            let val = array.value(i);
+                            if val.is_empty() {
+                                None
+                            } else {
+                                Some(val.to_string())
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![None; batch.num_rows()])
+    }
+
+    /// Helper to get an optional int column from a RecordBatch.
+    fn get_optional_int_column(batch: &RecordBatch, name: &str) -> Vec<Option<i32>> {
+        batch
+            .column_by_name(name)
+            .and_then(|col| col.as_any().downcast_ref::<Int32Array>())
+            .map(|array| {
+                (0..array.len())
+                    .map(|i| {
+                        if array.is_null(i) {
+                            None
+                        } else {
+                            Some(array.value(i))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![None; batch.num_rows()])
     }
 
     // Backward compatibility aliases

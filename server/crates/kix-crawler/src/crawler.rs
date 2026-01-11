@@ -17,6 +17,9 @@ use crate::rate_limiter::DomainRateLimiter;
 use crate::robots::RobotsChecker;
 use crate::CrawlerError;
 
+#[cfg(feature = "browser")]
+use crate::browser::{BrowserConfig, BrowserPool};
+
 /// Crawler configuration
 #[derive(Clone, Debug)]
 pub struct CrawlerConfig {
@@ -40,8 +43,10 @@ pub struct CrawlerConfig {
     pub allowed_domains: Vec<String>,
     /// Blocked domains
     pub blocked_domains: Vec<String>,
-    /// Render JavaScript using headless browser
+    /// Render JavaScript using headless browser (default: true)
     pub render_js: bool,
+    /// Timeout for browser rendering (default: 30 seconds)
+    pub render_timeout: Duration,
     /// Use sitemaps to discover URLs (from robots.txt or default locations)
     pub use_sitemaps: bool,
 }
@@ -59,7 +64,8 @@ impl Default for CrawlerConfig {
             user_agent: "EIP-Crawler/1.0 (+https://github.com/eip-knowledge)".to_string(),
             allowed_domains: vec![],
             blocked_domains: vec![],
-            render_js: false,
+            render_js: true,             // Enable browser rendering by default for JS-heavy pages
+            render_timeout: Duration::from_secs(30),  // Default timeout for browser rendering
             use_sitemaps: true,          // Enable sitemap discovery by default
         }
     }
@@ -132,11 +138,14 @@ pub struct Crawler {
     robots_checker: Arc<RobotsChecker>,
     semaphore: Arc<Semaphore>,
     cancellation: CancellationToken,
+    /// Browser pool for JavaScript rendering (per-job, created fresh for each crawler)
+    #[cfg(feature = "browser")]
+    browser_pool: Option<Arc<BrowserPool>>,
 }
 
 impl Crawler {
-    /// Create a new crawler
-    pub fn new(config: CrawlerConfig) -> Result<Self, CrawlerError> {
+    /// Create a new crawler (async to allow browser pool initialization)
+    pub async fn new(config: CrawlerConfig) -> Result<Self, CrawlerError> {
         let client = Client::builder()
             .user_agent(&config.user_agent)
             .timeout(config.timeout)
@@ -150,6 +159,19 @@ impl Crawler {
         let robots_checker = Arc::new(RobotsChecker::new(client.clone(), &config.user_agent));
         let semaphore = Arc::new(Semaphore::new(config.concurrent_requests));
 
+        // Initialize browser pool if JS rendering is enabled
+        #[cfg(feature = "browser")]
+        let browser_pool = if config.render_js {
+            let browser_config = BrowserConfig {
+                timeout: config.render_timeout,
+                ..Default::default()
+            };
+            info!("Initializing browser pool for JavaScript rendering");
+            Some(Arc::new(BrowserPool::new(browser_config).await?))
+        } else {
+            None
+        };
+
         Ok(Self {
             client,
             config,
@@ -158,7 +180,19 @@ impl Crawler {
             robots_checker,
             semaphore,
             cancellation: CancellationToken::new(),
+            #[cfg(feature = "browser")]
+            browser_pool,
         })
+    }
+
+    /// Shutdown the crawler and release resources (call when job completes)
+    pub async fn shutdown(&self) -> Result<(), CrawlerError> {
+        #[cfg(feature = "browser")]
+        if let Some(ref pool) = self.browser_pool {
+            info!("Shutting down browser pool");
+            pool.close().await?;
+        }
+        Ok(())
     }
 
     /// Filter sitemap URLs to only include those related to the seed URL
@@ -193,29 +227,39 @@ impl Crawler {
             .collect()
     }
 
-    /// Start crawling from a seed URL
-    pub async fn crawl<F>(&self, seed_url: Url, mut on_result: F) -> Result<CrawlStats, CrawlerError>
+    /// Start crawling from a seed URL with PARALLEL processing per depth level
+    pub async fn crawl<F>(&self, seed_url: Url, on_result: F) -> Result<CrawlStats, CrawlerError>
     where
-        F: FnMut(CrawlResult) + Send,
+        F: Fn(CrawlResult) + Send + Sync,
     {
-        info!(url = %seed_url, max_depth = self.config.max_depth, "Starting crawl");
+        use futures::stream::{self, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        info!(url = %seed_url, max_depth = self.config.max_depth, concurrency = self.config.concurrent_requests, "Starting parallel crawl");
 
         // Add seed URL
         self.frontier.add(CrawlTask::seed(seed_url.clone())).await;
 
-        let mut stats = CrawlStats::default();
+        // Use atomic counters for parallel access
+        let pages_crawled = AtomicUsize::new(0);
+        let bytes_downloaded = std::sync::atomic::AtomicU64::new(0);
+        let links_discovered = AtomicUsize::new(0);
+        let links_queued = AtomicUsize::new(0);
+        let robots_blocked = AtomicUsize::new(0);
+        let errors = AtomicUsize::new(0);
+        let mut sitemap_urls_discovered = 0;
 
         // Fetch sitemap URLs if enabled
         if self.config.use_sitemaps {
             let sitemap_urls = self.robots_checker.fetch_all_sitemap_urls(&seed_url).await;
             if !sitemap_urls.is_empty() {
                 info!(count = sitemap_urls.len(), "Discovered URLs from sitemap");
-                stats.sitemap_urls_discovered = sitemap_urls.len();
+                sitemap_urls_discovered = sitemap_urls.len();
 
                 // Filter to only URLs related to the seed URL's section
                 let related_urls = Self::filter_related_sitemap_urls(&seed_url, sitemap_urls);
                 info!(
-                    total = stats.sitemap_urls_discovered,
+                    total = sitemap_urls_discovered,
                     related = related_urls.len(),
                     "Filtered sitemap URLs to related section"
                 );
@@ -232,6 +276,7 @@ impl Crawler {
             }
         }
 
+        // Main parallel crawl loop
         while !self.frontier.is_done().await {
             // Check cancellation
             if self.cancellation.is_cancelled() {
@@ -240,96 +285,132 @@ impl Crawler {
             }
 
             // Check page limit
-            if stats.pages_crawled >= self.config.max_pages {
-                info!(pages = stats.pages_crawled, "Maximum pages reached");
+            if pages_crawled.load(Ordering::Relaxed) >= self.config.max_pages {
+                info!(pages = pages_crawled.load(Ordering::Relaxed), "Maximum pages reached");
                 break;
             }
 
-            // Get next task
-            let task = match self.frontier.next().await {
-                Some(t) => t,
-                None => {
-                    // Wait a bit for in-progress tasks
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
+            // Collect a batch of tasks to process in parallel
+            let batch_size = self.config.concurrent_requests.min(
+                self.config.max_pages.saturating_sub(pages_crawled.load(Ordering::Relaxed))
+            );
 
-            // Check depth limit
-            if task.depth > self.config.max_depth {
-                self.frontier.complete(&task.url);
+            let mut batch: Vec<CrawlTask> = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                if let Some(task) = self.frontier.next().await {
+                    // Pre-filter tasks
+                    if task.depth > self.config.max_depth {
+                        self.frontier.complete(&task.url);
+                        continue;
+                    }
+                    if !self.is_domain_allowed(&task.url) {
+                        debug!(url = %task.url, "Domain not allowed");
+                        self.frontier.complete(&task.url);
+                        continue;
+                    }
+                    batch.push(task);
+                } else {
+                    break;
+                }
+            }
+
+            if batch.is_empty() {
+                // Wait a bit for in-progress tasks
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
 
-            // Check domain restrictions
-            if !self.is_domain_allowed(&task.url) {
-                debug!(url = %task.url, "Domain not allowed");
-                self.frontier.complete(&task.url);
-                continue;
-            }
+            debug!(batch_size = batch.len(), "Processing batch in parallel with streaming");
 
-            // Acquire semaphore
-            let _permit = self.semaphore.acquire().await.unwrap();
+            // Process batch in parallel using buffer_unordered - STREAMING results as they complete
+            let result_stream = stream::iter(batch)
+                .map(|task| async {
+                    // Acquire semaphore permit
+                    let _permit = self.semaphore.acquire().await.unwrap();
 
-            // Check robots.txt
-            if self.config.respect_robots {
-                if !self.robots_checker.is_allowed(&task.url).await {
-                    debug!(url = %task.url, "Blocked by robots.txt");
-                    self.frontier.complete(&task.url);
-                    stats.robots_blocked += 1;
-                    continue;
-                }
+                    // Check robots.txt
+                    if self.config.respect_robots {
+                        if !self.robots_checker.is_allowed(&task.url).await {
+                            debug!(url = %task.url, "Blocked by robots.txt");
+                            let url_string = task.url.to_string();
+                            return (task, Err(CrawlerError::RobotsDisallowed(url_string)));
+                        }
 
-                // Apply crawl delay from robots.txt
-                if let Some(delay) = self.robots_checker.get_crawl_delay(&task.url).await {
+                        // Apply crawl delay from robots.txt
+                        if let Some(delay) = self.robots_checker.get_crawl_delay(&task.url).await {
+                            if let Some(domain) = task.url.domain() {
+                                self.rate_limiter.set_crawl_delay(domain, delay);
+                            }
+                        }
+                    }
+
+                    // Apply rate limiting
                     if let Some(domain) = task.url.domain() {
-                        self.rate_limiter.set_crawl_delay(domain, delay);
-                    }
-                }
-            }
-
-            // Apply rate limiting
-            if let Some(domain) = task.url.domain() {
-                self.rate_limiter.acquire(domain).await;
-            }
-
-            // Fetch the page
-            match self.fetch_page(&task.url).await {
-                Ok(result) => {
-                    stats.pages_crawled += 1;
-                    stats.bytes_downloaded += result.size as u64;
-
-                    // Extract and queue links
-                    if task.depth < self.config.max_depth {
-                        let new_tasks: Vec<CrawlTask> = result
-                            .links
-                            .iter()
-                            .filter(|url| self.is_domain_allowed(url))
-                            .map(|url| task.child(url.clone()))
-                            .collect();
-
-                        let added = self.frontier.add_many(new_tasks).await;
-                        stats.links_discovered += result.links.len();
-                        stats.links_queued += added;
+                        self.rate_limiter.acquire(domain).await;
                     }
 
-                    // Call result handler
-                    on_result(result);
+                    // Fetch the page
+                    let result = self.fetch_page(&task.url).await;
+                    (task, result)
+                })
+                .buffer_unordered(self.config.concurrent_requests);
 
-                    self.frontier.complete(&task.url);
-                }
-                Err(e) => {
-                    warn!(url = %task.url, error = %e, "Failed to fetch page");
-                    stats.errors += 1;
+            // Pin the stream for iteration
+            futures::pin_mut!(result_stream);
 
-                    // Retry on transient errors
-                    let should_retry = matches!(&e,
-                        CrawlerError::Http(e) if e.is_timeout() || e.is_connect()
-                    );
-                    self.frontier.fail(task, should_retry).await;
+            // Process results IMMEDIATELY as each page completes (no waiting for batch)
+            while let Some((task, result)) = result_stream.next().await {
+                match result {
+                    Ok(crawl_result) => {
+                        pages_crawled.fetch_add(1, Ordering::Relaxed);
+                        bytes_downloaded.fetch_add(crawl_result.size as u64, Ordering::Relaxed);
+
+                        // Extract and queue links
+                        if task.depth < self.config.max_depth {
+                            let new_tasks: Vec<CrawlTask> = crawl_result
+                                .links
+                                .iter()
+                                .filter(|url| self.is_domain_allowed(url))
+                                .map(|url| task.child(url.clone()))
+                                .collect();
+
+                            let added = self.frontier.add_many(new_tasks).await;
+                            links_discovered.fetch_add(crawl_result.links.len(), Ordering::Relaxed);
+                            links_queued.fetch_add(added, Ordering::Relaxed);
+                        }
+
+                        // Call result handler IMMEDIATELY - no waiting for other pages
+                        on_result(crawl_result);
+
+                        self.frontier.complete(&task.url);
+                    }
+                    Err(CrawlerError::RobotsDisallowed(_)) => {
+                        robots_blocked.fetch_add(1, Ordering::Relaxed);
+                        self.frontier.complete(&task.url);
+                    }
+                    Err(e) => {
+                        warn!(url = %task.url, error = %e, "Failed to fetch page");
+                        errors.fetch_add(1, Ordering::Relaxed);
+
+                        // Retry on transient errors
+                        let should_retry = matches!(&e,
+                            CrawlerError::Http(e) if e.is_timeout() || e.is_connect()
+                        );
+                        self.frontier.fail(task, should_retry).await;
+                    }
                 }
             }
         }
+
+        let stats = CrawlStats {
+            pages_crawled: pages_crawled.load(Ordering::Relaxed),
+            bytes_downloaded: bytes_downloaded.load(Ordering::Relaxed),
+            links_discovered: links_discovered.load(Ordering::Relaxed),
+            links_queued: links_queued.load(Ordering::Relaxed),
+            robots_blocked: robots_blocked.load(Ordering::Relaxed),
+            errors: errors.load(Ordering::Relaxed),
+            sitemap_urls_discovered,
+        };
 
         info!(
             pages = stats.pages_crawled,
@@ -341,8 +422,84 @@ impl Crawler {
         Ok(stats)
     }
 
-    /// Fetch a single page
+    /// Fetch a single page (routes to browser or raw based on config)
     async fn fetch_page(&self, url: &Url) -> Result<CrawlResult, CrawlerError> {
+        #[cfg(feature = "browser")]
+        if let Some(ref browser_pool) = self.browser_pool {
+            return self.fetch_page_with_browser(url, browser_pool).await;
+        }
+
+        // Fall back to raw HTML fetching
+        self.fetch_page_raw(url).await
+    }
+
+    /// Fetch a page using browser rendering (for JavaScript-heavy sites)
+    #[cfg(feature = "browser")]
+    async fn fetch_page_with_browser(
+        &self,
+        url: &Url,
+        browser_pool: &BrowserPool,
+    ) -> Result<CrawlResult, CrawlerError> {
+        let start = std::time::Instant::now();
+
+        debug!(url = %url, "Rendering page with browser");
+
+        // Render with browser
+        let render_result = browser_pool.render(url).await.map_err(|e| {
+            CrawlerError::BrowserError(format!(
+                "Browser rendering failed for {}: {}. Ensure Chromium is installed.",
+                url, e
+            ))
+        })?;
+
+        // Parse rendered HTML
+        let document = Html::parse_document(&render_result.html);
+
+        // Extract title from rendered content
+        let title_selector = Selector::parse("title").unwrap();
+        let title = document
+            .select(&title_selector)
+            .next()
+            .map(|el| el.text().collect::<String>().trim().to_string())
+            .or(render_result.title);
+
+        // Extract links
+        let link_selector = Selector::parse("a[href]").unwrap();
+        let links: Vec<Url> = document
+            .select(&link_selector)
+            .filter_map(|el| el.value().attr("href"))
+            .filter_map(|href| url.join(href).ok())
+            .filter(|u| u.scheme() == "http" || u.scheme() == "https")
+            .collect();
+
+        // Extract structured content from RENDERED HTML
+        let structured_content = extract_structured_content(&render_result.html, &document);
+        let content = structured_content.plain_text.clone();
+        let source_domain = url.domain().map(|d| d.to_string());
+
+        info!(
+            url = %url,
+            render_time_ms = render_result.render_time_ms,
+            content_len = content.len(),
+            "Page rendered with browser"
+        );
+
+        Ok(CrawlResult {
+            url: render_result.url,
+            status: 200,
+            title,
+            content,
+            structured_content,
+            links,
+            content_type: "text/html".to_string(),
+            size: render_result.html.len(),
+            fetch_time_ms: start.elapsed().as_millis() as u64,
+            source_domain,
+        })
+    }
+
+    /// Fetch a single page using raw HTTP (no JavaScript rendering)
+    async fn fetch_page_raw(&self, url: &Url) -> Result<CrawlResult, CrawlerError> {
         let start = std::time::Instant::now();
 
         let response = self.client.get(url.as_str()).send().await?;

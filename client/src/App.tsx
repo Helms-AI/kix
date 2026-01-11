@@ -1,11 +1,10 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation, Navigate, useParams } from 'react-router-dom';
-import { LayoutDashboard, Grid, Search, BookOpen, Network, Menu, X, Zap } from 'lucide-react';
+import { LayoutDashboard, Grid, BookOpen, Network, Menu, X, Zap } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
 
 import Dashboard from './pages/Dashboard';
 import EntryBrowser from './pages/EntryBrowser';
-import SearchPage from './pages/SearchPage';
 import EntryDetail from './pages/EntryDetail';
 import EntryGraph from './pages/EntryGraph';
 import IndexingDashboard from './pages/IndexingDashboard';
@@ -20,7 +19,6 @@ const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Indexing', href: '/indexing', icon: Zap },
   { name: 'Entries', href: '/entries', icon: Grid },
-  { name: 'Search', href: '/search', icon: Search },
   { name: 'Graph', href: '/graph', icon: Network },
 ];
 
@@ -114,10 +112,10 @@ function App() {
               <Route path="/indexing" element={<IndexingDashboard />} />
               <Route path="/entries" element={<EntryBrowser />} />
               <Route path="/entries/:id" element={<EntryDetail />} />
-              {/* Backward compatibility redirects for old /patterns URLs */}
+              {/* Backward compatibility redirects for old URLs */}
               <Route path="/patterns" element={<Navigate to="/entries" replace />} />
               <Route path="/patterns/:id" element={<PatternRedirect />} />
-              <Route path="/search" element={<SearchPage />} />
+              <Route path="/search" element={<Navigate to="/entries" replace />} />
               <Route path="/graph" element={<EntryGraph />} />
             </Routes>
           </div>

@@ -5,9 +5,83 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "browser")]
+use std::path::PathBuf;
+
+#[cfg(feature = "browser")]
+use std::sync::Arc;
+
+#[cfg(feature = "browser")]
+use tokio::sync::{Mutex, Semaphore};
+
+#[cfg(feature = "browser")]
+use tracing::{debug, info, warn};
+
 use url::Url;
 
 use crate::CrawlerError;
+
+/// Find the Chromium executable from the JavaScript Playwright installation
+#[cfg(feature = "browser")]
+fn find_chromium_executable() -> Option<PathBuf> {
+    // Check environment variable first
+    if let Ok(path) = std::env::var("PLAYWRIGHT_CHROMIUM_PATH") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // Look in the standard Playwright cache locations
+    let cache_dirs = [
+        dirs::cache_dir().map(|d| d.join("ms-playwright")),
+        dirs::home_dir().map(|d| d.join("Library/Caches/ms-playwright")),
+        Some(PathBuf::from("/app/cache/playwright")), // Docker location
+    ];
+
+    for cache_dir in cache_dirs.iter().flatten() {
+        if !cache_dir.exists() {
+            continue;
+        }
+
+        // Look for chromium-* directories
+        if let Ok(entries) = std::fs::read_dir(cache_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("chromium-") {
+                    // macOS path
+                    let mac_path = entry.path()
+                        .join("chrome-mac-arm64")
+                        .join("Google Chrome for Testing.app")
+                        .join("Contents/MacOS/Google Chrome for Testing");
+                    if mac_path.exists() {
+                        return Some(mac_path);
+                    }
+
+                    // macOS x64 path
+                    let mac_x64_path = entry.path()
+                        .join("chrome-mac")
+                        .join("Google Chrome for Testing.app")
+                        .join("Contents/MacOS/Google Chrome for Testing");
+                    if mac_x64_path.exists() {
+                        return Some(mac_x64_path);
+                    }
+
+                    // Linux path
+                    let linux_path = entry.path()
+                        .join("chrome-linux")
+                        .join("chrome");
+                    if linux_path.exists() {
+                        return Some(linux_path);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
 
 /// Configuration for browser rendering
 #[derive(Clone, Debug)]
@@ -108,12 +182,60 @@ impl BrowserPool {
             let pw_guard = self.playwright.lock().await;
             let pw = pw_guard.as_ref().unwrap();
 
-            let browser = pw.chromium()
-                .launcher()
-                .headless(self.config.headless)
-                .launch()
-                .await
-                .map_err(|e| CrawlerError::BrowserError(format!("Failed to launch browser: {}", e)))?;
+            // Find the Chromium executable from JavaScript Playwright installation
+            let chromium_path = find_chromium_executable();
+            if let Some(ref path) = chromium_path {
+                info!("Using Chromium at: {}", path.display());
+            }
+
+            // Launch browser with executable path if found
+            let browser = if let Some(ref path) = chromium_path {
+                pw.chromium()
+                    .launcher()
+                    .headless(self.config.headless)
+                    .executable(path.as_path())
+                    .launch()
+                    .await
+                    .map_err(|e| CrawlerError::BrowserError(format!(
+                        "Failed to launch browser with executable {}: {}",
+                        path.display(), e
+                    )))?
+            } else {
+                // No pre-installed Chromium found, try default launch
+                match pw.chromium()
+                    .launcher()
+                    .headless(self.config.headless)
+                    .launch()
+                    .await
+                {
+                    Ok(browser) => browser,
+                    Err(e) => {
+                        warn!("Browser launch failed, attempting to install Chromium: {}", e);
+                        drop(pw_guard);
+
+                        // Install Chromium browser
+                        let pw_guard = self.playwright.lock().await;
+                        let pw = pw_guard.as_ref().unwrap();
+                        pw.install_chromium()
+                            .map_err(|e| CrawlerError::BrowserError(format!(
+                                "Failed to install Chromium: {}. \
+                                 Try running 'npx playwright install chromium' manually.",
+                                e
+                            )))?;
+                        info!("Chromium installed successfully");
+
+                        // Try launching again
+                        pw.chromium()
+                            .launcher()
+                            .headless(self.config.headless)
+                            .launch()
+                            .await
+                            .map_err(|e| CrawlerError::BrowserError(format!(
+                                "Failed to launch browser after install: {}", e
+                            )))?
+                    }
+                }
+            };
 
             *browser_guard = Some(browser);
             info!("Browser launched successfully");
@@ -140,16 +262,18 @@ impl BrowserPool {
             .ok_or_else(|| CrawlerError::BrowserError("Browser not initialized".to_string()))?;
 
         // Create new context
+        let viewport = playwright::api::Viewport {
+            width: self.config.viewport_width as i32,
+            height: self.config.viewport_height as i32,
+        };
         let context = browser.context_builder()
-            .viewport_size(self.config.viewport_width as i32, self.config.viewport_height as i32)
+            .viewport(Some(viewport))
             .build()
             .await
             .map_err(|e| CrawlerError::BrowserError(format!("Failed to create context: {}", e)))?;
 
-        // Set user agent if configured
-        if let Some(ref ua) = self.config.user_agent {
-            // Note: Playwright context builder should handle this
-        }
+        // Note: User agent should be set via context_builder().user_agent() if needed
+        // The current playwright crate version doesn't expose this nicely
 
         // Create new page
         let page = context.new_page()
@@ -178,7 +302,6 @@ impl BrowserPool {
 
         // Get the final URL (after redirects)
         let final_url_str = page.url()
-            .await
             .map_err(|e| CrawlerError::BrowserError(format!("Failed to get URL: {}", e)))?;
 
         let final_url = Url::parse(&final_url_str)

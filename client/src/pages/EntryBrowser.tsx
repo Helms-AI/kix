@@ -1,25 +1,30 @@
-import { useState, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useState, useMemo, useEffect } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import {
   ChevronRight,
-  Filter,
+  ChevronDown,
   Grid,
   List,
-  Tag,
   Globe,
   Clock,
   FileText,
   Code,
   Hash,
-  Layers,
   Database,
+  Search,
+  X,
+  Sparkles,
+  Zap,
+  Layers,
+  Box,
+  FileType,
+  RefreshCw,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../api/client';
-import type { Entry, CategoryInfo } from '../types';
-
-type ViewMode = 'grid' | 'list' | 'compact';
+import { useEntriesFilters, type ViewMode, type SearchMode, type EntryType } from '../hooks/useEntriesFilters';
+import type { Entry, SearchResult } from '../types';
 
 // Helper to format dates nicely
 function formatDate(dateStr?: string): string {
@@ -38,14 +43,12 @@ function formatDate(dateStr?: string): string {
 
 // Helper to get entry type icon and color
 function getEntryTypeStyle(type: string) {
-  const styles: Record<string, { bg: string; text: string; icon: React.ReactNode }> = {
-    document: { bg: 'bg-blue-500/15', text: 'text-blue-400', icon: <FileText className="w-3.5 h-3.5" /> },
-    pdf: { bg: 'bg-rose-500/15', text: 'text-rose-400', icon: <FileText className="w-3.5 h-3.5" /> },
-    article: { bg: 'bg-emerald-500/15', text: 'text-emerald-400', icon: <FileText className="w-3.5 h-3.5" /> },
-    code: { bg: 'bg-amber-500/15', text: 'text-amber-400', icon: <Code className="w-3.5 h-3.5" /> },
-    messaging: { bg: 'bg-violet-500/15', text: 'text-violet-400', icon: <Layers className="w-3.5 h-3.5" /> },
-    conversation: { bg: 'bg-orange-500/15', text: 'text-orange-400', icon: <Layers className="w-3.5 h-3.5" /> },
-    other: { bg: 'bg-slate-500/15', text: 'text-slate-400', icon: <FileText className="w-3.5 h-3.5" /> },
+  const styles: Record<string, { bg: string; text: string; border: string; icon: React.ReactNode }> = {
+    document: { bg: 'bg-blue-500/15', text: 'text-blue-400', border: 'border-blue-500/30', icon: <FileText className="w-3.5 h-3.5" /> },
+    pdf: { bg: 'bg-rose-500/15', text: 'text-rose-400', border: 'border-rose-500/30', icon: <FileType className="w-3.5 h-3.5" /> },
+    article: { bg: 'bg-emerald-500/15', text: 'text-emerald-400', border: 'border-emerald-500/30', icon: <FileText className="w-3.5 h-3.5" /> },
+    code: { bg: 'bg-amber-500/15', text: 'text-amber-400', border: 'border-amber-500/30', icon: <Code className="w-3.5 h-3.5" /> },
+    other: { bg: 'bg-slate-500/15', text: 'text-slate-400', border: 'border-slate-500/30', icon: <FileText className="w-3.5 h-3.5" /> },
   };
   return styles[type.toLowerCase()] || styles.other;
 }
@@ -63,6 +66,15 @@ function getSourceTypeStyle(type?: string) {
   };
   return styles[type.toLowerCase()] || { bg: 'bg-slate-700/50', text: 'text-slate-400' };
 }
+
+// Type pill configuration
+const TYPE_PILLS: { value: EntryType; label: string; icon: React.ReactNode; colors: { bg: string; text: string; border: string } }[] = [
+  { value: 'all', label: 'All', icon: <Box className="w-3.5 h-3.5" />, colors: { bg: 'bg-cyan-500/15', text: 'text-cyan-400', border: 'border-cyan-500/30' } },
+  { value: 'document', label: 'Document', icon: <FileText className="w-3.5 h-3.5" />, colors: { bg: 'bg-blue-500/15', text: 'text-blue-400', border: 'border-blue-500/30' } },
+  { value: 'article', label: 'Article', icon: <FileText className="w-3.5 h-3.5" />, colors: { bg: 'bg-emerald-500/15', text: 'text-emerald-400', border: 'border-emerald-500/30' } },
+  { value: 'pdf', label: 'PDF', icon: <FileType className="w-3.5 h-3.5" />, colors: { bg: 'bg-rose-500/15', text: 'text-rose-400', border: 'border-rose-500/30' } },
+  { value: 'code', label: 'Code', icon: <Code className="w-3.5 h-3.5" />, colors: { bg: 'bg-amber-500/15', text: 'text-amber-400', border: 'border-amber-500/30' } },
+];
 
 // Domain badge component
 function DomainBadge({ domain }: { domain?: string }) {
@@ -230,123 +242,157 @@ function EntryCard({ entry, viewMode }: { entry: Entry; viewMode: ViewMode }) {
   }
 }
 
-// Category sidebar with domain filtering
-function CategorySidebar({
-  categories,
-  selectedCategory,
-  onSelectCategory,
-  domains,
-  selectedDomain,
-  onSelectDomain,
-}: {
-  categories: CategoryInfo[];
-  selectedCategory: string | null;
-  onSelectCategory: (cat: string | null) => void;
-  domains: string[];
-  selectedDomain: string | null;
-  onSelectDomain: (domain: string | null) => void;
-}) {
-  const messagingCats = categories.filter((c) => c.entry_type === 'messaging');
-  const conversationCats = categories.filter((c) => c.entry_type === 'conversation');
+// Search result card component
+function SearchResultCard({ result }: { result: SearchResult }) {
+  const typeStyle = getEntryTypeStyle(result.entry_type);
+  const scorePercent = Math.round(result.score * 100);
+  const scoreColor = scorePercent >= 80 ? 'text-emerald-400' : scorePercent >= 60 ? 'text-cyan-400' : 'text-amber-400';
 
   return (
-    <div className="w-72 flex-shrink-0 hidden lg:block space-y-4">
-      {/* Domains filter */}
-      {domains.length > 0 && (
-        <div className="bg-slate-900/60 backdrop-blur-sm rounded-xl border border-slate-800/80 p-4">
-          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
-            <Globe className="w-3.5 h-3.5" />
-            Sources
-          </h3>
-          <div className="space-y-1">
-            <button
-              onClick={() => onSelectDomain(null)}
-              className={clsx(
-                'w-full text-left px-3 py-2 rounded-lg text-sm transition-all flex items-center justify-between',
-                selectedDomain === null ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
-              )}
-            >
-              <span>All Sources</span>
-              <span className="text-xs text-slate-600">{domains.length}</span>
-            </button>
-            {domains.slice(0, 8).map((domain) => (
-              <button
-                key={domain}
-                onClick={() => onSelectDomain(domain)}
-                className={clsx(
-                  'w-full text-left px-3 py-2 rounded-lg text-sm transition-all flex items-center gap-2 group',
-                  selectedDomain === domain ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
-                )}
-              >
-                <Globe className={clsx('w-3 h-3 flex-shrink-0', selectedDomain === domain ? 'text-cyan-400' : 'text-slate-600 group-hover:text-slate-400')} />
-                <span className="truncate font-mono text-xs">{domain}</span>
-              </button>
-            ))}
-            {domains.length > 8 && <p className="text-xs text-slate-600 px-3 py-1">+{domains.length - 8} more</p>}
+    <Link
+      to={`/entries/${encodeURIComponent(result.entry_id)}`}
+      className="group relative flex flex-col bg-slate-900/60 backdrop-blur-sm rounded-xl border border-slate-800/80 overflow-hidden hover:border-cyan-500/40 hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-300"
+    >
+      {/* Top accent bar */}
+      <div className={clsx('h-1 w-full', typeStyle.bg.replace('/15', '/40'))} />
+
+      <div className="p-5 flex flex-col flex-1">
+        {/* Header with type badge and score */}
+        <div className="flex items-start justify-between gap-3 mb-3">
+          <div className={clsx('flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium', typeStyle.bg, typeStyle.text)}>
+            {typeStyle.icon}
+            <span className="capitalize">{result.entry_type}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            {result.chunk_type && (
+              <span className="px-2 py-0.5 text-[10px] font-mono rounded bg-slate-800/80 text-slate-400 uppercase tracking-wider">
+                {result.chunk_type}
+              </span>
+            )}
+            <div className={clsx('flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-800/80', scoreColor)}>
+              <Sparkles className="w-3 h-3" />
+              <span className="text-xs font-bold">{scorePercent}%</span>
+            </div>
           </div>
         </div>
-      )}
 
-      {/* Categories filter */}
-      <div className="bg-slate-900/60 backdrop-blur-sm rounded-xl border border-slate-800/80 p-4 sticky top-8">
-        <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
-          <Tag className="w-3.5 h-3.5" />
-          Categories
+        {/* Title */}
+        <h3 className="font-semibold text-white text-lg leading-tight group-hover:text-cyan-400 transition-colors line-clamp-2 mb-2">
+          {result.entry_title}
         </h3>
-        <button
-          onClick={() => onSelectCategory(null)}
-          className={clsx(
-            'w-full text-left px-3 py-2 rounded-lg text-sm transition-all mb-2',
-            selectedCategory === null ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
-          )}
-        >
-          All Entries
-        </button>
 
-        {messagingCats.length > 0 && (
-          <>
-            <p className="text-[10px] text-slate-600 font-mono uppercase mt-4 mb-2 px-3 flex items-center gap-1.5">
-              <div className="w-1.5 h-1.5 rounded-full bg-violet-500/60" />
-              Messaging
-            </p>
-            {messagingCats.map((cat) => (
-              <button
-                key={cat.name}
-                onClick={() => onSelectCategory(cat.name)}
-                className={clsx(
-                  'w-full text-left px-3 py-2 rounded-lg text-sm transition-all flex items-center justify-between',
-                  selectedCategory === cat.name ? 'bg-violet-500/15 text-violet-400 border border-violet-500/30' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
-                )}
-              >
-                <span className="truncate">{cat.name}</span>
-                <span className="text-xs text-slate-600">{cat.entry_count}</span>
-              </button>
-            ))}
-          </>
-        )}
+        {/* Matched text snippet */}
+        <p className="text-sm text-slate-400 line-clamp-3 flex-1 mb-4 italic border-l-2 border-cyan-500/30 pl-3">
+          "{result.text}"
+        </p>
 
-        {conversationCats.length > 0 && (
-          <>
-            <p className="text-[10px] text-slate-600 font-mono uppercase mt-4 mb-2 px-3 flex items-center gap-1.5">
-              <div className="w-1.5 h-1.5 rounded-full bg-amber-500/60" />
-              Conversation
-            </p>
-            {conversationCats.map((cat) => (
-              <button
-                key={cat.name}
-                onClick={() => onSelectCategory(cat.name)}
-                className={clsx(
-                  'w-full text-left px-3 py-2 rounded-lg text-sm transition-all flex items-center justify-between',
-                  selectedCategory === cat.name ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
-                )}
-              >
-                <span className="truncate">{cat.name}</span>
-                <span className="text-xs text-slate-600">{cat.entry_count}</span>
-              </button>
+        {/* Source domain */}
+        {result.source_domain && <DomainBadge domain={result.source_domain} />}
+
+        {/* Tags */}
+        {result.tags && result.tags.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-3">
+            {result.tags.slice(0, 3).map((tag: string) => (
+              <span key={tag} className="px-2 py-0.5 text-xs bg-slate-800/80 text-slate-400 rounded-md border border-slate-700/50">
+                {tag}
+              </span>
             ))}
-          </>
+            {result.tags.length > 3 && (
+              <span className="px-2 py-0.5 text-xs bg-slate-800/50 text-slate-500 rounded-md">+{result.tags.length - 3}</span>
+            )}
+          </div>
         )}
       </div>
+
+      {/* Hover indicator */}
+      <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gradient-to-r from-cyan-500 to-teal-500 scale-x-0 group-hover:scale-x-100 transition-transform duration-300" />
+    </Link>
+  );
+}
+
+// Search mode toggle component
+function SearchModeToggle({ mode, onChange }: { mode: SearchMode; onChange: (mode: SearchMode) => void }) {
+  const modes: { value: SearchMode; label: string; icon: React.ReactNode }[] = [
+    { value: 'fts', label: 'FTS', icon: <Search className="w-3.5 h-3.5" /> },
+    { value: 'vector', label: 'Vector', icon: <Sparkles className="w-3.5 h-3.5" /> },
+    { value: 'hybrid', label: 'Hybrid', icon: <Layers className="w-3.5 h-3.5" /> },
+  ];
+
+  return (
+    <div className="flex items-center bg-slate-800/80 rounded-lg p-1 border border-slate-700/50">
+      {modes.map((m) => (
+        <button
+          key={m.value}
+          onClick={() => onChange(m.value)}
+          className={clsx(
+            'flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-all',
+            mode === m.value
+              ? 'bg-cyan-500/20 text-cyan-400'
+              : 'text-slate-500 hover:text-white'
+          )}
+        >
+          {m.icon}
+          <span className="hidden sm:inline">{m.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Type pill component
+function TypePill({
+  pill,
+  isActive,
+  count,
+  onClick,
+}: {
+  pill: typeof TYPE_PILLS[0];
+  isActive: boolean;
+  count: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={clsx(
+        'flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium transition-all whitespace-nowrap border',
+        isActive
+          ? `${pill.colors.bg} ${pill.colors.text} ${pill.colors.border}`
+          : 'bg-slate-800/60 text-slate-400 border-slate-700/50 hover:text-white hover:bg-slate-800'
+      )}
+    >
+      {pill.icon}
+      <span>{pill.label}</span>
+      <span className={clsx('text-xs', isActive ? 'opacity-80' : 'text-slate-500')}>({count})</span>
+    </button>
+  );
+}
+
+// View mode toggle component
+function ViewModeToggle({ mode, onChange }: { mode: ViewMode; onChange: (mode: ViewMode) => void }) {
+  return (
+    <div className="flex items-center bg-slate-800/80 rounded-lg p-1 border border-slate-700/50">
+      <button
+        onClick={() => onChange('grid')}
+        className={clsx('p-1.5 rounded transition-all', mode === 'grid' ? 'bg-cyan-500/20 text-cyan-400' : 'text-slate-500 hover:text-white')}
+        title="Grid view"
+      >
+        <Grid className="w-4 h-4" />
+      </button>
+      <button
+        onClick={() => onChange('list')}
+        className={clsx('p-1.5 rounded transition-all', mode === 'list' ? 'bg-cyan-500/20 text-cyan-400' : 'text-slate-500 hover:text-white')}
+        title="List view"
+      >
+        <List className="w-4 h-4" />
+      </button>
+      <button
+        onClick={() => onChange('compact')}
+        className={clsx('p-1.5 rounded transition-all', mode === 'compact' ? 'bg-cyan-500/20 text-cyan-400' : 'text-slate-500 hover:text-white')}
+        title="Compact view"
+      >
+        <Hash className="w-4 h-4" />
+      </button>
     </div>
   );
 }
@@ -373,42 +419,125 @@ function StatsBar({ total, filtered, domains }: { total: number; filtered: numbe
 }
 
 export default function EntryBrowser() {
-  const [viewMode, setViewMode] = useState<ViewMode>('grid');
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
-  const [selectedType, setSelectedType] = useState<string>('all');
-  const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
+  const { filters, setFilter, clearFilters, hasActiveFilters, activeFilterCount } = useEntriesFilters();
+  const [searchInput, setSearchInput] = useState(filters.q);
+  const [filtersExpanded, setFiltersExpanded] = useState(false);
+  const [isSearchMode, setIsSearchMode] = useState(false);
+  const [isReindexing, setIsReindexing] = useState(false);
+  const [reindexResult, setReindexResult] = useState<{ success: boolean; message: string } | null>(null);
+  const queryClient = useQueryClient();
 
-  const { data: categoriesData } = useQuery({
-    queryKey: ['categories'],
-    queryFn: api.getCategories,
+  // Handle bulk re-index by domain
+  const handleReindexDomain = async () => {
+    if (!filters.domain) return;
+    setIsReindexing(true);
+    setReindexResult(null);
+    try {
+      const result = await api.reindexByDomain(filters.domain, { skip_render: false });
+      setReindexResult({
+        success: true,
+        message: `Queued ${result.entries_queued} entries for re-indexing`,
+      });
+      // Invalidate queries to refresh the list
+      queryClient.invalidateQueries({ queryKey: ['entries'] });
+      queryClient.invalidateQueries({ queryKey: ['entries-all'] });
+    } catch (err) {
+      setReindexResult({
+        success: false,
+        message: err instanceof Error ? err.message : 'Re-index failed',
+      });
+    } finally {
+      setIsReindexing(false);
+    }
+  };
+
+  // Sync search input with URL params
+  useEffect(() => {
+    setSearchInput(filters.q);
+    // Enable search mode if there's a query
+    setIsSearchMode(!!filters.q);
+  }, [filters.q]);
+
+  // Fetch all entries to get counts
+  const { data: allEntriesData } = useQuery({
+    queryKey: ['entries-all'],
+    queryFn: () => api.getEntries({}),
   });
 
-  const { data: entriesData, isLoading } = useQuery({
-    queryKey: ['entries', selectedCategory, selectedType],
+  // Fetch filtered entries (browse mode)
+  const { data: entriesData, isLoading: entriesLoading } = useQuery({
+    queryKey: ['entries', filters.type],
     queryFn: () =>
       api.getEntries({
-        category: selectedCategory || undefined,
-        entry_type: selectedType === 'all' ? undefined : selectedType,
+        entry_type: filters.type === 'all' ? undefined : filters.type,
       }),
+    enabled: !isSearchMode,
   });
 
-  const categories = categoriesData?.categories || [];
-  const allEntries = entriesData?.entries || [];
+  // Semantic search query (search mode)
+  const { data: searchData, isLoading: searchLoading } = useQuery({
+    queryKey: ['search', filters.q, filters.type, filters.domain],
+    queryFn: () =>
+      api.search({
+        q: filters.q,
+        entry_type: filters.type === 'all' ? undefined : filters.type,
+        source_domain: filters.domain || undefined,
+        limit: 50,
+      }),
+    enabled: isSearchMode && !!filters.q,
+  });
 
-  // Extract unique domains from entries
-  const domains = useMemo(() => {
-    const domainSet = new Set<string>();
-    allEntries.forEach((p) => {
-      if (p.source_domain) domainSet.add(p.source_domain);
+  const isLoading = isSearchMode ? searchLoading : entriesLoading;
+  const allEntries = allEntriesData?.entries || [];
+  const filteredEntries = entriesData?.entries || [];
+  const searchResults = searchData?.results || [];
+
+  // Calculate type counts from all entries
+  const typeCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: allEntries.length };
+    allEntries.forEach((entry) => {
+      const type = entry.entry_type.toLowerCase();
+      counts[type] = (counts[type] || 0) + 1;
     });
-    return Array.from(domainSet).sort();
+    return counts;
   }, [allEntries]);
 
-  // Filter entries by domain
+  // Extract unique domains from filtered entries
+  const domains = useMemo(() => {
+    const domainSet = new Set<string>();
+    filteredEntries.forEach((e) => {
+      if (e.source_domain) domainSet.add(e.source_domain);
+    });
+    return Array.from(domainSet).sort();
+  }, [filteredEntries]);
+
+  // Apply domain filtering for browse mode
   const entries = useMemo(() => {
-    if (!selectedDomain) return allEntries;
-    return allEntries.filter((e) => e.source_domain === selectedDomain);
-  }, [allEntries, selectedDomain]);
+    let result = filteredEntries;
+
+    // Filter by domain
+    if (filters.domain) {
+      result = result.filter((e) => e.source_domain === filters.domain);
+    }
+
+    return result;
+  }, [filteredEntries, filters.domain]);
+
+  // Handle search submit - triggers semantic search
+  const handleSearchSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (searchInput.trim()) {
+      setIsSearchMode(true);
+      setFilter('q', searchInput.trim());
+    }
+  };
+
+  // Handle search clear
+  const handleSearchClear = () => {
+    setSearchInput('');
+    setFilter('q', '');
+    setIsSearchMode(false);
+  };
 
   return (
     <div className="space-y-6">
@@ -417,158 +546,246 @@ export default function EntryBrowser() {
         <div>
           <h1 className="text-3xl font-bold text-white tracking-tight">Knowledge Base</h1>
           <div className="mt-2">
-            <StatsBar total={entriesData?.total || 0} filtered={entries.length} domains={domains.length} />
+            <StatsBar total={allEntriesData?.total || 0} filtered={isSearchMode ? searchResults.length : entries.length} domains={domains.length} />
           </div>
         </div>
+      </div>
 
+      {/* Search Bar */}
+      <form onSubmit={handleSearchSubmit} className="bg-slate-900/60 backdrop-blur-sm rounded-xl border border-slate-800/80 p-4">
         <div className="flex items-center gap-3">
-          {/* Type Filter */}
-          <div className="flex items-center gap-2">
-            <Filter className="w-4 h-4 text-slate-500" />
-            <select value={selectedType} onChange={(e) => setSelectedType(e.target.value)} className="input text-sm py-1.5 pr-8 bg-slate-800/80 border-slate-700/80">
-              <option value="all">All Types</option>
-              <option value="document">Document</option>
-              <option value="article">Article</option>
-              <option value="pdf">PDF</option>
-              <option value="code">Code</option>
-              <option value="messaging">Messaging</option>
-              <option value="conversation">Conversation</option>
-            </select>
+          <div className="relative flex-1">
+            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />
+            <input
+              type="text"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              placeholder="Describe what you're looking for... (press Enter for semantic search)"
+              className="input w-full pl-12 pr-10 py-3 bg-slate-800/80 border-slate-700/80 text-white placeholder-slate-500"
+            />
+            {searchInput && (
+              <button
+                type="button"
+                onClick={handleSearchClear}
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
           </div>
+          <SearchModeToggle mode={filters.mode} onChange={(mode) => setFilter('mode', mode)} />
+        </div>
+      </form>
 
-          {/* View Toggle */}
-          <div className="flex items-center bg-slate-800/80 rounded-lg p-1 border border-slate-700/50">
-            <button
-              onClick={() => setViewMode('grid')}
-              className={clsx('p-1.5 rounded transition-all', viewMode === 'grid' ? 'bg-cyan-500/20 text-cyan-400' : 'text-slate-500 hover:text-white')}
-              title="Grid view"
-            >
-              <Grid className="w-4 h-4" />
-            </button>
-            <button
-              onClick={() => setViewMode('list')}
-              className={clsx('p-1.5 rounded transition-all', viewMode === 'list' ? 'bg-cyan-500/20 text-cyan-400' : 'text-slate-500 hover:text-white')}
-              title="List view"
-            >
-              <List className="w-4 h-4" />
-            </button>
-            <button
-              onClick={() => setViewMode('compact')}
-              className={clsx('p-1.5 rounded transition-all', viewMode === 'compact' ? 'bg-cyan-500/20 text-cyan-400' : 'text-slate-500 hover:text-white')}
-              title="Compact view"
-            >
-              <Hash className="w-4 h-4" />
-            </button>
+      {/* Type Pills */}
+      <div className="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
+        {TYPE_PILLS.map((pill) => (
+          <TypePill
+            key={pill.value}
+            pill={pill}
+            isActive={filters.type === pill.value}
+            count={typeCounts[pill.value] || 0}
+            onClick={() => setFilter('type', pill.value)}
+          />
+        ))}
+      </div>
+
+      {/* Collapsible Filter Panel */}
+      <div className="bg-slate-900/40 rounded-xl border border-slate-800/60 overflow-hidden">
+        <div className="flex items-center justify-between p-3">
+          <button
+            onClick={() => setFiltersExpanded(!filtersExpanded)}
+            className={clsx(
+              'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
+              hasActiveFilters
+                ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
+            )}
+          >
+            <Zap className="w-4 h-4" />
+            <span>Filters{activeFilterCount > 0 && ` (${activeFilterCount})`}</span>
+            <ChevronDown
+              className={clsx('w-4 h-4 transition-transform duration-200', filtersExpanded && 'rotate-180')}
+            />
+          </button>
+
+          <ViewModeToggle mode={filters.view} onChange={(mode) => setFilter('view', mode)} />
+        </div>
+
+        {/* Expanded filters */}
+        <div
+          className={clsx(
+            'overflow-hidden transition-all duration-300 ease-in-out',
+            filtersExpanded ? 'max-h-60 opacity-100' : 'max-h-0 opacity-0'
+          )}
+        >
+          <div className="p-4 pt-0 border-t border-slate-800/50 space-y-4">
+            {/* Domain filter with re-index button */}
+            <div className="flex items-center gap-3">
+              <label className="text-xs font-medium text-slate-500 uppercase tracking-wider w-20">Source</label>
+              <select
+                value={filters.domain}
+                onChange={(e) => {
+                  setFilter('domain', e.target.value);
+                  setReindexResult(null); // Clear any previous result
+                }}
+                className="input flex-1 bg-slate-800/80 border-slate-700/80 text-sm"
+              >
+                <option value="">All Sources</option>
+                {domains.map((domain) => (
+                  <option key={domain} value={domain}>
+                    {domain}
+                  </option>
+                ))}
+              </select>
+              {filters.domain && (
+                <button
+                  onClick={handleReindexDomain}
+                  disabled={isReindexing}
+                  className={clsx(
+                    "flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap",
+                    isReindexing
+                      ? "bg-slate-700 text-slate-400 cursor-not-allowed"
+                      : "bg-cyan-600 hover:bg-cyan-500 text-white"
+                  )}
+                  title="Re-index all entries from this domain with JS rendering"
+                >
+                  <RefreshCw className={clsx("w-4 h-4", isReindexing && "animate-spin")} />
+                  {isReindexing ? 'Re-indexing...' : 'Re-index Domain'}
+                </button>
+              )}
+            </div>
+            {/* Re-index result message */}
+            {reindexResult && (
+              <div className={clsx(
+                "flex items-center gap-2 px-3 py-2 rounded-lg text-sm",
+                reindexResult.success
+                  ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+                  : "bg-red-500/15 text-red-400 border border-red-500/30"
+              )}>
+                {reindexResult.success ? (
+                  <RefreshCw className="w-4 h-4" />
+                ) : (
+                  <X className="w-4 h-4" />
+                )}
+                {reindexResult.message}
+              </div>
+            )}
+
+            {/* Active filter chips */}
+            {hasActiveFilters && (
+              <div className="flex items-center gap-2 flex-wrap">
+                {filters.q && (
+                  <div className="flex items-center gap-2 px-3 py-1.5 bg-cyan-500/15 border border-cyan-500/30 rounded-lg">
+                    <Search className="w-3.5 h-3.5 text-cyan-400" />
+                    <span className="text-cyan-400 text-sm">"{filters.q}"</span>
+                    <button onClick={() => setFilter('q', '')} className="text-cyan-400/60 hover:text-cyan-400 ml-1">
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+                {filters.type !== 'all' && (
+                  <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-500/15 border border-blue-500/30 rounded-lg">
+                    <FileText className="w-3.5 h-3.5 text-blue-400" />
+                    <span className="text-blue-400 text-sm capitalize">{filters.type}</span>
+                    <button onClick={() => setFilter('type', 'all')} className="text-blue-400/60 hover:text-blue-400 ml-1">
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+                {filters.domain && (
+                  <div className="flex items-center gap-2 px-3 py-1.5 bg-teal-500/15 border border-teal-500/30 rounded-lg">
+                    <Globe className="w-3.5 h-3.5 text-teal-400" />
+                    <span className="text-teal-400 text-sm font-mono">{filters.domain}</span>
+                    <button onClick={() => setFilter('domain', '')} className="text-teal-400/60 hover:text-teal-400 ml-1">
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+                <button
+                  onClick={clearFilters}
+                  className="text-xs text-slate-500 hover:text-white transition-colors px-2"
+                >
+                  Clear all
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Mobile Filters */}
-      <div className="lg:hidden space-y-3">
-        <select
-          value={selectedDomain || ''}
-          onChange={(e) => setSelectedDomain(e.target.value || null)}
-          className="input w-full bg-slate-800/80 border-slate-700/80"
-        >
-          <option value="">All Sources</option>
-          {domains.map((domain) => (
-            <option key={domain} value={domain}>
-              {domain}
-            </option>
-          ))}
-        </select>
-        <select
-          value={selectedCategory || ''}
-          onChange={(e) => setSelectedCategory(e.target.value || null)}
-          className="input w-full bg-slate-800/80 border-slate-700/80"
-        >
-          <option value="">All Categories</option>
-          {categories.map((cat) => (
-            <option key={cat.name} value={cat.name}>
-              {cat.name} ({cat.entry_count})
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {/* Main Content */}
-      <div className="flex gap-6">
-        <CategorySidebar
-          categories={categories}
-          selectedCategory={selectedCategory}
-          onSelectCategory={setSelectedCategory}
-          domains={domains}
-          selectedDomain={selectedDomain}
-          onSelectDomain={setSelectedDomain}
-        />
-
-        <div className="flex-1 min-w-0">
-          {/* Active Filters */}
-          {(selectedCategory || selectedDomain) && (
-            <div className="mb-4 flex items-center gap-2 flex-wrap">
-              {selectedCategory && (
-                <div className="flex items-center gap-2 px-3 py-1.5 bg-violet-500/15 border border-violet-500/30 rounded-lg">
-                  <Tag className="w-3.5 h-3.5 text-violet-400" />
-                  <span className="text-violet-400 text-sm font-medium">{selectedCategory}</span>
-                  <button onClick={() => setSelectedCategory(null)} className="text-violet-400/60 hover:text-violet-400 ml-1 text-lg leading-none">
-                    ×
-                  </button>
-                </div>
-              )}
-              {selectedDomain && (
-                <div className="flex items-center gap-2 px-3 py-1.5 bg-cyan-500/15 border border-cyan-500/30 rounded-lg">
-                  <Globe className="w-3.5 h-3.5 text-cyan-400" />
-                  <span className="text-cyan-400 text-sm font-mono">{selectedDomain}</span>
-                  <button onClick={() => setSelectedDomain(null)} className="text-cyan-400/60 hover:text-cyan-400 ml-1 text-lg leading-none">
-                    ×
-                  </button>
-                </div>
-              )}
+      {/* Results */}
+      <div className="min-w-0">
+        {isLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <div className="flex flex-col items-center gap-4">
+              <div className="w-10 h-10 border-3 border-cyan-500 border-t-transparent rounded-full animate-spin" />
+              <p className="text-slate-500 text-sm">{isSearchMode ? 'Searching...' : 'Loading entries...'}</p>
+            </div>
+          </div>
+        ) : isSearchMode ? (
+          // Search results view
+          searchResults.length === 0 ? (
+            <div className="bg-slate-900/40 rounded-xl border border-slate-800/60 p-12 text-center">
+              <Search className="w-12 h-12 text-slate-700 mx-auto mb-4" />
+              <p className="text-slate-400 text-lg">No results found</p>
+              <p className="text-slate-600 text-sm mt-1">Try a different search query or adjust your filters</p>
               <button
-                onClick={() => {
-                  setSelectedCategory(null);
-                  setSelectedDomain(null);
-                }}
-                className="text-xs text-slate-500 hover:text-white transition-colors px-2"
+                onClick={handleSearchClear}
+                className="mt-4 px-4 py-2 bg-cyan-500/10 text-cyan-400 rounded-lg border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors text-sm"
               >
-                Clear all
+                Clear search
               </button>
             </div>
-          )}
-
-          {isLoading ? (
-            <div className="flex items-center justify-center py-20">
-              <div className="flex flex-col items-center gap-4">
-                <div className="w-10 h-10 border-3 border-cyan-500 border-t-transparent rounded-full animate-spin" />
-                <p className="text-slate-500 text-sm">Loading entries...</p>
+          ) : (
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 text-sm text-slate-400">
+                <Sparkles className="w-4 h-4 text-cyan-400" />
+                <span>
+                  Found <span className="text-white font-semibold">{searchResults.length}</span> semantic matches for "
+                  <span className="text-cyan-400">{filters.q}</span>"
+                </span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                {searchResults.map((result) => (
+                  <SearchResultCard key={result.id} result={result} />
+                ))}
               </div>
             </div>
-          ) : entries.length === 0 ? (
-            <div className="bg-slate-900/40 rounded-xl border border-slate-800/60 p-12 text-center">
-              <Database className="w-12 h-12 text-slate-700 mx-auto mb-4" />
-              <p className="text-slate-400 text-lg">No entries found</p>
-              <p className="text-slate-600 text-sm mt-1">Try adjusting your filters or add some content</p>
-            </div>
-          ) : viewMode === 'grid' ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-              {entries.map((entry) => (
-                <EntryCard key={entry.id} entry={entry} viewMode="grid" />
-              ))}
-            </div>
-          ) : viewMode === 'list' ? (
-            <div className="space-y-3">
-              {entries.map((entry) => (
-                <EntryCard key={entry.id} entry={entry} viewMode="list" />
-              ))}
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              {entries.map((entry) => (
-                <EntryCard key={entry.id} entry={entry} viewMode="compact" />
-              ))}
-            </div>
-          )}
-        </div>
+          )
+        ) : entries.length === 0 ? (
+          <div className="bg-slate-900/40 rounded-xl border border-slate-800/60 p-12 text-center">
+            <Database className="w-12 h-12 text-slate-700 mx-auto mb-4" />
+            <p className="text-slate-400 text-lg">No entries found</p>
+            <p className="text-slate-600 text-sm mt-1">Try adjusting your filters or add some content</p>
+            {hasActiveFilters && (
+              <button
+                onClick={clearFilters}
+                className="mt-4 px-4 py-2 bg-cyan-500/10 text-cyan-400 rounded-lg border border-cyan-500/30 hover:bg-cyan-500/20 transition-colors text-sm"
+              >
+                Clear all filters
+              </button>
+            )}
+          </div>
+        ) : filters.view === 'grid' ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {entries.map((entry) => (
+              <EntryCard key={entry.id} entry={entry} viewMode="grid" />
+            ))}
+          </div>
+        ) : filters.view === 'list' ? (
+          <div className="space-y-3">
+            {entries.map((entry) => (
+              <EntryCard key={entry.id} entry={entry} viewMode="list" />
+            ))}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            {entries.map((entry) => (
+              <EntryCard key={entry.id} entry={entry} viewMode="compact" />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

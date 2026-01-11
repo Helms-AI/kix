@@ -77,6 +77,9 @@ pub fn create_indexing_router(state: IndexingState) -> Router {
         // Start indexing endpoints
         .route("/api/indexing/url", post(start_url_indexing))
         .route("/api/indexing/files", post(start_file_indexing))
+        // Re-index endpoints
+        .route("/api/indexing/reindex/:id", post(reindex_entry))
+        .route("/api/indexing/reindex-domain", post(reindex_by_domain))
         // SSE endpoints
         .route("/api/indexing/sse/:job_id", get(sse_job_stream))
         .route("/api/indexing/sse", get(sse_global_stream))
@@ -97,12 +100,19 @@ pub struct StartUrlIndexingRequest {
     /// Whether to respect robots.txt
     #[serde(default = "default_true")]
     pub respect_robots: bool,
-    /// Whether to render JavaScript (requires browser)
+    /// Skip JavaScript rendering (faster, for static pages only)
+    /// Note: By default, JS rendering is ENABLED for better content extraction
     #[serde(default)]
-    pub render_js: bool,
+    pub skip_render: bool,
+    /// Timeout for browser rendering in seconds (default: 30)
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
     /// Optional job priority (1-10, default 5)
     #[serde(default = "default_priority")]
     pub priority: u8,
+    /// Maximum pages to process (default: 1000, 0 = unlimited)
+    #[serde(default = "default_max_pages")]
+    pub max_pages: usize,
 }
 
 fn default_depth() -> usize {
@@ -115,6 +125,14 @@ fn default_true() -> bool {
 
 fn default_priority() -> u8 {
     5
+}
+
+fn default_timeout_secs() -> u64 {
+    30
+}
+
+fn default_max_pages() -> usize {
+    1000
 }
 
 /// Response when starting an indexing job
@@ -206,6 +224,47 @@ impl IntoResponse for ApiIndexingError {
     }
 }
 
+/// Request to re-index a single entry
+#[derive(Debug, Deserialize)]
+pub struct ReindexEntryRequest {
+    /// Whether to skip JavaScript rendering (default: false, meaning render by default)
+    #[serde(default)]
+    pub skip_render: bool,
+    /// Timeout for browser rendering in seconds (default: 30)
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Optional job priority (1-10, default 5)
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+}
+
+/// Request to re-index all entries from a domain
+#[derive(Debug, Deserialize)]
+pub struct ReindexByDomainRequest {
+    /// Domain to re-index (e.g., "claude.com")
+    pub domain: String,
+    /// Whether to skip JavaScript rendering (default: false)
+    #[serde(default)]
+    pub skip_render: bool,
+    /// Timeout for browser rendering in seconds (default: 30)
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Optional job priority (1-10, default 5)
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+}
+
+/// Response when re-indexing is started
+#[derive(Debug, Serialize)]
+pub struct ReindexResponse {
+    /// Number of entries queued for re-indexing
+    pub entries_queued: usize,
+    /// Job IDs created for re-indexing
+    pub job_ids: Vec<Uuid>,
+    /// Status message
+    pub status: String,
+}
+
 impl From<IndexingErrorResponse> for ApiIndexingError {
     fn from(err: IndexingErrorResponse) -> Self {
         Self {
@@ -238,7 +297,9 @@ async fn start_url_indexing(
             url: request.url.clone(),
             depth: request.levels,
             respect_robots: request.respect_robots,
-            render_js: request.render_js,
+            render_js: !request.skip_render,  // Invert: skip_render=false means render_js=true
+            timeout_secs: request.timeout_secs,
+            max_pages: request.max_pages,
         },
         config,
     );
@@ -506,4 +567,182 @@ async fn sse_global_stream(
     })?;
 
     Ok(connection.into_sse())
+}
+
+/// POST /api/indexing/reindex/:id - Re-index a single entry
+async fn reindex_entry(
+    State(state): State<IndexingState>,
+    Path(id): Path<String>,
+    Json(request): Json<ReindexEntryRequest>,
+) -> Result<Json<StartIndexingResponse>, ApiIndexingError> {
+    info!(entry_id = %id, "Re-indexing entry");
+
+    // Get the entry to find its source URL
+    let store = state.app_state.store().read().await;
+    let entry = store
+        .get_pattern_by_id(&id)
+        .await
+        .map_err(|e| ApiIndexingError::bad_request("store_error", format!("Failed to get entry: {}", e)))?
+        .ok_or_else(|| ApiIndexingError::bad_request("not_found", format!("Entry not found: {}", id)))?;
+
+    // Get the source URL from source_path
+    let source_url = entry.source_path.ok_or_else(|| {
+        ApiIndexingError::bad_request("no_source", "Entry has no source URL and cannot be re-indexed")
+    })?;
+
+    // Validate it's a URL
+    let _parsed_url = url::Url::parse(&source_url).map_err(|e| {
+        ApiIndexingError::bad_request("invalid_url", format!("Entry source is not a valid URL: {}", e))
+    })?;
+
+    drop(store);
+
+    // Delete existing entry and chunks
+    {
+        let store = state.app_state.store().write().await;
+        if let Err(e) = store.delete_chunks_by_entry(&id).await {
+            error!(error = %e, "Failed to delete chunks for entry");
+        }
+        if let Err(e) = store.delete_entry(&id).await {
+            error!(error = %e, "Failed to delete entry");
+        }
+    }
+
+    // Invalidate caches
+    state.app_state.invalidate_caches();
+
+    // Create a new URL indexing job with browser rendering
+    let mut config = JobConfig::default();
+    config.priority = request.priority;
+
+    let job = Job::new(
+        JobType::Url {
+            url: source_url.clone(),
+            depth: 0, // Only re-index this specific URL, no following links
+            respect_robots: true,
+            render_js: !request.skip_render,
+            timeout_secs: request.timeout_secs,
+            max_pages: 1,  // Only this one page
+        },
+        config,
+    );
+
+    let job_id = job.id;
+
+    // Submit to queue
+    state
+        .job_queue
+        .submit(job)
+        .await
+        .map_err(|e| ApiIndexingError::bad_request(
+            "queue_error",
+            format!("Failed to submit re-index job: {}", e),
+        ))?;
+
+    info!(job_id = %job_id, url = %source_url, "Re-index job submitted");
+
+    Ok(Json(StartIndexingResponse {
+        job_id,
+        sse_url: format!("/api/indexing/sse/{}", job_id),
+        status: "pending".to_string(),
+    }))
+}
+
+/// POST /api/indexing/reindex-domain - Re-index all entries from a domain
+async fn reindex_by_domain(
+    State(state): State<IndexingState>,
+    Json(request): Json<ReindexByDomainRequest>,
+) -> Result<Json<ReindexResponse>, ApiIndexingError> {
+    info!(domain = %request.domain, "Re-indexing all entries from domain");
+
+    // Get all entries and filter by domain
+    let store = state.app_state.store().read().await;
+    let all_entries = store
+        .list_all_entries()
+        .await
+        .map_err(|e| ApiIndexingError::bad_request("store_error", format!("Failed to list entries: {}", e)))?;
+
+    // Filter entries by domain
+    let domain_entries: Vec<_> = all_entries
+        .into_iter()
+        .filter(|entry| {
+            entry.source_path.as_ref().map_or(false, |path| {
+                url::Url::parse(path)
+                    .ok()
+                    .and_then(|u| u.domain().map(|d| d.to_string()))
+                    .map_or(false, |d| d.contains(&request.domain) || request.domain.contains(&d))
+            })
+        })
+        .collect();
+
+    if domain_entries.is_empty() {
+        return Err(ApiIndexingError::bad_request(
+            "no_entries",
+            format!("No entries found for domain: {}", request.domain),
+        ));
+    }
+
+    let entry_count = domain_entries.len();
+    drop(store);
+
+    // Delete all entries and their chunks, then create jobs
+    let mut job_ids = Vec::new();
+
+    for entry in domain_entries {
+        let entry_id = entry.id.clone();
+        let source_url = match entry.source_path {
+            Some(url) => url,
+            None => continue,
+        };
+
+        // Delete existing entry and chunks
+        {
+            let store = state.app_state.store().write().await;
+            if let Err(e) = store.delete_chunks_by_entry(&entry_id).await {
+                error!(error = %e, entry_id = %entry_id, "Failed to delete chunks");
+            }
+            if let Err(e) = store.delete_entry(&entry_id).await {
+                error!(error = %e, entry_id = %entry_id, "Failed to delete entry");
+            }
+        }
+
+        // Create job for this URL
+        let mut config = JobConfig::default();
+        config.priority = request.priority;
+
+        let job = Job::new(
+            JobType::Url {
+                url: source_url,
+                depth: 0,
+                respect_robots: true,
+                render_js: !request.skip_render,
+                timeout_secs: request.timeout_secs,
+                max_pages: 1,  // Only this one page
+            },
+            config,
+        );
+
+        let job_id = job.id;
+        job_ids.push(job_id);
+
+        // Submit to queue
+        if let Err(e) = state.job_queue.submit(job).await {
+            error!(error = %e, "Failed to submit re-index job");
+        }
+    }
+
+    // Invalidate caches
+    state.app_state.invalidate_caches();
+
+    info!(
+        domain = %request.domain,
+        entries_queued = job_ids.len(),
+        "Domain re-index jobs submitted"
+    );
+
+    Ok(Json(ReindexResponse {
+        entries_queued: job_ids.len(),
+        job_ids,
+        status: format!("Queued {} entries from domain '{}' for re-indexing", entry_count, request.domain),
+    }))
 }

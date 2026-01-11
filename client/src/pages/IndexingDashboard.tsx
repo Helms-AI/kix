@@ -94,9 +94,12 @@ function UrlIndexingForm({ onSuccess }: { onSuccess?: () => void }) {
   const [url, setUrl] = useState('');
   const [levels, setLevels] = useState(1);
   const [respectRobots, setRespectRobots] = useState(true);
-  const [renderJs, setRenderJs] = useState(false);
+  const [skipRender, setSkipRender] = useState(false);  // Default: render JS (skipRender=false)
+  const [timeoutSecs, setTimeoutSecs] = useState(30);   // Browser rendering timeout
   const [priority, setPriority] = useState(5);
   const [urlError, setUrlError] = useState('');
+  const [maxPages, setMaxPages] = useState(1000);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const queryClient = useQueryClient();
 
@@ -127,8 +130,10 @@ function UrlIndexingForm({ onSuccess }: { onSuccess?: () => void }) {
       url,
       levels,
       respect_robots: respectRobots,
-      render_js: renderJs,
+      skip_render: skipRender,
+      timeout_secs: timeoutSecs,
       priority,
+      max_pages: maxPages,
     });
   };
 
@@ -187,54 +192,118 @@ function UrlIndexingForm({ onSuccess }: { onSuccess?: () => void }) {
         </div>
       </div>
 
-      {/* Options Grid */}
-      <div className="grid grid-cols-2 gap-4">
-        <label className="flex items-center gap-3 p-3 bg-slate-800/30 rounded-lg border border-slate-700/50 cursor-pointer hover:border-slate-600 transition-colors">
-          <input
-            type="checkbox"
-            checked={respectRobots}
-            onChange={(e) => setRespectRobots(e.target.checked)}
-            className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-cyan-500 focus:ring-cyan-500 focus:ring-offset-0"
-          />
-          <div>
-            <span className="text-sm text-slate-300 block">Respect robots.txt</span>
-            <span className="text-xs text-slate-500">Follow crawl rules</span>
-          </div>
-        </label>
+      {/* Advanced Settings Toggle */}
+      <button
+        type="button"
+        onClick={() => setShowAdvanced(!showAdvanced)}
+        className="flex items-center gap-2 text-sm text-slate-400 hover:text-cyan-400 transition-colors"
+      >
+        {showAdvanced ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+        Advanced Settings
+      </button>
 
-        <label className="flex items-center gap-3 p-3 bg-slate-800/30 rounded-lg border border-slate-700/50 cursor-pointer hover:border-slate-600 transition-colors">
-          <input
-            type="checkbox"
-            checked={renderJs}
-            onChange={(e) => setRenderJs(e.target.checked)}
-            className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-cyan-500 focus:ring-cyan-500 focus:ring-offset-0"
-          />
-          <div>
-            <span className="text-sm text-slate-300 block">Render JavaScript</span>
-            <span className="text-xs text-slate-500">Use headless browser</span>
-          </div>
-        </label>
-      </div>
+      {/* Advanced Settings Panel */}
+      {showAdvanced && (
+        <div className="space-y-4 p-4 bg-slate-800/30 rounded-lg border border-slate-700/50">
+          {/* Options Grid */}
+          <div className="grid grid-cols-2 gap-4">
+            <label className="flex items-center gap-3 p-3 bg-slate-800/50 rounded-lg border border-slate-700/50 cursor-pointer hover:border-slate-600 transition-colors">
+              <input
+                type="checkbox"
+                checked={respectRobots}
+                onChange={(e) => setRespectRobots(e.target.checked)}
+                className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-cyan-500 focus:ring-cyan-500 focus:ring-offset-0"
+              />
+              <div>
+                <span className="text-sm text-slate-300 block">Respect robots.txt</span>
+                <span className="text-xs text-slate-500">Follow crawl rules</span>
+              </div>
+            </label>
 
-      {/* Priority Slider */}
-      <div>
-        <div className="flex justify-between items-center mb-2">
-          <label className="text-sm font-medium text-slate-300">Priority</label>
-          <span className="text-sm font-mono text-cyan-400">{priority}</span>
+            <label className="flex items-center gap-3 p-3 bg-slate-800/50 rounded-lg border border-slate-700/50 cursor-pointer hover:border-slate-600 transition-colors">
+              <input
+                type="checkbox"
+                checked={skipRender}
+                onChange={(e) => setSkipRender(e.target.checked)}
+                className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-cyan-500 focus:ring-cyan-500 focus:ring-offset-0"
+              />
+              <div>
+                <span className="text-sm text-slate-300 block">Skip JS rendering</span>
+                <span className="text-xs text-slate-500">Faster, for static pages</span>
+              </div>
+            </label>
+          </div>
+
+          {/* Render Timeout (only show when JS rendering is enabled) */}
+          {!skipRender && (
+            <div>
+              <div className="flex justify-between items-center mb-2">
+                <label className="text-sm font-medium text-slate-300">
+                  Render Timeout
+                </label>
+                <span className="text-sm font-mono text-cyan-400">{timeoutSecs}s</span>
+              </div>
+              <input
+                type="range"
+                min="10"
+                max="120"
+                step="5"
+                value={timeoutSecs}
+                onChange={(e) => setTimeoutSecs(parseInt(e.target.value))}
+                className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer slider-thumb"
+              />
+              <div className="flex justify-between text-xs text-slate-600 mt-1 font-mono">
+                <span>10s</span>
+                <span>120s</span>
+              </div>
+            </div>
+          )}
+
+          {/* Priority Slider */}
+          <div>
+            <div className="flex justify-between items-center mb-2">
+              <label className="text-sm font-medium text-slate-300">Priority</label>
+              <span className="text-sm font-mono text-cyan-400">{priority}</span>
+            </div>
+            <input
+              type="range"
+              min="1"
+              max="10"
+              value={priority}
+              onChange={(e) => setPriority(parseInt(e.target.value))}
+              className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer slider-thumb"
+            />
+            <div className="flex justify-between text-xs text-slate-600 mt-1 font-mono">
+              <span>1 (low)</span>
+              <span>10 (urgent)</span>
+            </div>
+          </div>
+
+          {/* Max Pages */}
+          <div>
+            <div className="flex justify-between items-center mb-2">
+              <label className="text-sm font-medium text-slate-300">
+                Max Pages
+              </label>
+              <span className="text-sm font-mono text-cyan-400">
+                {maxPages === 0 ? 'Unlimited' : maxPages}
+              </span>
+            </div>
+            <input
+              type="number"
+              value={maxPages}
+              onChange={(e) => setMaxPages(Math.max(0, parseInt(e.target.value) || 0))}
+              min={0}
+              max={10000}
+              placeholder="1000"
+              className="w-full px-4 py-2 bg-slate-800/50 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 focus:border-cyan-500 font-mono text-sm"
+            />
+            <p className="text-xs text-slate-500 mt-1">
+              Maximum pages to crawl. Set to 0 for unlimited.
+            </p>
+          </div>
         </div>
-        <input
-          type="range"
-          min="1"
-          max="10"
-          value={priority}
-          onChange={(e) => setPriority(parseInt(e.target.value))}
-          className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer slider-thumb"
-        />
-        <div className="flex justify-between text-xs text-slate-600 mt-1 font-mono">
-          <span>1 (low)</span>
-          <span>10 (urgent)</span>
-        </div>
-      </div>
+      )}
 
       {/* Submit Button */}
       <button

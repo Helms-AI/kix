@@ -5,8 +5,10 @@ export interface StartUrlIndexingRequest {
   url: string;
   levels: number;
   respect_robots: boolean;
-  render_js: boolean;
+  skip_render: boolean;  // If true, skip JS rendering (faster, for static pages)
+  timeout_secs: number;  // Browser rendering timeout in seconds
   priority: number;
+  max_pages: number;  // Maximum pages to crawl (0 = unlimited)
 }
 
 export interface FileUpload {

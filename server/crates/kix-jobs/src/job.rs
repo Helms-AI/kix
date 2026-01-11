@@ -89,6 +89,11 @@ pub enum JobType {
         depth: usize,
         respect_robots: bool,
         render_js: bool,
+        /// Timeout for browser rendering in seconds
+        timeout_secs: u64,
+        /// Maximum pages to process (0 = unlimited)
+        #[serde(default = "default_max_pages")]
+        max_pages: usize,
     },
     /// Index uploaded files
     FileUpload {
@@ -104,6 +109,11 @@ pub enum JobType {
         collection_id: String,
         filters: Option<ReindexFilters>,
     },
+}
+
+/// Default max pages limit
+fn default_max_pages() -> usize {
+    1000
 }
 
 /// Filters for re-indexing
@@ -182,7 +192,9 @@ impl Job {
                 url: url.into(),
                 depth,
                 respect_robots: true,
-                render_js: false,
+                render_js: true,  // Enable JS rendering by default
+                timeout_secs: 30, // Default timeout
+                max_pages: default_max_pages(),
             },
             JobConfig::default(),
         )

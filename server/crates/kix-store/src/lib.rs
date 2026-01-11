@@ -11,4 +11,4 @@ pub mod store;
 
 pub use error::StoreError;
 pub use store::{KixStore, EipStore, DEFAULT_EMBEDDING_DIM, get_embedding_dim};
-pub use search::{SearchResult, SearchFilters, EntrySummary, PatternSummary};
+pub use search::{SearchResult, SearchFilters, EntrySummary, PatternSummary, EntryChunk};

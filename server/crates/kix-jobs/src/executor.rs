@@ -1,10 +1,12 @@
 //! Job executor for running jobs
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -195,9 +197,22 @@ impl JobExecutor {
                 depth,
                 respect_robots,
                 render_js,
+                timeout_secs,
+                max_pages,
             } => {
-                Self::execute_url_job(job, url, *depth, *respect_robots, *render_js, &tracker, sse_manager, processor)
-                    .await?
+                Self::execute_url_job(
+                    job,
+                    url,
+                    *depth,
+                    *max_pages,
+                    *respect_robots,
+                    *render_js,
+                    *timeout_secs,
+                    &tracker,
+                    sse_manager,
+                    processor,
+                )
+                .await?
             }
             JobType::FileUpload {
                 file_paths,
@@ -236,64 +251,78 @@ impl JobExecutor {
         Ok(result)
     }
 
-    /// Execute URL crawling job
+    /// Execute URL crawling job with STREAMING processing
+    ///
+    /// This processes pages AS THEY ARE CRAWLED rather than collecting all first.
+    /// This provides immediate feedback, lower memory usage, and early exit capability.
     async fn execute_url_job(
         job: &Job,
         url: &str,
         depth: usize,
+        max_pages: usize,
         respect_robots: bool,
-        _render_js: bool,
+        render_js: bool,
+        timeout_secs: u64,
         tracker: &ProgressTracker,
         sse_manager: &ConnectionManager,
         processor: Option<&Arc<ContentProcessor>>,
     ) -> Result<JobResult, JobError> {
+        use std::time::Duration;
         use url::Url;
 
-        tracker.set_step("Crawling URL").await;
+        tracker.set_step("Crawling and processing URL").await;
         tracker.set_current_item(Some(url.to_string())).await;
 
         // Parse the seed URL
         let seed_url = Url::parse(url)
             .map_err(|e| JobError::Processing(format!("Invalid URL: {}", e)))?;
 
-        // Configure and run crawler
+        // Configure crawler
+        let effective_max_pages = if max_pages == 0 { usize::MAX } else { max_pages };
         let crawler_config = CrawlerConfig {
             max_depth: depth,
-            max_pages: usize::MAX, // Unlimited pages
+            max_pages: effective_max_pages,
             respect_robots,
+            render_js,
+            render_timeout: Duration::from_secs(timeout_secs),
             ..Default::default()
         };
 
         let crawler = Crawler::new(crawler_config)
+            .await
             .map_err(|e| JobError::Processing(format!("Failed to create crawler: {}", e)))?;
 
-        // Use a channel to collect results from the callback
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CrawlResult>();
+        // Stats for streaming processing (using atomics for thread-safe access)
+        let processed_count = Arc::new(AtomicUsize::new(0));
+        let mut total_chunks = 0;
+        let mut total_embeddings = 0;
+        let mut errors = vec![];
+        let job_id = job.id;
+        let start = std::time::Instant::now();
+        let concurrency = 8; // Process up to 8 pages concurrently
 
-        // Use callback-based crawling - just collect results
-        let stats = crawler
-            .crawl(seed_url, move |result| {
-                // Send result through channel
-                let _ = tx.send(result);
-            })
-            .await
-            .map_err(|e| JobError::Processing(format!("Crawl failed: {}", e)))?;
+        // Use UNBOUNDED channel - send() is synchronous and never drops messages
+        // This ensures all crawled pages are processed, even if processing is slower than crawling
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<CrawlResult>();
 
-        // Collect all results from the channel
-        let mut pages = Vec::new();
-        rx.close();
-        while let Some(result) = rx.recv().await {
-            pages.push(result);
-        }
+        // Spawn crawler task - runs independently
+        let crawler_handle = tokio::spawn(async move {
+            let result = crawler
+                .crawl(seed_url, move |crawl_result| {
+                    // Unbounded send - synchronous, never blocks, never drops
+                    let _ = tx.send(crawl_result);
+                })
+                .await;
 
-        tracker.set_total(pages.len());
-        info!(url = url, pages = pages.len(), stats = ?stats, "Crawl completed, processing pages in parallel");
+            // Shutdown crawler to release browser resources
+            if let Err(e) = crawler.shutdown().await {
+                warn!("Failed to shutdown crawler: {}", e);
+            }
 
-        // Process pages in parallel using buffered streams with real-time updates
-        let total_pages = pages.len();
-        let concurrency = 16; // Process up to 16 pages simultaneously
+            result
+        });
 
-        // Define the result type for each page processing
+        // Define result type for parallel processing
         struct PageResult {
             url: String,
             chunks: usize,
@@ -301,30 +330,39 @@ impl JobExecutor {
             error: Option<String>,
         }
 
-        // Create parallel processing stream - use streaming iteration for real-time updates
-        let job_id = job.id;
-        let result_stream = stream::iter(pages)
-            .map(|page| {
-                let page_url = page.url.to_string();
-                let content = page.content.clone();
-                let proc = processor.cloned();
+        // Convert receiver to stream for parallel processing
+        let result_stream = UnboundedReceiverStream::new(rx);
+        let processed_count_clone = processed_count.clone();
 
+        // Process pages in PARALLEL using buffer_unordered (like file uploads)
+        info!(url = url, max_pages = effective_max_pages, concurrency = concurrency, "Starting parallel crawl and process");
+
+        let processing_stream = result_stream
+            .take_while(move |_| {
+                // Stop accepting new pages if we've reached max_pages
+                let count = processed_count_clone.load(Ordering::Relaxed);
+                futures::future::ready(count < effective_max_pages)
+            })
+            .map(|result| {
+                let proc = processor.cloned();
                 async move {
-                    if let Some(proc) = proc {
-                        match proc.process_html(&content, &page_url).await {
-                            Ok(result) => PageResult {
+                    let page_url = result.url.to_string();
+                    if let Some(ref p) = proc {
+                        match p.process_html(&result.content, &page_url).await {
+                            Ok(res) => PageResult {
                                 url: page_url,
-                                chunks: result.chunks_created,
-                                embeddings: result.embeddings_generated,
+                                chunks: res.chunks_created,
+                                embeddings: res.embeddings_generated,
                                 error: None,
                             },
                             Err(e) => {
-                                warn!(url = page_url, error = %e, "Failed to process page");
+                                let error_msg = format!("Failed to process {}: {}", page_url, e);
+                                warn!("{}", error_msg);
                                 PageResult {
-                                    url: page_url.clone(),
+                                    url: page_url,
                                     chunks: 0,
                                     embeddings: 0,
-                                    error: Some(format!("Failed to process {}: {}", page_url, e)),
+                                    error: Some(error_msg),
                                 }
                             }
                         }
@@ -338,25 +376,19 @@ impl JobExecutor {
                     }
                 }
             })
-            .buffer_unordered(concurrency);
+            .buffer_unordered(concurrency); // Process up to 8 pages concurrently
 
-        // Process results as they complete and send real-time updates
-        let mut total_chunks = 0;
-        let mut total_embeddings = 0;
-        let mut errors = vec![];
-        let mut processed_count = 0;
+        // Pin the stream for iteration
+        futures::pin_mut!(processing_stream);
 
-        // Use pin_mut! for safe iteration over the stream
-        futures::pin_mut!(result_stream);
-
-        while let Some(result) = result_stream.next().await {
-            processed_count += 1;
+        // Collect results as they complete and send real-time updates
+        while let Some(result) = processing_stream.next().await {
+            let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
             total_chunks += result.chunks;
             total_embeddings += result.embeddings;
 
             if let Some(ref err) = result.error {
                 errors.push(err.clone());
-                // Send error event for processing failure
                 let _ = sse_manager.broadcast_to_job(
                     job_id,
                     Event::new(EventType::Error {
@@ -367,7 +399,7 @@ impl JobExecutor {
                     }),
                 );
             } else {
-                // Send item processed event immediately
+                // Send SSE update immediately
                 let _ = sse_manager.broadcast_to_job(
                     job_id,
                     Event::new(EventType::ItemProcessed {
@@ -385,7 +417,7 @@ impl JobExecutor {
             tracker
                 .update_metrics(|m| {
                     m.chunks_created = total_chunks;
-                    m.items_discovered = processed_count;
+                    m.items_discovered = count;
                 })
                 .await;
 
@@ -395,21 +427,48 @@ impl JobExecutor {
                 job_id,
                 Event::new(EventType::Progress {
                     job_id,
-                    processed: processed_count,
-                    total: total_pages,
+                    processed: count,
+                    total: effective_max_pages.min(count + 100), // Estimate since we don't know total
                     current_item: Some(result.url),
                     rate: progress.rate,
-                    percentage: progress.percentage,
+                    percentage: if effective_max_pages < usize::MAX {
+                        (count as f32 / effective_max_pages as f32) * 100.0
+                    } else {
+                        progress.percentage
+                    },
                 }),
             );
         }
 
+        // Wait for crawler to finish (it may have more pages but we stopped processing)
+        let final_count = processed_count.load(Ordering::Relaxed);
+        match crawler_handle.await {
+            Ok(Ok(stats)) => {
+                info!(
+                    "Crawl completed: {} pages crawled, {} processed, {} bytes, {} errors",
+                    stats.pages_crawled, final_count, stats.bytes_downloaded, stats.errors
+                );
+            }
+            Ok(Err(e)) => {
+                // Crawler error - but we may have processed some pages
+                warn!("Crawler error: {}", e);
+                if final_count == 0 {
+                    return Err(JobError::Processing(format!("Crawl failed: {}", e)));
+                }
+                errors.push(format!("Crawler error: {}", e));
+            }
+            Err(e) => {
+                warn!("Crawler task panic: {}", e);
+                errors.push(format!("Crawler task error: {}", e));
+            }
+        }
+
         Ok(JobResult {
-            items_processed: total_pages,
+            items_processed: final_count,
             chunks_created: total_chunks,
             embeddings_generated: total_embeddings,
             errors,
-            duration_ms: tracker.elapsed().as_millis() as u64,
+            duration_ms: start.elapsed().as_millis() as u64,
         })
     }
 

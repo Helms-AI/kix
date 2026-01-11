@@ -17,7 +17,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, error};
 
 use kix_embeddings::EmbeddingGenerator;
-use kix_store::search::{PatternSummary, SearchFilters, SearchResult};
+use kix_store::search::{PatternSummary, SearchFilters, SearchResult, EntryChunk};
 use kix_store::KixStore;
 
 /// Cache configuration constants
@@ -120,12 +120,13 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/stats", get(get_stats))
-        .route("/api/patterns", get(list_patterns))
-        .route("/api/patterns-related/*id", get(get_related_patterns))
-        .route("/api/patterns/*id", get(get_pattern))
+        .route("/api/entries", get(list_entries))
+        .route("/api/entries-related/*id", get(get_related_entries))
+        .route("/api/entries-chunks/*id", get(get_entry_chunks))
+        .route("/api/entries/*id", get(get_entry))
         .route("/api/categories", get(list_categories))
-        .route("/api/search", get(search_patterns))
-        .route("/api/graph", get(get_pattern_graph))
+        .route("/api/search", get(search_entries))
+        .route("/api/graph", get(get_entry_graph))
         .route("/api/health", get(health_check))
         .layer(cors)
         .with_state(state)
@@ -136,9 +137,11 @@ pub fn create_router(state: AppState) -> Router {
 /// Dashboard statistics response.
 #[derive(Serialize)]
 pub struct StatsResponse {
-    pub total_patterns: usize,
-    pub messaging_patterns: usize,
-    pub conversation_patterns: usize,
+    pub total_entries: usize,
+    pub document_entries: usize,
+    pub article_entries: usize,
+    pub pdf_entries: usize,
+    pub code_entries: usize,
     pub total_chunks: usize,
     pub total_documents: usize,
     pub categories: Vec<CategoryCount>,
@@ -151,31 +154,41 @@ pub struct CategoryCount {
     pub count: usize,
 }
 
-/// Pattern list response.
+/// Entry list response.
 #[derive(Serialize)]
-pub struct PatternListResponse {
-    pub patterns: Vec<PatternResponse>,
+pub struct EntryListResponse {
+    pub entries: Vec<EntryResponse>,
     pub total: usize,
 }
 
-/// Individual pattern response.
+/// Individual entry response.
 #[derive(Serialize)]
-pub struct PatternResponse {
+pub struct EntryResponse {
     pub id: String,
     pub title: String,
-    pub pattern_type: String,
-    pub categories: Vec<String>,
+    pub entry_type: String,
+    pub tags: Vec<String>,
     pub description: String,
+    pub source_type: Option<String>,
+    pub source_domain: Option<String>,
+    pub source_path: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
-impl From<PatternSummary> for PatternResponse {
+impl From<PatternSummary> for EntryResponse {
     fn from(p: PatternSummary) -> Self {
         Self {
             id: p.id,
             title: p.title,
-            pattern_type: p.entry_type,
-            categories: p.tags,
+            entry_type: p.entry_type,
+            tags: p.tags,
             description: p.description,
+            source_type: p.source_type,
+            source_domain: p.source_domain,
+            source_path: p.source_path,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
         }
     }
 }
@@ -192,9 +205,12 @@ pub struct SearchResponse {
 #[derive(Serialize)]
 pub struct SearchResultResponse {
     pub id: String,
-    pub pattern_name: String,
-    pub pattern_type: String,
-    pub categories: Vec<String>,
+    pub entry_id: String,
+    pub entry_title: String,
+    pub entry_type: String,
+    pub tags: Vec<String>,
+    pub chunk_type: Option<String>,
+    pub source_domain: Option<String>,
     pub text: String,
     pub score: f32,
 }
@@ -202,12 +218,44 @@ pub struct SearchResultResponse {
 impl From<SearchResult> for SearchResultResponse {
     fn from(r: SearchResult) -> Self {
         Self {
-            id: r.entry_id,
-            pattern_name: r.entry_title,
-            pattern_type: r.entry_type,
-            categories: r.tags,
+            id: r.chunk_id.clone(),
+            entry_id: r.entry_id,
+            entry_title: r.entry_title,
+            entry_type: r.entry_type,
+            tags: r.tags,
+            chunk_type: r.chunk_type,
+            source_domain: r.source_domain,
             text: r.text,
             score: r.score,
+        }
+    }
+}
+
+/// Entry chunks response.
+#[derive(Serialize)]
+pub struct ChunksResponse {
+    pub chunks: Vec<ChunkResponse>,
+    pub total: usize,
+}
+
+/// Individual chunk response.
+#[derive(Serialize)]
+pub struct ChunkResponse {
+    pub id: String,
+    pub entry_id: String,
+    pub text: String,
+    pub chunk_type: Option<String>,
+    pub chunk_index: Option<i32>,
+}
+
+impl From<EntryChunk> for ChunkResponse {
+    fn from(c: EntryChunk) -> Self {
+        Self {
+            id: c.chunk_id,
+            entry_id: c.entry_id,
+            text: c.text,
+            chunk_type: c.chunk_type,
+            chunk_index: c.chunk_index,
         }
     }
 }
@@ -218,12 +266,12 @@ pub struct CategoriesResponse {
     pub categories: Vec<CategoryInfo>,
 }
 
-/// Category info with patterns.
+/// Category info with entries.
 #[derive(Serialize)]
 pub struct CategoryInfo {
     pub name: String,
-    pub pattern_count: usize,
-    pub pattern_type: String,
+    pub entry_count: usize,
+    pub entry_type: String,
 }
 
 /// Pattern graph response for visualization.
@@ -233,12 +281,12 @@ pub struct PatternGraphResponse {
     pub edges: Vec<GraphEdge>,
 }
 
-/// Graph node representing a pattern.
+/// Graph node representing an entry.
 #[derive(Serialize)]
 pub struct GraphNode {
     pub id: String,
     pub label: String,
-    pub pattern_type: String,
+    pub entry_type: String,
     pub category: String,
 }
 
@@ -259,11 +307,11 @@ pub struct HealthResponse {
 
 // === Query Parameters ===
 
-/// Query parameters for listing patterns.
+/// Query parameters for listing entries.
 #[derive(Deserialize)]
-pub struct ListPatternsQuery {
+pub struct ListEntriesQuery {
     pub category: Option<String>,
-    pub pattern_type: Option<String>,
+    pub entry_type: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -272,7 +320,7 @@ pub struct ListPatternsQuery {
 #[derive(Deserialize)]
 pub struct SearchQuery {
     pub q: String,
-    pub pattern_type: Option<String>,
+    pub entry_type: Option<String>,
     pub category: Option<String>,
     pub limit: Option<usize>,
     /// Filter by source domain (e.g., "docs.example.com")
@@ -310,26 +358,35 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
 
     let store = state.store.read().await;
 
-    // Get all patterns to compute stats
-    let all_patterns = store
+    // Get all entries to compute stats
+    let all_entries = store
         .list_all_patterns()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let messaging_patterns = all_patterns
+    // Count by actual entry types
+    let document_entries = all_entries
         .iter()
-        .filter(|p| p.entry_type == "messaging")
+        .filter(|p| p.entry_type == "document")
         .count();
-    let conversation_patterns = all_patterns
+    let article_entries = all_entries
         .iter()
-        .filter(|p| p.entry_type == "conversation")
+        .filter(|p| p.entry_type == "article")
+        .count();
+    let pdf_entries = all_entries
+        .iter()
+        .filter(|p| p.entry_type == "pdf")
+        .count();
+    let code_entries = all_entries
+        .iter()
+        .filter(|p| p.entry_type == "code")
         .count();
 
     // Count by category
     let mut category_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for pattern in &all_patterns {
-        for category in &pattern.tags {
+    for entry in &all_entries {
+        for category in &entry.tags {
             *category_counts.entry(category.clone()).or_insert(0) += 1;
         }
     }
@@ -339,28 +396,30 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
         .map(|(name, count)| CategoryCount { name, count })
         .collect();
 
-    // Get total chunks (estimate from pattern count * avg chunks per pattern)
-    let total_chunks = all_patterns.len() * 3; // Rough estimate
-    let total_documents = all_patterns.len();
+    // Get total chunks (estimate from entry count * avg chunks per entry)
+    let total_chunks = all_entries.len() * 3; // Rough estimate
+    let total_documents = all_entries.len();
 
     Ok(Json(StatsResponse {
-        total_patterns: all_patterns.len(),
-        messaging_patterns,
-        conversation_patterns,
+        total_entries: all_entries.len(),
+        document_entries,
+        article_entries,
+        pdf_entries,
+        code_entries,
         total_chunks,
         total_documents,
         categories,
     }))
 }
 
-/// GET /api/patterns - List all patterns.
-async fn list_patterns(
+/// GET /api/entries - List all entries.
+async fn list_entries(
     State(state): State<AppState>,
-    Query(query): Query<ListPatternsQuery>,
-) -> Result<Json<PatternListResponse>, StatusCode> {
+    Query(query): Query<ListEntriesQuery>,
+) -> Result<Json<EntryListResponse>, StatusCode> {
     info!(
-        "Listing patterns - category: {:?}, type: {:?}",
-        query.category, query.pattern_type
+        "Listing entries - category: {:?}, type: {:?}",
+        query.category, query.entry_type
     );
 
     let store = state.store.read().await;
@@ -370,9 +429,9 @@ async fn list_patterns(
             .list_by_category(category)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    } else if let Some(ref pattern_type) = query.pattern_type {
+    } else if let Some(ref entry_type) = query.entry_type {
         store
-            .list_by_pattern_type(pattern_type)
+            .list_by_pattern_type(entry_type)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     } else {
@@ -386,22 +445,22 @@ async fn list_patterns(
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(100);
 
-    let patterns: Vec<PatternResponse> = patterns
+    let entries: Vec<EntryResponse> = patterns
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(PatternResponse::from)
+        .map(EntryResponse::from)
         .collect();
 
-    Ok(Json(PatternListResponse { patterns, total }))
+    Ok(Json(EntryListResponse { entries, total }))
 }
 
-/// GET /api/patterns/:id - Get a specific pattern.
-async fn get_pattern(
+/// GET /api/entries/:id - Get a specific entry.
+async fn get_entry(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<PatternResponse>, StatusCode> {
-    info!("Getting pattern: {}", id);
+) -> Result<Json<EntryResponse>, StatusCode> {
+    info!("Getting entry: {}", id);
 
     let store = state.store.read().await;
     let pattern = store
@@ -410,31 +469,53 @@ async fn get_pattern(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     match pattern {
-        Some(p) => Ok(Json(PatternResponse::from(p))),
+        Some(p) => Ok(Json(EntryResponse::from(p))),
         None => Err(StatusCode::NOT_FOUND),
     }
 }
 
-/// GET /api/patterns-related/:id - Get related patterns.
-async fn get_related_patterns(
+/// GET /api/entries-chunks/:id - Get chunks for an entry.
+async fn get_entry_chunks(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<PatternListResponse>, StatusCode> {
-    info!("Getting related patterns for: {}", id);
+) -> Result<Json<ChunksResponse>, StatusCode> {
+    info!("Getting chunks for entry: {}", id);
+
+    let store = state.store.read().await;
+    let chunks = store
+        .get_chunks_by_entry_id(&id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get chunks for entry '{}': {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let total = chunks.len();
+    let chunks: Vec<ChunkResponse> = chunks.into_iter().map(ChunkResponse::from).collect();
+
+    Ok(Json(ChunksResponse { chunks, total }))
+}
+
+/// GET /api/entries-related/:id - Get related entries.
+async fn get_related_entries(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<EntryListResponse>, StatusCode> {
+    info!("Getting related entries for: {}", id);
 
     let store = state.store.read().await;
     let pattern = store
         .get_pattern_by_id(&id)
         .await
         .map_err(|e| {
-            error!("Failed to get pattern by id '{}': {}", id, e);
+            error!("Failed to get entry by id '{}': {}", id, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     match pattern {
         Some(p) => {
-            // Use semantic search to find related patterns
-            let query = format!("patterns related to {} {}", p.title, p.description);
+            // Use semantic search to find related entries
+            let query = format!("entries related to {} {}", p.title, p.description);
             drop(store); // Release read lock before embedding
 
             let embedding = {
@@ -442,7 +523,7 @@ async fn get_related_patterns(
                 embedder
                     .embed_query(&query)
                     .map_err(|e| {
-                        error!("Failed to generate embedding for related patterns: {}", e);
+                        error!("Failed to generate embedding for related entries: {}", e);
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?
             };
@@ -456,28 +537,33 @@ async fn get_related_patterns(
                 .vector_search(&embedding, 6, &filters)
                 .await
                 .map_err(|e| {
-                    error!("Vector search for related patterns failed: {}", e);
+                    error!("Vector search for related entries failed: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            // Filter out the original pattern and convert to summaries
-            let mut related: Vec<PatternResponse> = Vec::new();
+            // Filter out the original entry and convert to responses
+            let mut related: Vec<EntryResponse> = Vec::new();
             for result in results {
                 if result.entry_id != id {
                     // Create a simple response from search result
-                    related.push(PatternResponse {
+                    related.push(EntryResponse {
                         id: result.entry_id,
                         title: result.entry_title,
-                        pattern_type: result.entry_type,
-                        categories: result.tags,
+                        entry_type: result.entry_type,
+                        tags: result.tags,
                         description: result.text,
+                        source_type: None,
+                        source_domain: result.source_domain,
+                        source_path: None,
+                        created_at: None,
+                        updated_at: None,
                     });
                 }
             }
             let total = related.len();
 
-            Ok(Json(PatternListResponse {
-                patterns: related.into_iter().take(5).collect(),
+            Ok(Json(EntryListResponse {
+                entries: related.into_iter().take(5).collect(),
                 total,
             }))
         }
@@ -512,24 +598,24 @@ async fn list_categories(
 
     let categories: Vec<CategoryInfo> = category_info
         .into_iter()
-        .map(|(name, (pattern_count, pattern_type))| CategoryInfo {
+        .map(|(name, (entry_count, entry_type))| CategoryInfo {
             name,
-            pattern_count,
-            pattern_type,
+            entry_count,
+            entry_type,
         })
         .collect();
 
     Ok(Json(CategoriesResponse { categories }))
 }
 
-/// GET /api/search - Search patterns with caching.
-async fn search_patterns(
+/// GET /api/search - Search entries with caching.
+async fn search_entries(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, StatusCode> {
     let limit = query.limit.unwrap_or(10);
     let filters = SearchFilters {
-        entry_type: query.pattern_type.clone(),
+        entry_type: query.entry_type.clone(),
         tag: query.category.clone(),
         chunk_type: None,
         source_domain: query.source_domain.clone(),
@@ -606,8 +692,8 @@ async fn search_patterns(
     }))
 }
 
-/// GET /api/graph - Get pattern graph for visualization.
-async fn get_pattern_graph(
+/// GET /api/graph - Get entry graph for visualization.
+async fn get_entry_graph(
     State(state): State<AppState>,
 ) -> Result<Json<PatternGraphResponse>, StatusCode> {
     info!("Getting pattern graph");
@@ -618,13 +704,13 @@ async fn get_pattern_graph(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Create nodes from patterns
+    // Create nodes from entries
     let nodes: Vec<GraphNode> = all_patterns
         .iter()
         .map(|p| GraphNode {
             id: p.id.clone(),
             label: p.title.clone(),
-            pattern_type: p.entry_type.clone(),
+            entry_type: p.entry_type.clone(),
             category: p.tags.first().cloned().unwrap_or_default(),
         })
         .collect();
@@ -671,17 +757,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pattern_response_from() {
+    fn test_entry_response_from() {
         let summary = PatternSummary {
             id: "test-id".to_string(),
-            title: "Test Pattern".to_string(),
-            entry_type: "messaging".to_string(),
+            title: "Test Entry".to_string(),
+            entry_type: "document".to_string(),
             tags: vec!["Category1".to_string()],
             description: "Test description".to_string(),
+            source_type: Some("url".to_string()),
+            source_domain: Some("example.com".to_string()),
+            source_path: Some("/docs".to_string()),
+            created_at: None,
+            updated_at: None,
         };
 
-        let response = PatternResponse::from(summary);
+        let response = EntryResponse::from(summary);
         assert_eq!(response.id, "test-id");
-        assert_eq!(response.title, "Test Pattern");
+        assert_eq!(response.title, "Test Entry");
+        assert_eq!(response.entry_type, "document");
+        assert_eq!(response.source_domain, Some("example.com".to_string()));
     }
 }

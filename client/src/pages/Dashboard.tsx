@@ -1,21 +1,23 @@
 import { useQuery } from '@tanstack/react-query';
-import { FileText, Database, Layers, Box, ArrowRight, TrendingUp } from 'lucide-react';
+import { FileText, Box, ArrowRight, TrendingUp, Code, FileType } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 
-function StatCard({
-  title,
-  value,
-  icon: Icon,
-  gradient,
-}: {
+interface TypeCardProps {
   title: string;
-  value: number | string;
+  value: number;
   icon: React.ComponentType<{ className?: string }>;
   gradient: string;
-}) {
+  hoverBorder: string;
+  to: string;
+}
+
+function TypeCard({ title, value, icon: Icon, gradient, hoverBorder, to }: TypeCardProps) {
   return (
-    <div className="stat-card group">
+    <Link
+      to={to}
+      className={`stat-card group cursor-pointer hover:${hoverBorder} transition-all duration-300`}
+    >
       <div className={`absolute top-0 left-0 w-full h-1 bg-gradient-to-r ${gradient}`} />
       <div className="flex items-start justify-between">
         <div>
@@ -26,7 +28,10 @@ function StatCard({
           <Icon className="w-6 h-6 text-white" />
         </div>
       </div>
-    </div>
+      <div className="absolute bottom-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
+        <ArrowRight className="w-5 h-5 text-slate-400" />
+      </div>
+    </Link>
   );
 }
 
@@ -84,31 +89,47 @@ export default function Dashboard() {
         <p className="text-slate-400 mt-2">Knowledge Base</p>
       </div>
 
-      {/* Stats Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
-        <StatCard
+      {/* Type Cards Grid */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+        <TypeCard
           title="Total Entries"
           value={stats?.total_entries || 0}
           icon={Box}
           gradient="from-cyan-500 to-teal-500"
+          hoverBorder="border-cyan-500/50"
+          to="/entries"
         />
-        <StatCard
+        <TypeCard
           title="Documents"
-          value={stats?.messaging_entries || 0}
+          value={stats?.document_entries || 0}
           icon={FileText}
-          gradient="from-violet-500 to-purple-500"
+          gradient="from-blue-500 to-indigo-500"
+          hoverBorder="border-blue-500/50"
+          to="/entries?type=document"
         />
-        <StatCard
+        <TypeCard
           title="Articles"
-          value={stats?.conversation_entries || 0}
-          icon={Layers}
-          gradient="from-amber-500 to-orange-500"
-        />
-        <StatCard
-          title="Content Chunks"
-          value={stats?.total_chunks || 0}
-          icon={Database}
+          value={stats?.article_entries || 0}
+          icon={FileText}
           gradient="from-emerald-500 to-green-500"
+          hoverBorder="border-emerald-500/50"
+          to="/entries?type=article"
+        />
+        <TypeCard
+          title="PDFs"
+          value={stats?.pdf_entries || 0}
+          icon={FileType}
+          gradient="from-rose-500 to-pink-500"
+          hoverBorder="border-rose-500/50"
+          to="/entries?type=pdf"
+        />
+        <TypeCard
+          title="Code"
+          value={stats?.code_entries || 0}
+          icon={Code}
+          gradient="from-amber-500 to-orange-500"
+          hoverBorder="border-amber-500/50"
+          to="/entries?type=code"
         />
       </div>
 
@@ -134,10 +155,13 @@ export default function Dashboard() {
                 maxCount={maxCategoryCount}
               />
             ))}
+            {(!stats?.categories || stats.categories.length === 0) && (
+              <p className="text-slate-500 text-sm text-center py-4">No categories yet</p>
+            )}
           </div>
           {(stats?.categories?.length || 0) > 8 && (
             <Link
-              to="/patterns"
+              to="/entries"
               className="mt-6 flex items-center justify-center gap-2 text-sm text-cyan-400 hover:text-cyan-300 transition-colors"
             >
               View all categories
@@ -169,7 +193,7 @@ export default function Dashboard() {
             </Link>
 
             <Link
-              to="/patterns"
+              to="/entries"
               className="block p-4 rounded-lg bg-slate-800/50 hover:bg-slate-800 border border-slate-700 hover:border-violet-500/50 transition-all group"
             >
               <div className="flex items-center gap-4">
@@ -205,19 +229,6 @@ export default function Dashboard() {
             </Link>
           </div>
         </div>
-      </div>
-
-      {/* Footer Info */}
-      <div className="card p-4 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-          <span className="text-sm text-slate-400">
-            {stats?.total_documents || 0} documents indexed
-          </span>
-        </div>
-        <span className="text-xs text-slate-600 font-mono">
-          LanceDB + fastembed (384-dim)
-        </span>
       </div>
     </div>
   );
