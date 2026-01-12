@@ -305,9 +305,9 @@ export default function EntryDetail() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Main Content */}
-        <div className="lg:col-span-2 space-y-6">
+      <div className="space-y-6">
+        {/* Main Content - Full Width */}
+        <div className="space-y-6">
           {/* Content */}
           <div className="card p-6">
             <h2 className="text-xl font-semibold text-white flex items-center gap-2 mb-4">
@@ -353,8 +353,8 @@ export default function EntryDetail() {
           </div>
         </div>
 
-        {/* Sidebar */}
-        <div className="space-y-6">
+        {/* Related & Quick Links - Side by Side */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {/* Related Entries */}
           <div className="card p-6">
             <h2 className="text-lg font-semibold text-white flex items-center gap-2 mb-4">
