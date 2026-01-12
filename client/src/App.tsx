@@ -22,7 +22,7 @@ const navigation = [
   { name: 'Indexing', href: '/indexing', icon: Zap },
   { name: 'Entries', href: '/entries', icon: Grid },
   { name: 'Graph', href: '/graph', icon: Network },
-  { name: 'MCP', href: '/mcp', icon: Plug2 },
+  { name: 'MCP', href: '/config/mcp', icon: Plug2 },
 ];
 
 function Sidebar() {
@@ -142,7 +142,8 @@ function AppContent() {
               <Route path="/patterns/:id" element={<PatternRedirect />} />
               <Route path="/search" element={<Navigate to="/entries" replace />} />
               <Route path="/graph" element={<EntryGraph />} />
-              <Route path="/mcp" element={<MCPDocs />} />
+              <Route path="/mcp" element={<Navigate to="/config/mcp" replace />} />
+              <Route path="/config/mcp" element={<MCPDocs />} />
             </Routes>
           </div>
         )}

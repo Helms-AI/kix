@@ -553,3 +553,65 @@
 .btn-admin-ghost {
   @apply text-slate-400 hover:text-white hover:bg-slate-800;
 }
+
+/* ============================================
+   MCP CONFIGURATION PAGE - Neural Command Center
+   ============================================ */
+
+/* Main tab with icon support */
+.admin-tab-with-icon {
+  @apply flex items-center gap-2;
+}
+
+/* Agent card accent - violet glow on hover */
+.admin-card-agent {
+  @apply relative bg-slate-900/60 backdrop-blur-md rounded-2xl border border-slate-700/50;
+  @apply shadow-xl shadow-black/20 overflow-hidden transition-all duration-300;
+}
+
+.admin-card-agent::before {
+  content: '';
+  @apply absolute inset-0 bg-gradient-to-br from-slate-800/20 via-transparent to-slate-900/40;
+  @apply pointer-events-none;
+}
+
+.admin-card-agent:hover {
+  @apply border-violet-500/30;
+  box-shadow:
+    0 0 0 1px rgba(139, 92, 246, 0.1),
+    0 20px 40px -10px rgba(0, 0, 0, 0.4),
+    0 0 30px -10px rgba(139, 92, 246, 0.2);
+}
+
+/* Hook card accent - amber glow on hover */
+.admin-card-hook {
+  @apply relative bg-slate-900/60 backdrop-blur-md rounded-2xl border border-slate-700/50;
+  @apply shadow-xl shadow-black/20 overflow-hidden transition-all duration-300;
+}
+
+.admin-card-hook::before {
+  content: '';
+  @apply absolute inset-0 bg-gradient-to-br from-slate-800/20 via-transparent to-slate-900/40;
+  @apply pointer-events-none;
+}
+
+.admin-card-hook:hover {
+  @apply border-amber-500/30;
+  box-shadow:
+    0 0 0 1px rgba(251, 191, 36, 0.1),
+    0 20px 40px -10px rgba(0, 0, 0, 0.4),
+    0 0 30px -10px rgba(251, 191, 36, 0.2);
+}
+
+/* Content card icon containers */
+.content-card-icon-agent {
+  @apply w-12 h-12 rounded-xl flex items-center justify-center;
+  @apply bg-gradient-to-br from-violet-500/20 to-purple-500/20;
+  @apply border border-violet-500/20;
+}
+
+.content-card-icon-hook {
+  @apply w-12 h-12 rounded-xl flex items-center justify-center;
+  @apply bg-gradient-to-br from-amber-500/20 to-orange-500/20;
+  @apply border border-amber-500/20;
+}

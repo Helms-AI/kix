@@ -36,6 +36,44 @@ export default defineConfig({
       '/mcp': {
         target: 'http://127.0.0.1:3002',
         changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            // Forward original host for OAuth URL construction
+            proxyReq.setHeader('X-Forwarded-Host', req.headers.host || 'localhost:3000');
+            proxyReq.setHeader('X-Forwarded-Proto', 'http');
+          });
+        },
+      },
+      // OAuth stub routes for MCP clients that expect OAuth discovery
+      '/.well-known/oauth-authorization-server': {
+        target: 'http://127.0.0.1:3002',
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            proxyReq.setHeader('X-Forwarded-Host', req.headers.host || 'localhost:3000');
+            proxyReq.setHeader('X-Forwarded-Proto', 'http');
+          });
+        },
+      },
+      '/.well-known/oauth-protected-resource': {
+        target: 'http://127.0.0.1:3002',
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            proxyReq.setHeader('X-Forwarded-Host', req.headers.host || 'localhost:3000');
+            proxyReq.setHeader('X-Forwarded-Proto', 'http');
+          });
+        },
+      },
+      '/oauth': {
+        target: 'http://127.0.0.1:3002',
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            proxyReq.setHeader('X-Forwarded-Host', req.headers.host || 'localhost:3000');
+            proxyReq.setHeader('X-Forwarded-Proto', 'http');
+          });
+        },
       },
     },
   },
