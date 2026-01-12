@@ -10,6 +10,7 @@ kix-store = { path = "../kix-store" }
 kix-embeddings = { path = "../kix-embeddings" }
 kix-parser = { path = "../kix-parser" }
 kix-crawler = { path = "../kix-crawler" }
+kix-jobs = { path = "../kix-jobs" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

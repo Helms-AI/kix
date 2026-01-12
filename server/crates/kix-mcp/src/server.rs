@@ -38,8 +38,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
+use uuid::Uuid;
 
 use kix_embeddings::{DocumentChunker, EmbeddingGenerator};
+use kix_jobs::{Job, JobConfig, JobQueue, JobState, JobType};
 use kix_parser::{Entry, EntryType, PdfParser, SourceType};
 use kix_crawler::ContentExtractor;
 use kix_store::search::SearchFilters;
@@ -238,12 +240,24 @@ pub struct UrlSource {
     /// URL to crawl
     #[schemars(description = "URL to crawl")]
     pub url: String,
-    /// Crawl depth (0 = single page, default)
-    #[schemars(description = "Crawl depth: 0 = single page (default), 1+ = follow links")]
+    /// Crawl depth (0 = single page, 1 = follow links one level, default: 1)
+    #[schemars(description = "Crawl depth: 0 = single page, 1+ = follow links (default: 1)")]
     pub depth: Option<usize>,
-    /// Maximum pages to index
-    #[schemars(description = "Maximum pages to index (default: 100)")]
+    /// Maximum pages to index (0 = unlimited/discovery mode)
+    #[schemars(description = "Maximum pages to index (default: 0 = unlimited/discovery mode)")]
     pub max_pages: Option<usize>,
+    /// Whether to respect robots.txt (default: true)
+    #[schemars(description = "Whether to respect robots.txt (default: true)")]
+    pub respect_robots: Option<bool>,
+    /// Whether to render JavaScript (default: true)
+    #[schemars(description = "Whether to render JavaScript for dynamic content (default: true)")]
+    pub render_js: Option<bool>,
+    /// Timeout for browser rendering in seconds (default: 30)
+    #[schemars(description = "Timeout for browser rendering in seconds (default: 30)")]
+    pub timeout_secs: Option<u64>,
+    /// Job priority (1-10, higher = more urgent, default: 5)
+    #[schemars(description = "Job priority 1-10, higher = more urgent (default: 5)")]
+    pub priority: Option<u8>,
 }
 
 /// Async source for batch/crawl operations.
@@ -397,14 +411,16 @@ pub struct KixMcpServer {
     store: Arc<Mutex<KixStore>>,
     embedder: Arc<Mutex<EmbeddingGenerator>>,
     http_client: HttpClient,
+    /// Job queue for async indexing operations
+    job_queue: Arc<JobQueue>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl KixMcpServer {
-    /// Creates a new MCP server with the given store and embedder.
-    pub fn new(store: KixStore, embedder: EmbeddingGenerator) -> Self {
+    /// Creates a new MCP server with the given store, embedder, and job queue.
+    pub fn new(store: KixStore, embedder: EmbeddingGenerator, job_queue: Arc<JobQueue>) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
             embedder: Arc::new(Mutex::new(embedder)),
@@ -412,6 +428,7 @@ impl KixMcpServer {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("Failed to create HTTP client"),
+            job_queue,
             tool_router: Self::tool_router(),
         }
     }
@@ -782,23 +799,73 @@ impl KixMcpServer {
             ));
         }
 
-        // Generate job ID
-        let job_id = uuid::Uuid::new_v4().to_string();
+        // Determine source type and create job
+        let (source_type, estimated_items, job) = if let Some(ref url_source) = source.url {
+            // URL crawling job
+            let depth = url_source.depth.unwrap_or(1); // Default to 1 level
+            let max_pages = url_source.max_pages.unwrap_or(0); // 0 = unlimited/discovery mode
+            let respect_robots = url_source.respect_robots.unwrap_or(true);
+            let render_js = url_source.render_js.unwrap_or(true);
+            let timeout_secs = url_source.timeout_secs.unwrap_or(30);
+            let priority = url_source.priority.unwrap_or(5);
 
-        // Determine source type and estimated items
-        let (source_type, estimated_items) = if let Some(ref url_source) = source.url {
-            let max_pages = url_source.max_pages.unwrap_or(100);
-            ("url".to_string(), Some(max_pages))
+            let mut config = JobConfig::default();
+            config.priority = priority;
+
+            let job = Job::new(
+                JobType::Url {
+                    url: url_source.url.clone(),
+                    depth,
+                    respect_robots,
+                    render_js,
+                    timeout_secs,
+                    max_pages,
+                },
+                config,
+            );
+
+            // estimated_items is None when max_pages=0 (unlimited)
+            let estimated = if max_pages > 0 { Some(max_pages) } else { None };
+            ("url".to_string(), estimated, job)
         } else if let Some(ref files) = source.files {
-            ("files".to_string(), Some(files.len()))
+            // File indexing job
+            let file_paths: Vec<std::path::PathBuf> = files.iter().map(std::path::PathBuf::from).collect();
+            let file_names: Vec<String> = files.iter().map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.clone())
+            }).collect();
+
+            let job = Job::new(
+                JobType::FileUpload {
+                    file_paths,
+                    file_names: file_names.clone(),
+                    extract_archives: true,
+                },
+                JobConfig::default(),
+            );
+
+            ("files".to_string(), Some(files.len()), job)
         } else {
-            ("unknown".to_string(), None)
+            return Err(McpError::invalid_params(
+                "Must provide either url or files",
+                None,
+            ));
         };
 
-        // TODO: Actually queue the job when job system is integrated
-        // For now, return a stub response indicating the feature
+        let job_id = job.id;
+
+        // Submit job to queue
+        self.job_queue
+            .submit(job)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to queue job: {}", e), None))?;
+
+        info!(job_id = %job_id, source_type = %source_type, "Job submitted to queue");
+
         let response = JobCreated {
-            job_id,
+            job_id: job_id.to_string(),
             status: "queued".to_string(),
             source_type,
             estimated_items,
@@ -818,14 +885,57 @@ impl KixMcpServer {
     ) -> Result<CallToolResult, McpError> {
         info!("Checking job status: {}", params.0.job_id);
 
-        // TODO: Look up job from job store when integrated
-        // For now, return not found
-        let response = JobStatusResponse {
-            job_id: params.0.job_id.clone(),
-            status: "not_found".to_string(),
-            progress: None,
-            result: None,
-            error: Some("Job not found. Async job tracking not yet implemented.".to_string()),
+        // Parse job ID
+        let job_id = Uuid::parse_str(&params.0.job_id)
+            .map_err(|_| McpError::invalid_params("Invalid job ID format", None))?;
+
+        // Look up job from queue
+        let response = if let Some(job) = self.job_queue.get(job_id) {
+            let state = job.get_state().await;
+
+            let (status, progress, result, error) = match state {
+                JobState::Pending { .. } => {
+                    ("pending".to_string(), None, None, None)
+                }
+                JobState::Queued { .. } => {
+                    ("queued".to_string(), None, None, None)
+                }
+                JobState::Running { .. } => {
+                    // For running jobs, we could add progress tracking if available
+                    ("running".to_string(), None, None, None)
+                }
+                JobState::Completed { result: job_result, .. } => {
+                    let result = JobResult {
+                        documents_created: job_result.items_processed,
+                        chunks_created: job_result.chunks_created,
+                        errors: job_result.errors,
+                    };
+                    ("completed".to_string(), None, Some(result), None)
+                }
+                JobState::Failed { error, .. } => {
+                    ("failed".to_string(), None, None, Some(error))
+                }
+                JobState::Cancelled { reason, .. } => {
+                    ("cancelled".to_string(), None, None, Some(reason))
+                }
+            };
+
+            JobStatusResponse {
+                job_id: params.0.job_id.clone(),
+                status,
+                progress,
+                result,
+                error,
+            }
+        } else {
+            // Job not found in active queue
+            JobStatusResponse {
+                job_id: params.0.job_id.clone(),
+                status: "not_found".to_string(),
+                progress: None,
+                result: None,
+                error: Some("Job not found in active queue. It may have expired or never existed.".to_string()),
+            }
         };
 
         let json = serde_json::to_string_pretty(&response)

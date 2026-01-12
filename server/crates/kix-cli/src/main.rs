@@ -396,8 +396,28 @@ async fn run_serve(db_path: &str) -> Result<()> {
         .await
         .context("Failed to initialize tables")?;
 
+    // Create job queue for async indexing operations
+    let job_queue = Arc::new(JobQueue::new(QueueConfig::default()));
+
+    // Create SSE manager for progress tracking (even though stdio won't use SSE directly)
+    let sse_manager = Arc::new(ConnectionManager::new(Default::default()));
+
+    // Create and start the job executor to process queued jobs
+    let executor_config = ExecutorConfig {
+        db_path: db_path.to_string(),
+        jobs_db_path: None,
+        on_job_complete: None,
+        ..Default::default()
+    };
+
+    let mut executor = JobExecutor::new(job_queue.clone(), sse_manager, executor_config)
+        .await
+        .context("Failed to create job executor")?;
+    executor.start();
+    info!("Job executor started for async indexing");
+
     // Create MCP server
-    let server = KixMcpServer::new(store, embedder);
+    let server = KixMcpServer::new(store, embedder, job_queue);
 
     // Create stdio transport
     let transport = rmcp::transport::io::stdio();
@@ -429,9 +449,29 @@ async fn run_serve_http(db_path: &str, host: &str, port: u16) -> Result<()> {
         .await
         .context("Failed to initialize tables")?;
 
+    // Create job queue for async indexing operations
+    let job_queue = Arc::new(JobQueue::new(QueueConfig::default()));
+
+    // Create SSE manager for progress tracking
+    let sse_manager = Arc::new(ConnectionManager::new(Default::default()));
+
+    // Create and start the job executor to process queued jobs
+    let executor_config = ExecutorConfig {
+        db_path: db_path.to_string(),
+        jobs_db_path: None,
+        on_job_complete: None,
+        ..Default::default()
+    };
+
+    let mut executor = JobExecutor::new(job_queue.clone(), sse_manager, executor_config)
+        .await
+        .context("Failed to create job executor")?;
+    executor.start();
+    info!("Job executor started for async indexing");
+
     // Create a template server that will be cloned for each session
     // KixMcpServer implements Clone since it uses Arc internally
-    let template_server = KixMcpServer::new(store, embedder);
+    let template_server = KixMcpServer::new(store, embedder, job_queue);
 
     // Create the streamable HTTP service with a factory function
     let service = StreamableHttpService::new(
@@ -858,12 +898,28 @@ fn create_entry_from_extracted(
 // OAuth Stub Handlers - Allow MCP clients to connect without real authentication
 // =============================================================================
 
+/// Helper to get the effective host from X-Forwarded-Host or Host header
+fn get_effective_host(headers: &axum::http::HeaderMap, host: &str) -> String {
+    // Check for X-Forwarded-Host first (set by reverse proxies)
+    if let Some(forwarded_host) = headers.get("x-forwarded-host") {
+        if let Ok(fh) = forwarded_host.to_str() {
+            let proto = headers
+                .get("x-forwarded-proto")
+                .and_then(|p| p.to_str().ok())
+                .unwrap_or("http");
+            return format!("{}://{}", proto, fh);
+        }
+    }
+    format!("http://{}", host)
+}
+
 /// OAuth Authorization Server Metadata (RFC 8414)
 /// Returns metadata indicating this server supports OAuth but doesn't require it
 async fn oauth_metadata_handler(
+    headers: axum::http::HeaderMap,
     axum::extract::Host(host): axum::extract::Host,
 ) -> impl IntoResponse {
-    let issuer = format!("http://{}", host);
+    let issuer = get_effective_host(&headers, &host);
     Json(json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{}/oauth/authorize", issuer),
@@ -879,9 +935,10 @@ async fn oauth_metadata_handler(
 
 /// OAuth Protected Resource Metadata
 async fn oauth_resource_handler(
+    headers: axum::http::HeaderMap,
     axum::extract::Host(host): axum::extract::Host,
 ) -> impl IntoResponse {
-    let issuer = format!("http://{}", host);
+    let issuer = get_effective_host(&headers, &host);
     Json(json!({
         "resource": format!("{}/mcp", issuer),
         "authorization_servers": [issuer],
