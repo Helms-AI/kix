@@ -498,14 +498,19 @@ impl JobExecutor {
             }
 
             // Emit ItemDiscovered for new URLs found on this page (deduplicated)
+            // Cap at effective_max_pages so we only show pages that will be processed
             for (link_url, depth) in &result.discovered_links {
-                // Only emit if this URL hasn't been emitted before
-                let is_new = {
+                // Only emit if this URL hasn't been emitted before AND we're under the cap
+                let should_emit = {
                     let mut emitted = emitted_urls.lock().unwrap();
-                    emitted.insert(link_url.clone())
+                    if emitted.len() >= effective_max_pages {
+                        false // At capacity, don't emit (page won't be processed)
+                    } else {
+                        emitted.insert(link_url.clone()) // Returns true if new
+                    }
                 };
 
-                if is_new {
+                if should_emit {
                     let _ = sse_manager.broadcast_to_job(
                         job_id,
                         Event::new(EventType::ItemDiscovered {
