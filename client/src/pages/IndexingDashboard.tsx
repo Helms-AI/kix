@@ -4,7 +4,6 @@ import {
   Globe,
   Upload,
   Play,
-  XCircle,
   CheckCircle,
   Clock,
   AlertCircle,
@@ -23,67 +22,14 @@ import clsx from 'clsx';
 import { useSSEContext } from '../contexts/SSEContext';
 import {
   indexingApi,
-  Job,
   fileToBase64,
   formatFileSize,
   FileUpload,
+  PersistedJob,
 } from '../api/indexingClient';
 import { ActiveJobCard } from '../components/indexing/ActiveJobCard';
+import { HistoryJobCard } from '../components/indexing/HistoryJobCard';
 import { DeleteAllDataModal } from '../components/DeleteAllDataModal';
-
-// ============================================================================
-// Status Badge Component
-// ============================================================================
-function StatusBadge({ status }: { status: Job['status'] }) {
-  const config = {
-    pending: { icon: Clock, class: 'bg-slate-700 text-slate-300', label: 'Pending' },
-    queued: { icon: Clock, class: 'bg-amber-900/50 text-amber-400 border border-amber-700/50', label: 'Queued' },
-    running: { icon: Loader2, class: 'bg-cyan-900/50 text-cyan-400 border border-cyan-700/50', label: 'Running' },
-    completed: { icon: CheckCircle, class: 'bg-emerald-900/50 text-emerald-400 border border-emerald-700/50', label: 'Completed' },
-    failed: { icon: AlertCircle, class: 'bg-red-900/50 text-red-400 border border-red-700/50', label: 'Failed' },
-    cancelled: { icon: XCircle, class: 'bg-slate-700 text-slate-400 border border-slate-600', label: 'Cancelled' },
-  };
-
-  const { icon: Icon, class: className, label } = config[status];
-
-  return (
-    <span className={clsx('inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium font-mono', className)}>
-      <Icon className={clsx('w-3 h-3', status === 'running' && 'animate-spin')} />
-      {label}
-    </span>
-  );
-}
-
-// ============================================================================
-// Progress Bar Component
-// ============================================================================
-function ProgressBar({
-  percentage,
-  animated = false,
-  showGlow = false,
-}: {
-  percentage: number;
-  animated?: boolean;
-  showGlow?: boolean;
-}) {
-  return (
-    <div className="relative h-2 bg-slate-800 rounded-full overflow-hidden">
-      <div
-        className={clsx(
-          'h-full rounded-full transition-all duration-500 ease-out',
-          'bg-gradient-to-r from-cyan-500 via-teal-400 to-cyan-500',
-          animated && 'bg-[length:200%_100%] animate-shimmer',
-          showGlow && 'shadow-[0_0_12px_rgba(34,211,238,0.5)]'
-        )}
-        style={{ width: `${Math.min(percentage, 100)}%` }}
-      />
-      {/* Scanline effect for active jobs */}
-      {animated && (
-        <div className="absolute inset-0 bg-gradient-to-b from-transparent via-white/5 to-transparent animate-scanline" />
-      )}
-    </div>
-  );
-}
 
 // ============================================================================
 // URL Indexing Form
@@ -551,78 +497,12 @@ function FileUploadForm({ onSuccess }: { onSuccess?: () => void }) {
 
 
 // ============================================================================
-// Job History Row
-// ============================================================================
-function JobHistoryRow({ job, onCancel }: { job: Job; onCancel: (id: string) => void }) {
-  const [expanded, setExpanded] = useState(false);
-
-  return (
-    <div className="border-b border-slate-800 last:border-0">
-      <div
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-4 py-3 px-4 hover:bg-slate-800/30 cursor-pointer transition-colors"
-      >
-        <button className="text-slate-500">
-          {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-        </button>
-        <div className="flex-1 grid grid-cols-5 gap-4 items-center">
-          <span className="font-mono text-sm text-slate-400 truncate">{job.id.slice(0, 8)}...</span>
-          <span className="text-sm text-slate-300 capitalize flex items-center gap-2">
-            {job.job_type === 'url' ? <Globe className="w-4 h-4 text-cyan-400" /> : <FileText className="w-4 h-4 text-violet-400" />}
-            {job.job_type.replace('_', ' ')}
-          </span>
-          <StatusBadge status={job.status} />
-          <span className="text-sm text-slate-500 font-mono">
-            {new Date(job.created_at).toLocaleTimeString()}
-          </span>
-          <div className="w-full">
-            {job.progress && (
-              <div className="flex items-center gap-2">
-                <ProgressBar percentage={job.progress.percentage} />
-                <span className="text-xs text-slate-500 font-mono w-12">
-                  {job.progress.percentage.toFixed(0)}%
-                </span>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-      {expanded && (
-        <div className="px-12 pb-4 space-y-2">
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div>
-              <span className="text-slate-500">Job ID:</span>
-              <span className="ml-2 font-mono text-slate-300">{job.id}</span>
-            </div>
-            <div>
-              <span className="text-slate-500">Created:</span>
-              <span className="ml-2 text-slate-300">{new Date(job.created_at).toLocaleString()}</span>
-            </div>
-          </div>
-          {(job.status === 'running' || job.status === 'queued') && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onCancel(job.id);
-              }}
-              className="flex items-center gap-2 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
-            >
-              <XCircle className="w-4 h-4" />
-              Cancel Job
-            </button>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================================================
 // Main Dashboard Component
 // ============================================================================
 export default function IndexingDashboard() {
   const [activeTab, setActiveTab] = useState<'url' | 'files'>('url');
   const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
+  const [expandedHistoryJobId, setExpandedHistoryJobId] = useState<string | null>(null);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
 
   const queryClient = useQueryClient();
@@ -630,11 +510,19 @@ export default function IndexingDashboard() {
   // Use global SSE context for real-time updates
   const { isConnected, reconnect, jobs: liveJobData, clearJobLog } = useSSEContext();
 
-  // Fetch jobs
-  const { data: jobsData, isLoading, isError } = useQuery({
+  // Fetch active jobs
+  const { data: jobsData, isError } = useQuery({
     queryKey: ['jobs'],
     queryFn: () => indexingApi.listJobs({ limit: 50 }),
     refetchInterval: 5000,
+    retry: 2,
+  });
+
+  // Fetch persisted job history from LanceDB
+  const { data: historyData, isLoading: isHistoryLoading } = useQuery({
+    queryKey: ['job-history'],
+    queryFn: () => indexingApi.getJobHistory({ limit: 50 }),
+    refetchInterval: 30000, // Refresh every 30 seconds
     retry: 2,
   });
 
@@ -651,17 +539,25 @@ export default function IndexingDashboard() {
     setExpandedJobId((prev) => (prev === jobId ? null : jobId));
   }, []);
 
+  // Toggle history job expansion (accordion behavior - only one expanded at a time)
+  const handleToggleHistoryExpand = useCallback((jobId: string) => {
+    setExpandedHistoryJobId((prev) => (prev === jobId ? null : jobId));
+  }, []);
+
   // Handle delete all indexed data
   const handleDeleteAll = useCallback(async () => {
     const result = await indexingApi.deleteAllData();
     queryClient.invalidateQueries({ queryKey: ['stats'] });
     queryClient.invalidateQueries({ queryKey: ['jobs'] });
+    queryClient.invalidateQueries({ queryKey: ['job-history'] });
     return result;
   }, [queryClient]);
 
   const jobs = jobsData?.jobs || [];
   const activeJobs = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
-  const historyJobs = jobs.filter((j) => j.status !== 'running' && j.status !== 'queued');
+
+  // Use persisted job history from LanceDB
+  const persistedJobs: PersistedJob[] = historyData?.jobs || [];
 
   return (
     <div className="space-y-8">
@@ -805,50 +701,46 @@ export default function IndexingDashboard() {
           </div>
 
           {/* Job History */}
-          <div className="card">
-            <div className="flex items-center justify-between p-6 border-b border-slate-800">
+          <div className="card p-6">
+            <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-semibold text-white flex items-center gap-2">
                 <Clock className="w-5 h-5 text-slate-400" />
                 Job History
               </h2>
               <span className="text-sm text-slate-500 font-mono">
-                {historyJobs.length} jobs
+                {historyData?.total ?? persistedJobs.length} jobs
               </span>
             </div>
 
-            {isLoading ? (
+            {isHistoryLoading ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-8 h-8 text-cyan-400 animate-spin" />
               </div>
-            ) : historyJobs.length === 0 ? (
+            ) : persistedJobs.length === 0 ? (
               <div className="text-center py-12 text-slate-500">
-                <p>No completed jobs yet</p>
+                <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-slate-800 flex items-center justify-center">
+                  <CheckCircle className="w-8 h-8 text-slate-600" />
+                </div>
+                <p className="font-medium">No completed jobs yet</p>
+                <p className="text-sm mt-1">Completed jobs will appear here</p>
               </div>
             ) : (
-              <div className="divide-y divide-slate-800">
-                {/* Table Header */}
-                <div className="grid grid-cols-5 gap-4 py-2 px-12 text-xs font-medium text-slate-500 uppercase tracking-wider">
-                  <span>Job ID</span>
-                  <span>Type</span>
-                  <span>Status</span>
-                  <span>Created</span>
-                  <span>Progress</span>
-                </div>
-                {/* Table Rows */}
-                {historyJobs.slice(0, 10).map((job) => (
-                  <JobHistoryRow
-                    key={job.id}
+              <div className="space-y-3">
+                {persistedJobs.slice(0, 10).map((job) => (
+                  <HistoryJobCard
+                    key={job.job_id}
                     job={job}
-                    onCancel={(id) => cancelMutation.mutate(id)}
+                    isExpanded={expandedHistoryJobId === job.job_id}
+                    onToggleExpand={() => handleToggleHistoryExpand(job.job_id)}
                   />
                 ))}
               </div>
             )}
 
-            {historyJobs.length > 10 && (
-              <div className="p-4 text-center border-t border-slate-800">
+            {persistedJobs.length > 10 && (
+              <div className="pt-4 text-center border-t border-slate-800 mt-4">
                 <button className="text-sm text-cyan-400 hover:text-cyan-300 font-medium flex items-center gap-2 mx-auto">
-                  View all {historyJobs.length} jobs
+                  View all {historyData?.total ?? persistedJobs.length} jobs
                   <ExternalLink className="w-4 h-4" />
                 </button>
               </div>

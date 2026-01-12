@@ -13,7 +13,8 @@ function formatDuration(ms: number | undefined): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-function truncateUrl(url: string, maxLength: number = 45): string {
+function truncateUrl(url: string | undefined, maxLength: number = 45): string {
+  if (!url) return 'Unknown URL';
   if (url.length <= maxLength) return url;
 
   try {

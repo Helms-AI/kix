@@ -136,6 +136,69 @@ export interface DeleteAllDataResponse {
   chunks_deleted: number;
 }
 
+// ============================================================================
+// Job History Types (Persisted Jobs)
+// ============================================================================
+
+// Stats for a persisted job
+export interface PersistedJobStats {
+  items_processed: number;
+  items_discovered: number;
+  chunks_created: number;
+  embeddings_generated: number;
+  error_count: number;
+  duration_ms: number;
+  rate: number;
+}
+
+// Persisted job from history API (matches backend JobHistoryItem)
+export interface PersistedJob {
+  job_id: string;
+  job_type: 'url' | 'file_upload' | 'reindex';
+  status: 'completed' | 'failed' | 'cancelled';
+  source_url: string | null;
+  source_domain: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string;
+  stats: PersistedJobStats;
+}
+
+// Individual item from a persisted job (matches backend JobHistoryItemDetail)
+// Matches backend JobHistoryItemDetail struct
+export interface PersistedJobItem {
+  url: string;  // Maps to item_path on backend
+  status: string;
+  parent_url: string | null;
+  depth: number;
+  discovered_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  chunks_created: number;
+  embeddings_generated: number;
+  duration_ms: number;
+  error_message: string | null;
+}
+
+// Response from GET /api/indexing/history
+export interface JobHistoryResponse {
+  jobs: PersistedJob[];
+  total: number;
+}
+
+// Response from GET /api/indexing/history/:job_id
+export interface JobDetailResponse {
+  job: PersistedJob;
+  items: PersistedJobItem[];
+  errors: string[];
+}
+
+// Parameters for listing job history
+export interface ListJobHistoryParams {
+  limit?: number;
+  offset?: number;
+}
+
 // API functions
 export const indexingApi = {
   // Start URL indexing
@@ -228,6 +291,54 @@ export const indexingApi = {
 
     return response.json();
   },
+
+  // ============================================================================
+  // Job History API (Persisted Jobs)
+  // ============================================================================
+
+  // List persisted job history
+  async getJobHistory(params?: ListJobHistoryParams): Promise<JobHistoryResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.limit) searchParams.set('limit', params.limit.toString());
+    if (params?.offset) searchParams.set('offset', params.offset.toString());
+
+    const url = `${API_BASE}/history${searchParams.toString() ? `?${searchParams}` : ''}`;
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch job history');
+    }
+
+    return response.json();
+  },
+
+  // Get detailed info for a persisted job including all items
+  async getJobDetail(jobId: string): Promise<JobDetailResponse> {
+    const response = await fetch(`${API_BASE}/history/${jobId}`);
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error('Job not found in history');
+      }
+      throw new Error('Failed to fetch job details');
+    }
+
+    return response.json();
+  },
+
+  // Get just the items for a persisted job (for pagination/lazy loading)
+  async getJobItems(jobId: string): Promise<PersistedJobItem[]> {
+    const response = await fetch(`${API_BASE}/history/${jobId}/items`);
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error('Job not found in history');
+      }
+      throw new Error('Failed to fetch job items');
+    }
+
+    return response.json();
+  },
 };
 
 // Utility function to convert File to base64
@@ -260,4 +371,41 @@ export function formatDuration(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${mins}m ${secs}s`;
+}
+
+// Format duration from milliseconds
+export function formatDurationMs(ms: number): string {
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}m ${secs}s`;
+}
+
+// Convert PersistedJobItem array to PageState record for PageStatusList compatibility
+export function convertPersistedItemsToPages(items: PersistedJobItem[]): Record<string, PageState> {
+  const pages: Record<string, PageState> = {};
+
+  for (const item of items) {
+    const pageStatus: PageStatus =
+      item.status === 'completed' ? 'completed' :
+      item.status === 'error' ? 'error' : 'completed';
+
+    pages[item.url] = {
+      url: item.url,
+      status: pageStatus,
+      discoveredAt: item.discovered_at,
+      parentUrl: item.parent_url || undefined,
+      depth: item.depth,
+      startedAt: item.started_at || undefined,
+      completedAt: item.completed_at || undefined,
+      chunksCreated: item.chunks_created,
+      embeddingsGenerated: item.embeddings_generated,
+      durationMs: item.duration_ms,
+      errorMessage: item.error_message || undefined,
+      recoverable: false, // Historical items are not recoverable
+    };
+  }
+
+  return pages;
 }

@@ -1,11 +1,12 @@
 //! Job executor for running jobs
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::Utc;
 use futures::stream::{self, StreamExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -15,6 +16,7 @@ use url::Url;
 use kix_crawler::crawler::{CrawlResult, Crawler, CrawlerConfig};
 use kix_sse::event::{Event, EventType, SourceType};
 use kix_sse::ConnectionManager;
+use kix_store::{JobItemRecord, JobRecord, JobStats, JobStore};
 
 use crate::job::{Job, JobResult, JobType};
 use crate::processor::{ContentProcessor, ProcessorConfig};
@@ -60,6 +62,8 @@ pub struct ExecutorConfig {
     pub max_memory_per_job: usize,
     /// Database path for LanceDB storage
     pub db_path: String,
+    /// Path for job history persistence (jobs.lance)
+    pub jobs_db_path: Option<String>,
     /// Content processor configuration
     pub processor_config: ProcessorConfig,
 }
@@ -71,9 +75,22 @@ impl Default for ExecutorConfig {
             worker_count: 8,     // Increased from 4 to match concurrent jobs
             max_memory_per_job: 512 * 1024 * 1024, // 512MB
             db_path: "./data/eip.lance".to_string(),
+            jobs_db_path: Some("./data/lancedb/jobs.lance".to_string()),
             processor_config: ProcessorConfig::default(),
         }
     }
+}
+
+/// Context for tracking items during job execution.
+/// Collects data for job history persistence.
+#[derive(Clone)]
+pub struct JobExecutionContext {
+    /// Items keyed by URL/path for O(1) upsert
+    pub items: Arc<RwLock<HashMap<String, JobItemRecord>>>,
+    /// Job start time for duration calculation
+    pub start_time: std::time::Instant,
+    /// Actual count of discovered items (may differ from items.len() due to filtering)
+    pub items_discovered: Arc<AtomicUsize>,
 }
 
 /// Job executor manages job execution
@@ -85,6 +102,8 @@ pub struct JobExecutor {
     shutdown_token: CancellationToken,
     workers: Vec<JoinHandle<()>>,
     processor: Option<Arc<ContentProcessor>>,
+    /// Job history store (optional - for persisting completed jobs)
+    job_store: Option<Arc<JobStore>>,
 }
 
 impl JobExecutor {
@@ -100,6 +119,27 @@ impl JobExecutor {
         let processor = ContentProcessor::new(&config.db_path, config.processor_config.clone())
             .await?;
 
+        // Initialize job history store if configured
+        let job_store = if let Some(ref jobs_path) = config.jobs_db_path {
+            match JobStore::new(jobs_path).await {
+                Ok(mut store) => {
+                    if let Err(e) = store.init_tables().await {
+                        warn!("Failed to initialize job history tables: {}", e);
+                        None
+                    } else {
+                        info!("Job history store initialized at: {}", jobs_path);
+                        Some(Arc::new(store))
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create job history store: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             queue,
             sse_manager,
@@ -108,6 +148,7 @@ impl JobExecutor {
             shutdown_token: CancellationToken::new(),
             workers: Vec::new(),
             processor: Some(Arc::new(processor)),
+            job_store,
         })
     }
 
@@ -127,7 +168,13 @@ impl JobExecutor {
             shutdown_token: CancellationToken::new(),
             workers: Vec::new(),
             processor: None,
+            job_store: None,
         }
+    }
+
+    /// Get a reference to the job store (for API access)
+    pub fn job_store(&self) -> Option<&Arc<JobStore>> {
+        self.job_store.as_ref()
     }
 
     /// Start the executor with worker threads
@@ -140,9 +187,10 @@ impl JobExecutor {
             let semaphore = self.semaphore.clone();
             let shutdown = self.shutdown_token.clone();
             let processor = self.processor.clone();
+            let job_store = self.job_store.clone();
 
             let handle = tokio::spawn(async move {
-                Self::worker_loop(i, queue, sse_manager, semaphore, shutdown, processor).await;
+                Self::worker_loop(i, queue, sse_manager, semaphore, shutdown, processor, job_store).await;
             });
 
             self.workers.push(handle);
@@ -157,6 +205,7 @@ impl JobExecutor {
         semaphore: Arc<Semaphore>,
         shutdown: CancellationToken,
         processor: Option<Arc<ContentProcessor>>,
+        job_store: Option<Arc<JobStore>>,
     ) {
         info!(worker_id, "Worker started");
 
@@ -172,12 +221,38 @@ impl JobExecutor {
 
                     info!(worker_id, job_id = %job.id, "Processing job");
 
-                    match Self::execute_job(&job, &sse_manager, processor.as_ref()).await {
+                    // Create execution context for item tracking
+                    let ctx = JobExecutionContext {
+                        items: Arc::new(RwLock::new(HashMap::new())),
+                        start_time: std::time::Instant::now(),
+                        items_discovered: Arc::new(AtomicUsize::new(0)),
+                    };
+
+                    match Self::execute_job(&job, &sse_manager, processor.as_ref(), &ctx).await {
                         Ok(result) => {
+                            // Persist job history before marking complete
+                            if let Some(ref store) = job_store {
+                                if let Err(e) = Self::persist_job(&job, &result, "completed", &ctx, store).await {
+                                    warn!(job_id = %job.id, error = %e, "Failed to persist job history");
+                                }
+                            }
                             queue.complete(job.id, result).await;
                         }
                         Err(e) => {
                             error!(worker_id, job_id = %job.id, error = %e, "Job failed");
+                            // Persist failed job
+                            if let Some(ref store) = job_store {
+                                let failed_result = JobResult {
+                                    items_processed: 0,
+                                    chunks_created: 0,
+                                    embeddings_generated: 0,
+                                    errors: vec![e.to_string()],
+                                    duration_ms: ctx.start_time.elapsed().as_millis() as u64,
+                                };
+                                if let Err(pe) = Self::persist_job(&job, &failed_result, "failed", &ctx, store).await {
+                                    warn!(job_id = %job.id, error = %pe, "Failed to persist failed job history");
+                                }
+                            }
                             queue.fail(job.id, e.to_string(), 0).await;
                         }
                     }
@@ -186,11 +261,93 @@ impl JobExecutor {
         }
     }
 
+    /// Persist job and its items to the job history store
+    async fn persist_job(
+        job: &Job,
+        result: &JobResult,
+        status: &str,
+        ctx: &JobExecutionContext,
+        store: &JobStore,
+    ) -> Result<(), kix_store::StoreError> {
+        // Extract source info from job type
+        let (source_url, source_domain) = match &job.job_type {
+            JobType::Url { url, .. } => {
+                let domain = Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.domain().map(|d| d.to_string()));
+                (Some(url.clone()), domain)
+            }
+            JobType::FileUpload { file_names, .. } => {
+                (file_names.first().cloned(), None)
+            }
+            JobType::Reindex { collection_id, .. } => {
+                (Some(collection_id.clone()), None)
+            }
+        };
+
+        // Build job type string
+        let job_type_str = match &job.job_type {
+            JobType::Url { .. } => "url",
+            JobType::FileUpload { .. } => "file_upload",
+            JobType::Reindex { .. } => "reindex",
+        };
+
+        // Serialize job config
+        let config = serde_json::to_value(&job.config).unwrap_or(serde_json::json!({}));
+
+        // Calculate rate
+        let duration_secs = result.duration_ms as f64 / 1000.0;
+        let rate = if duration_secs > 0.0 {
+            result.items_processed as f64 / duration_secs
+        } else {
+            0.0
+        };
+
+        // Get actual discovered count from context
+        let items_discovered = ctx.items_discovered.load(Ordering::Relaxed) as u32;
+
+        let job_record = JobRecord {
+            job_id: job.id.to_string(),
+            job_type: job_type_str.to_string(),
+            status: status.to_string(),
+            created_at: job.created_at,
+            started_at: Some(Utc::now() - chrono::Duration::milliseconds(result.duration_ms as i64)),
+            completed_at: Utc::now(),
+            source_url,
+            source_domain,
+            config,
+            stats: JobStats {
+                items_processed: result.items_processed as u32,
+                items_discovered: items_discovered.max(result.items_processed as u32),
+                chunks_created: result.chunks_created as u32,
+                embeddings_generated: result.embeddings_generated as u32,
+                error_count: result.errors.len() as u32,
+                duration_ms: result.duration_ms,
+                processing_rate: rate,
+            },
+            errors: result.errors.clone(),
+        };
+
+        // Get collected items as Vec
+        let items_map = ctx.items.read().await;
+        let items: Vec<JobItemRecord> = items_map.values().cloned().collect();
+
+        info!(
+            job_id = %job.id,
+            items_count = items.len(),
+            items_discovered = items_discovered,
+            "Persisting job with items"
+        );
+
+        store.save_job(&job_record, &items).await
+    }
+
     /// Execute a single job
     async fn execute_job(
         job: &Job,
         sse_manager: &ConnectionManager,
         processor: Option<&Arc<ContentProcessor>>,
+        ctx: &JobExecutionContext,
     ) -> Result<JobResult, JobError> {
         let tracker = ProgressTracker::new();
 
@@ -240,6 +397,7 @@ impl JobExecutor {
                     &tracker,
                     sse_manager,
                     processor,
+                    ctx,
                 )
                 .await?
             }
@@ -256,11 +414,12 @@ impl JobExecutor {
                     &tracker,
                     sse_manager,
                     processor,
+                    ctx,
                 )
                 .await?
             }
             JobType::Reindex { collection_id, filters } => {
-                Self::execute_reindex_job(job, collection_id, filters.as_ref(), &tracker, sse_manager, processor)
+                Self::execute_reindex_job(job, collection_id, filters.as_ref(), &tracker, sse_manager, processor, ctx)
                     .await?
             }
         };
@@ -295,6 +454,7 @@ impl JobExecutor {
         tracker: &ProgressTracker,
         sse_manager: &ConnectionManager,
         processor: Option<&Arc<ContentProcessor>>,
+        ctx: &JobExecutionContext,
     ) -> Result<JobResult, JobError> {
         use std::time::Duration;
         use url::Url;
@@ -325,16 +485,24 @@ impl JobExecutor {
 
         // Emit ItemDiscovered for seed URL (path-only normalization to prevent duplicates)
         let normalized_seed = normalize_url_for_display(&seed_url);
+        let seed_discovered_at = Utc::now();
         let _ = sse_manager.broadcast_to_job(
             job.id,
             Event::new(EventType::ItemDiscovered {
                 job_id: job.id,
                 item_path: normalized_seed.clone(),
-                discovered_at: chrono::Utc::now(),
+                discovered_at: seed_discovered_at,
                 parent_url: None,
                 depth: 0,
             }),
         );
+
+        // Track seed URL as an item for persistence
+        {
+            let mut items = ctx.items.write().await;
+            items.insert(normalized_seed.clone(), JobItemRecord::new_page(job.id.to_string(), normalized_seed.clone()));
+        }
+        ctx.items_discovered.fetch_add(1, Ordering::Relaxed);
 
         // Stats for streaming processing (using atomics for thread-safe access)
         let processed_count = Arc::new(AtomicUsize::new(0));
@@ -484,6 +652,14 @@ impl JobExecutor {
                         recoverable: true,
                     }),
                 );
+                // Update or insert item for persistence (upsert)
+                {
+                    let mut items = ctx.items.write().await;
+                    let item = items.entry(result.url.clone()).or_insert_with(|| {
+                        JobItemRecord::new_page(job_id.to_string(), result.url.clone())
+                    });
+                    item.mark_error(err.clone());
+                }
             } else {
                 let _ = sse_manager.broadcast_to_job(
                     job_id,
@@ -495,6 +671,14 @@ impl JobExecutor {
                         duration_ms: 0,
                     }),
                 );
+                // Update or insert item for persistence (upsert)
+                {
+                    let mut items = ctx.items.write().await;
+                    let item = items.entry(result.url.clone()).or_insert_with(|| {
+                        JobItemRecord::new_page(job_id.to_string(), result.url.clone())
+                    });
+                    item.mark_completed(result.chunks as u32, result.embeddings as u32, 0);
+                }
             }
 
             // Emit ItemDiscovered for new URLs found on this page (deduplicated)
@@ -521,6 +705,16 @@ impl JobExecutor {
                             depth: *depth,
                         }),
                     );
+                    // Add discovered URL as an item for persistence (may already exist if processed first)
+                    {
+                        let mut items = ctx.items.write().await;
+                        items.entry(link_url.clone()).or_insert_with(|| {
+                            JobItemRecord::new_page(job_id.to_string(), link_url.clone())
+                                .with_parent(result.url.clone(), *depth as u32)
+                        });
+                    }
+                    // Increment discovered count
+                    ctx.items_discovered.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -598,6 +792,7 @@ impl JobExecutor {
         tracker: &ProgressTracker,
         sse_manager: &ConnectionManager,
         processor: Option<&Arc<ContentProcessor>>,
+        ctx: &JobExecutionContext,
     ) -> Result<JobResult, JobError> {
         tracker.set_step("Processing uploaded files in parallel").await;
         tracker.set_total(file_paths.len());
@@ -665,6 +860,15 @@ impl JobExecutor {
         // Use pin_mut! for safe iteration over the stream
         futures::pin_mut!(result_stream);
 
+        // Add all files as items upfront for persistence tracking
+        {
+            let mut items = ctx.items.write().await;
+            for name in file_names {
+                items.insert(name.clone(), JobItemRecord::new_file(job_id.to_string(), name.clone()));
+            }
+        }
+        ctx.items_discovered.store(file_names.len(), Ordering::Relaxed);
+
         while let Some(result) = result_stream.next().await {
             processed_count += 1;
             total_chunks += result.chunks;
@@ -682,6 +886,13 @@ impl JobExecutor {
                         recoverable: true,
                     }),
                 );
+                // Update item status for persistence
+                {
+                    let mut items = ctx.items.write().await;
+                    if let Some(item) = items.get_mut(&result.name) {
+                        item.mark_error(err.clone());
+                    }
+                }
             } else {
                 // Send item processed event immediately
                 let _ = sse_manager.broadcast_to_job(
@@ -694,6 +905,13 @@ impl JobExecutor {
                         duration_ms: 0,
                     }),
                 );
+                // Update item status for persistence
+                {
+                    let mut items = ctx.items.write().await;
+                    if let Some(item) = items.get_mut(&result.name) {
+                        item.mark_completed(result.chunks as u32, result.embeddings as u32, 0);
+                    }
+                }
             }
 
             // Update tracker
@@ -737,6 +955,7 @@ impl JobExecutor {
         tracker: &ProgressTracker,
         _sse_manager: &ConnectionManager,
         _processor: Option<&Arc<ContentProcessor>>,
+        _ctx: &JobExecutionContext,
     ) -> Result<JobResult, JobError> {
         tracker.set_step("Re-indexing collection").await;
         info!(collection_id = collection_id, "Re-indexing not yet implemented");

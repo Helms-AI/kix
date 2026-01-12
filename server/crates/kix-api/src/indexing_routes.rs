@@ -27,6 +27,7 @@ use kix_jobs::{
     queue::JobQueue,
 };
 use kix_sse::manager::ConnectionManager;
+use kix_store::JobStore;
 
 use crate::routes::AppState;
 
@@ -41,6 +42,8 @@ pub struct IndexingState {
     pub sse_manager: Arc<ConnectionManager>,
     /// File handler for uploads
     pub file_handler: Arc<FileHandler>,
+    /// Job history store (optional - for persisted job history)
+    pub job_store: Option<Arc<JobStore>>,
 }
 
 impl IndexingState {
@@ -55,7 +58,14 @@ impl IndexingState {
             job_queue,
             sse_manager,
             file_handler,
+            job_store: None,
         }
+    }
+
+    /// Set the job store for history persistence
+    pub fn with_job_store(mut self, job_store: Arc<JobStore>) -> Self {
+        self.job_store = Some(job_store);
+        self
     }
 }
 
@@ -72,6 +82,10 @@ pub fn create_indexing_router(state: IndexingState) -> Router {
         .route("/api/indexing/jobs", get(list_jobs))
         .route("/api/indexing/jobs/:id", get(get_job))
         .route("/api/indexing/jobs/:id", delete(cancel_job))
+        // Job history endpoints
+        .route("/api/indexing/history", get(list_job_history))
+        .route("/api/indexing/history/:job_id", get(get_job_detail))
+        .route("/api/indexing/history/:job_id/items", get(get_job_items))
         // Data management endpoints
         .route("/api/indexing/data", delete(delete_all_data))
         // Start indexing endpoints
@@ -745,4 +759,229 @@ async fn reindex_by_domain(
         job_ids,
         status: format!("Queued {} entries from domain '{}' for re-indexing", entry_count, request.domain),
     }))
+}
+
+// ============================================================================
+// Job History Endpoints
+// ============================================================================
+
+/// Query parameters for job history list
+#[derive(Debug, Deserialize)]
+pub struct JobHistoryQuery {
+    /// Maximum jobs to return (default: 50)
+    #[serde(default = "default_history_limit")]
+    pub limit: usize,
+    /// Offset for pagination (default: 0)
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_history_limit() -> usize {
+    50
+}
+
+/// Response for job history list
+#[derive(Debug, Serialize)]
+pub struct JobHistoryResponse {
+    pub jobs: Vec<JobHistoryItem>,
+    pub total: usize,
+}
+
+/// A job in the history list
+#[derive(Debug, Serialize)]
+pub struct JobHistoryItem {
+    pub job_id: String,
+    pub job_type: String,
+    pub status: String,
+    pub source_url: Option<String>,
+    pub source_domain: Option<String>,
+    pub created_at: String,
+    pub completed_at: String,
+    pub stats: JobHistoryStats,
+}
+
+/// Job statistics
+#[derive(Debug, Serialize)]
+pub struct JobHistoryStats {
+    pub items_processed: u32,
+    pub items_discovered: u32,
+    pub chunks_created: u32,
+    pub embeddings_generated: u32,
+    pub error_count: u32,
+    pub duration_ms: u64,
+    pub rate: f64,
+}
+
+/// Detailed job response with items
+#[derive(Debug, Serialize)]
+pub struct JobDetailResponse {
+    pub job: JobHistoryItem,
+    pub items: Vec<JobHistoryItemDetail>,
+    pub errors: Vec<String>,
+}
+
+/// Individual item (page/file) in job history
+#[derive(Debug, Serialize)]
+pub struct JobHistoryItemDetail {
+    pub url: String,
+    pub status: String,
+    pub parent_url: Option<String>,
+    pub depth: u32,
+    pub discovered_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub chunks_created: u32,
+    pub embeddings_generated: u32,
+    pub duration_ms: u64,
+    pub error_message: Option<String>,
+}
+
+/// GET /api/indexing/history - List persisted job history
+async fn list_job_history(
+    State(state): State<IndexingState>,
+    Query(query): Query<JobHistoryQuery>,
+) -> Result<Json<JobHistoryResponse>, (StatusCode, String)> {
+    let store = state.job_store.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "Job history not available".to_string())
+    })?;
+
+    let jobs = store
+        .list_jobs(query.limit, query.offset)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to list job history");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list jobs: {}", e))
+        })?;
+
+    let total = store.job_count().await.unwrap_or(0);
+
+    let items: Vec<JobHistoryItem> = jobs
+        .into_iter()
+        .map(|j| JobHistoryItem {
+            job_id: j.job_id,
+            job_type: j.job_type,
+            status: j.status,
+            source_url: j.source_url,
+            source_domain: j.source_domain,
+            created_at: j.created_at.to_rfc3339(),
+            completed_at: j.completed_at.to_rfc3339(),
+            stats: JobHistoryStats {
+                items_processed: j.stats.items_processed,
+                items_discovered: j.stats.items_discovered,
+                chunks_created: j.stats.chunks_created,
+                embeddings_generated: j.stats.embeddings_generated,
+                error_count: j.stats.error_count,
+                duration_ms: j.stats.duration_ms,
+                rate: j.stats.processing_rate,
+            },
+        })
+        .collect();
+
+    Ok(Json(JobHistoryResponse { jobs: items, total }))
+}
+
+/// GET /api/indexing/history/:job_id - Get detailed job history with items
+async fn get_job_detail(
+    State(state): State<IndexingState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobDetailResponse>, (StatusCode, String)> {
+    let store = state.job_store.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "Job history not available".to_string())
+    })?;
+
+    let job = store
+        .get_job(&job_id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to get job");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get job: {}", e))
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Job not found".to_string()))?;
+
+    let items = store
+        .get_job_items(&job_id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to get job items");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get job items: {}", e))
+        })?;
+
+    let job_item = JobHistoryItem {
+        job_id: job.job_id,
+        job_type: job.job_type,
+        status: job.status,
+        source_url: job.source_url,
+        source_domain: job.source_domain,
+        created_at: job.created_at.to_rfc3339(),
+        completed_at: job.completed_at.to_rfc3339(),
+        stats: JobHistoryStats {
+            items_processed: job.stats.items_processed,
+            items_discovered: job.stats.items_discovered,
+            chunks_created: job.stats.chunks_created,
+            embeddings_generated: job.stats.embeddings_generated,
+            error_count: job.stats.error_count,
+            duration_ms: job.stats.duration_ms,
+            rate: job.stats.processing_rate,
+        },
+    };
+
+    let item_details: Vec<JobHistoryItemDetail> = items
+        .into_iter()
+        .map(|i| JobHistoryItemDetail {
+            url: i.item_path,
+            status: i.status,
+            parent_url: i.parent_url,
+            depth: i.depth,
+            discovered_at: i.discovered_at.to_rfc3339(),
+            started_at: i.started_at.map(|dt| dt.to_rfc3339()),
+            completed_at: i.completed_at.map(|dt| dt.to_rfc3339()),
+            chunks_created: i.chunks_created,
+            embeddings_generated: i.embeddings_generated,
+            duration_ms: i.duration_ms,
+            error_message: i.error_message,
+        })
+        .collect();
+
+    Ok(Json(JobDetailResponse {
+        job: job_item,
+        items: item_details,
+        errors: job.errors,
+    }))
+}
+
+/// GET /api/indexing/history/:job_id/items - Get just the items for a job
+async fn get_job_items(
+    State(state): State<IndexingState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<Vec<JobHistoryItemDetail>>, (StatusCode, String)> {
+    let store = state.job_store.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "Job history not available".to_string())
+    })?;
+
+    let items = store
+        .get_job_items(&job_id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to get job items");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get job items: {}", e))
+        })?;
+
+    let item_details: Vec<JobHistoryItemDetail> = items
+        .into_iter()
+        .map(|i| JobHistoryItemDetail {
+            url: i.item_path,
+            status: i.status,
+            parent_url: i.parent_url,
+            depth: i.depth,
+            discovered_at: i.discovered_at.to_rfc3339(),
+            started_at: i.started_at.map(|dt| dt.to_rfc3339()),
+            completed_at: i.completed_at.map(|dt| dt.to_rfc3339()),
+            chunks_created: i.chunks_created,
+            embeddings_generated: i.embeddings_generated,
+            duration_ms: i.duration_ms,
+            error_message: i.error_message,
+        })
+        .collect();
+
+    Ok(Json(item_details))
 }

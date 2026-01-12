@@ -27,7 +27,7 @@ use kix_crawler::ContentExtractor;
 use url::Url;
 use kix_sse::{ConnectionManager, spawn_cleanup_task};
 use kix_store::search::SearchFilters;
-use kix_store::KixStore;
+use kix_store::{JobStore, KixStore};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 
@@ -494,17 +494,41 @@ async fn run_api(db_path: &str, port: u16) -> Result<()> {
     // Initialize file handler upload directory
     file_handler.init().await?;
 
+    // Initialize job history store
+    let jobs_db_path = PathBuf::from(db_path).join("jobs.lance");
+    let job_store = match JobStore::new(jobs_db_path.to_string_lossy().as_ref()).await {
+        Ok(mut store) => {
+            if let Err(e) = store.init_tables().await {
+                error!("Failed to initialize job history tables: {}", e);
+                None
+            } else {
+                info!("Job history store initialized at {}", jobs_db_path.display());
+                Some(Arc::new(store))
+            }
+        }
+        Err(e) => {
+            error!("Failed to create job history store: {}", e);
+            None
+        }
+    };
+
     // Create indexing state
-    let indexing_state = IndexingState::new(
+    let mut indexing_state = IndexingState::new(
         state.clone(),
         job_queue.clone(),
         sse_manager.clone(),
         file_handler,
     );
 
+    // Attach job store if initialized
+    if let Some(store) = job_store.clone() {
+        indexing_state = indexing_state.with_job_store(store);
+    }
+
     // Create and start the job executor
     let executor_config = ExecutorConfig {
         db_path: db_path.to_string(),
+        jobs_db_path: job_store.as_ref().map(|_| jobs_db_path.to_string_lossy().to_string()),
         ..Default::default()
     };
 

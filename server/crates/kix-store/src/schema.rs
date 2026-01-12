@@ -90,6 +90,88 @@ pub fn document_schema() -> Arc<Schema> {
     entry_schema()
 }
 
+// ============================================================================
+// Jobs Table Schema (Job History Persistence)
+// ============================================================================
+
+/// Creates the schema for the jobs table.
+///
+/// The jobs table stores completed job metadata and aggregated statistics
+/// for job history persistence. Stored in a separate `jobs.lance` file.
+pub fn job_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        // Identifiers
+        Field::new("job_id", DataType::Utf8, false),
+
+        // Job metadata
+        Field::new("job_type", DataType::Utf8, false),      // "url", "file_upload", "reindex"
+        Field::new("status", DataType::Utf8, false),        // "completed", "failed", "cancelled"
+
+        // Timestamps
+        Field::new("created_at", DataType::Utf8, false),    // RFC3339
+        Field::new("started_at", DataType::Utf8, true),     // RFC3339
+        Field::new("completed_at", DataType::Utf8, false),  // RFC3339
+
+        // Source information
+        Field::new("source_url", DataType::Utf8, true),     // For URL jobs
+        Field::new("source_domain", DataType::Utf8, true),  // Extracted domain
+
+        // Job configuration (JSON serialized)
+        Field::new("config", DataType::Utf8, false),
+
+        // Aggregated statistics
+        Field::new("items_processed", DataType::UInt32, false),
+        Field::new("items_discovered", DataType::UInt32, false),
+        Field::new("chunks_created", DataType::UInt32, false),
+        Field::new("embeddings_generated", DataType::UInt32, false),
+        Field::new("error_count", DataType::UInt32, false),
+        Field::new("duration_ms", DataType::UInt64, false),
+        Field::new("processing_rate", DataType::Float64, false), // items/sec
+
+        // Errors (JSON array)
+        Field::new("errors", DataType::Utf8, true),
+    ]))
+}
+
+// ============================================================================
+// Job Items Table Schema (Per-Item Details)
+// ============================================================================
+
+/// Creates the schema for the job_items table.
+///
+/// The job_items table stores per-page/file details for job history.
+/// Each row represents one processed item (URL or file) with its
+/// individual statistics and status.
+pub fn job_item_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        // Identifiers
+        Field::new("item_id", DataType::Utf8, false),       // UUID as string
+        Field::new("job_id", DataType::Utf8, false),        // FK to jobs table
+
+        // Item details
+        Field::new("item_path", DataType::Utf8, false),     // URL or file path
+        Field::new("item_type", DataType::Utf8, false),     // "page", "file"
+        Field::new("status", DataType::Utf8, false),        // "completed", "error", "skipped"
+
+        // Hierarchy (for crawled pages)
+        Field::new("parent_url", DataType::Utf8, true),     // Parent URL for crawls
+        Field::new("depth", DataType::UInt32, false),       // Crawl depth
+
+        // Timestamps
+        Field::new("discovered_at", DataType::Utf8, false), // RFC3339
+        Field::new("started_at", DataType::Utf8, true),     // RFC3339
+        Field::new("completed_at", DataType::Utf8, true),   // RFC3339
+
+        // Processing stats
+        Field::new("chunks_created", DataType::UInt32, false),
+        Field::new("embeddings_generated", DataType::UInt32, false),
+        Field::new("duration_ms", DataType::UInt64, false),
+
+        // Error information
+        Field::new("error_message", DataType::Utf8, true),
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +192,27 @@ mod tests {
         assert!(schema.field_with_name("entry_id").is_ok());
         assert!(schema.field_with_name("entry_title").is_ok());
         assert!(schema.field_with_name("vector").is_ok());
+    }
+
+    #[test]
+    fn test_job_schema_fields() {
+        let schema = job_schema();
+        assert!(schema.field_with_name("job_id").is_ok());
+        assert!(schema.field_with_name("job_type").is_ok());
+        assert!(schema.field_with_name("status").is_ok());
+        assert!(schema.field_with_name("items_processed").is_ok());
+        assert!(schema.field_with_name("chunks_created").is_ok());
+        assert!(schema.field_with_name("duration_ms").is_ok());
+    }
+
+    #[test]
+    fn test_job_item_schema_fields() {
+        let schema = job_item_schema();
+        assert!(schema.field_with_name("item_id").is_ok());
+        assert!(schema.field_with_name("job_id").is_ok());
+        assert!(schema.field_with_name("item_path").is_ok());
+        assert!(schema.field_with_name("status").is_ok());
+        assert!(schema.field_with_name("chunks_created").is_ok());
+        assert!(schema.field_with_name("error_message").is_ok());
     }
 }

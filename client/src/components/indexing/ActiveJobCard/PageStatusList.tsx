@@ -78,9 +78,9 @@ export const PageStatusList = memo(function PageStatusList({
   maxHeight = 300,
   onClear,
 }: PageStatusListProps) {
-  // Convert pages Record to sorted array
+  // Convert pages Record to sorted array, filtering out invalid entries
   const sortedPages = useMemo(() => {
-    const pageArray = Object.values(pages);
+    const pageArray = Object.values(pages).filter(page => page && page.url);
     return sortPages(pageArray);
   }, [pages]);
 
