@@ -305,10 +305,9 @@ export default function EntryDetail() {
         </div>
       </div>
 
-      <div className="space-y-6">
-        {/* Main Content - Full Width */}
-        <div className="space-y-6">
-          {/* Content */}
+      <div className="flex flex-col lg:flex-row gap-6">
+        {/* Main Content */}
+        <div className="flex-1 min-w-0">
           <div className="card p-6">
             <h2 className="text-xl font-semibold text-white flex items-center gap-2 mb-4">
               <Layers className="w-5 h-5 text-cyan-400" />
@@ -353,8 +352,8 @@ export default function EntryDetail() {
           </div>
         </div>
 
-        {/* Related & Quick Links - Side by Side */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Right Sidebar */}
+        <aside className="w-full lg:w-80 flex-shrink-0 space-y-6">
           {/* Related Entries */}
           <div className="card p-6">
             <h2 className="text-lg font-semibold text-white flex items-center gap-2 mb-4">
@@ -371,13 +370,13 @@ export default function EntryDetail() {
                     to={`/entries/${encodeURIComponent(related.id)}`}
                     className="block p-3 rounded-lg bg-slate-800/50 hover:bg-slate-800 border border-slate-700 hover:border-cyan-500/50 transition-all group"
                   >
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-300 group-hover:text-white text-sm font-medium">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-slate-300 group-hover:text-white text-sm font-medium truncate">
                         {related.title}
                       </span>
                       <span
                         className={clsx(
-                          'px-2 py-0.5 text-xs font-mono rounded',
+                          'px-2 py-0.5 text-xs font-mono rounded flex-shrink-0',
                           related.entry_type === 'messaging'
                             ? 'bg-violet-500/20 text-violet-400'
                             : 'bg-amber-500/20 text-amber-400'
@@ -410,7 +409,7 @@ export default function EntryDetail() {
               </Link>
             </div>
           </div>
-        </div>
+        </aside>
       </div>
 
       {/* Back Link */}
