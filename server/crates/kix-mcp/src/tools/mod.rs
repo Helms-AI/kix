@@ -1,14 +1,54 @@
-//! MCP tool implementations.
+//! MCP tool parameter and response types.
 //!
-//! All tools are implemented in the `server` module using the `#[tool]` macro.
-//! This module re-exports parameter types for external use.
+//! This module re-exports all parameter and response types used by the RAG tools.
+//!
+//! ## Tool Categories
+//!
+//! **Retrieval Tools:**
+//! - `search` - [`SearchParams`], [`SearchResponse`]
+//! - `get_context` - [`GetContextParams`], [`PageContext`]
+//! - `get_document` - [`GetDocumentParams`], [`Document`]
+//!
+//! **Indexing Tools:**
+//! - `index` - [`IndexParams`], [`IndexResult`]
+//! - `index_async` - [`IndexAsyncParams`], [`JobCreated`]
+//! - `job_status` - [`JobStatusParams`], [`JobStatusResponse`]
+//! - `delete` - [`DeleteParams`], [`DeleteResult`]
+//!
+//! **Status Tool:**
+//! - `status` - [`StatusParams`], [`IndexStatus`]
 
 pub use crate::server::{
-    // Search tools
-    ComparePatternsParams, ExplainPatternParams, FindRelatedParams, GetCategoryOverviewParams,
-    GetPatternParams, ListPatternsParams, PatternSequenceParams, SearchByProblemParams,
-    SearchByTechnologyParams, SearchPatternsParams, SuggestArchitectureParams,
-    // Indexing tools
-    BatchDocument, ContentSource, DeleteDocumentParams, DocumentSchema, GenericSchema,
-    GetIndexStatusParams, IndexBatchParams, IndexDocumentParams, PatternSchema,
+    // Search/Retrieval types
+    SearchParams,
+    SearchMode,
+    QueryFilters,
+    SearchResultItem,
+    SearchResponse,
+    GetContextParams,
+    PageContext,
+    GetDocumentParams,
+    ChunkInfo,
+    Document,
+
+    // Indexing types
+    ContentSource,
+    IndexParams,
+    IndexResult,
+    UrlSource,
+    AsyncSource,
+    IndexAsyncParams,
+    JobCreated,
+    JobStatusParams,
+    JobProgress,
+    JobResult,
+    JobStatusResponse,
+    DeleteFilter,
+    DeleteParams,
+    DeleteResult,
+
+    // Status types
+    StatusParams,
+    StatusBreakdown,
+    IndexStatus,
 };

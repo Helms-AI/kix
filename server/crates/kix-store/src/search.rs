@@ -17,6 +17,8 @@ pub struct SearchResult {
     pub chunk_id: String,
     /// Parent entry ID
     pub entry_id: String,
+    /// Page ID for RAG context retrieval
+    pub page_id: Option<String>,
     /// Entry title
     pub entry_title: String,
     /// Chunk text content
@@ -510,6 +512,7 @@ impl KixStore {
     fn batch_to_results(batch: &RecordBatch) -> Result<Vec<SearchResult>, StoreError> {
         let chunk_ids = Self::get_string_column(batch, "chunk_id")?;
         let entry_ids = Self::get_string_column(batch, "entry_id")?;
+        let page_ids = Self::get_optional_string_column(batch, "page_id");
         let entry_titles = Self::get_string_column(batch, "entry_title")?;
         let texts = Self::get_string_column(batch, "text")?;
         let entry_types = Self::get_string_column(batch, "entry_type")?;
@@ -541,6 +544,7 @@ impl KixStore {
             results.push(SearchResult {
                 chunk_id: chunk_ids[i].clone(),
                 entry_id: entry_ids[i].clone(),
+                page_id: page_ids[i].clone(),
                 entry_title: entry_titles[i].clone(),
                 text: texts[i].clone(),
                 score,
@@ -561,6 +565,7 @@ impl KixStore {
     ) -> Result<Vec<SearchResult>, StoreError> {
         let chunk_ids = Self::get_string_column(batch, "chunk_id")?;
         let entry_ids = Self::get_string_column(batch, "entry_id")?;
+        let page_ids = Self::get_optional_string_column(batch, "page_id");
         let entry_titles = Self::get_string_column(batch, "entry_title")?;
         let texts = Self::get_string_column(batch, "text")?;
         let entry_types = Self::get_string_column(batch, "entry_type")?;
@@ -576,6 +581,7 @@ impl KixStore {
             results.push(SearchResult {
                 chunk_id: chunk_ids[i].clone(),
                 entry_id: entry_ids[i].clone(),
+                page_id: page_ids[i].clone(),
                 entry_title: entry_titles[i].clone(),
                 text: texts[i].clone(),
                 score: default_score - (i as f32 * 0.01), // Slight decay for rank

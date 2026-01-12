@@ -1,4 +1,21 @@
-//! MCP server implementation for EIP Knowledge System.
+//! MCP server implementation for RAG (Retrieval Augmented Generation) system.
+//!
+//! This module provides 8 domain-agnostic tools for AI agents to interact with
+//! the knowledge base:
+//!
+//! **Retrieval (3 tools):**
+//! - `search` - Unified semantic + keyword search
+//! - `get_context` - Full page content for RAG synthesis
+//! - `get_document` - Document metadata and chunks
+//!
+//! **Indexing (4 tools):**
+//! - `index` - Synchronous single document indexing
+//! - `index_async` - Async crawl/batch indexing with job tracking
+//! - `job_status` - Check async job progress
+//! - `delete` - Remove documents by ID or filter
+//!
+//! **Status (1 tool):**
+//! - `status` - Index health and statistics
 
 use reqwest::Client as HttpClient;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -17,309 +34,364 @@ use rmcp::{RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use kix_embeddings::{DocumentChunker, EmbeddingGenerator};
 use kix_parser::{Entry, EntryType, PdfParser, SourceType};
 use kix_crawler::ContentExtractor;
-use kix_store::search::{EntrySummary, SearchFilters, SearchResult};
+use kix_store::search::SearchFilters;
 use kix_store::KixStore;
 
-/// Search patterns request.
+// =============================================================================
+// RETRIEVAL TOOL PARAMETERS
+// =============================================================================
+
+/// Search mode for queries.
+#[derive(Debug, Clone, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Combined vector and full-text search (default, recommended)
+    #[default]
+    Hybrid,
+    /// Pure semantic vector search
+    Vector,
+    /// Pure keyword/full-text search
+    Text,
+}
+
+/// Filters for search queries.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct QueryFilters {
+    /// Filter by document type (e.g., "document", "pdf", "article")
+    #[schemars(description = "Filter by document type: 'document', 'pdf', 'article', 'code'")]
+    pub entry_type: Option<String>,
+    /// Filter by chunk type (e.g., "content", "code", "header")
+    #[schemars(description = "Filter by chunk type: 'content', 'code', 'header', 'summary'")]
+    pub chunk_type: Option<String>,
+    /// Filter by tag
+    #[schemars(description = "Filter by tag")]
+    pub tag: Option<String>,
+    /// Filter by source domain
+    #[schemars(description = "Filter by source domain (e.g., 'docs.example.com')")]
+    pub source_domain: Option<String>,
+}
+
+/// Parameters for the `search` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchPatternsParams {
-    /// Search query text
-    #[schemars(description = "Natural language search query for finding patterns")]
+pub struct SearchParams {
+    /// Natural language search query
+    #[schemars(description = "Natural language search query")]
     pub query: String,
-    /// Maximum number of results (default: 5)
-    #[schemars(description = "Maximum number of results to return")]
+    /// Maximum number of results (default: 10, max: 100)
+    #[schemars(description = "Maximum number of results to return (default: 10, max: 100)")]
     pub limit: Option<usize>,
-    /// Filter by pattern type (messaging, conversation)
-    #[schemars(description = "Filter by pattern type: 'messaging' or 'conversation'")]
-    pub pattern_type: Option<String>,
+    /// Pagination offset (default: 0)
+    #[schemars(description = "Pagination offset (default: 0)")]
+    pub offset: Option<usize>,
+    /// Search mode: hybrid, vector, or text
+    #[schemars(description = "Search mode: 'hybrid' (default), 'vector', or 'text'")]
+    pub mode: Option<SearchMode>,
+    /// Optional filters
+    #[schemars(description = "Optional filters for entry_type, chunk_type, tag, source_domain")]
+    pub filters: Option<QueryFilters>,
 }
 
-/// Get pattern request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetPatternParams {
-    /// Pattern name to retrieve
-    #[schemars(description = "Name of the pattern to retrieve")]
-    pub name: String,
+/// A single search result.
+#[derive(Debug, Serialize)]
+pub struct SearchResultItem {
+    pub chunk_id: String,
+    pub entry_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
+    pub text: String,
+    pub score: f32,
+    pub entry_title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
-/// List patterns request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListPatternsParams {
-    /// Category to filter by
-    #[schemars(description = "Category to filter patterns by (e.g., 'Message Routing', 'Message Channel')")]
-    pub category: Option<String>,
-    /// Pattern type to filter by
-    #[schemars(description = "Pattern type filter: 'messaging' or 'conversation'")]
-    pub pattern_type: Option<String>,
+/// Response from the `search` tool.
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchResultItem>,
+    pub total_count: usize,
+    pub has_more: bool,
 }
 
-/// Find related patterns request.
+/// Parameters for the `get_context` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct FindRelatedParams {
-    /// Pattern name to find related patterns for
-    #[schemars(description = "Name of the pattern to find related patterns for")]
-    pub pattern_name: String,
+pub struct GetContextParams {
+    /// Page ID for direct lookup
+    #[schemars(description = "Page ID from search result for direct lookup")]
+    pub page_id: Option<String>,
+    /// Chunk ID to lookup page via chunk's page_id
+    #[schemars(description = "Chunk ID to lookup the associated page")]
+    pub chunk_id: Option<String>,
 }
 
-/// Search by problem request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchByProblemParams {
-    /// Problem description to find patterns for
-    #[schemars(description = "Description of the problem you're trying to solve")]
-    pub problem_description: String,
-    /// Maximum number of results
-    #[schemars(description = "Maximum number of results to return")]
-    pub limit: Option<usize>,
+/// Full page context for RAG.
+#[derive(Debug, Serialize)]
+pub struct PageContext {
+    pub page_id: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub full_content: String,
+    pub content_length: usize,
+    pub code_block_count: usize,
 }
 
-/// Explain pattern request.
+/// Parameters for the `get_document` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ExplainPatternParams {
-    /// Pattern name to explain
-    #[schemars(description = "Name of the pattern to explain")]
-    pub pattern_name: String,
-    /// Focus area for explanation
-    #[schemars(description = "Focus area: 'usage', 'implementation', or 'tradeoffs'")]
-    pub focus: Option<String>,
+pub struct GetDocumentParams {
+    /// Document ID
+    #[schemars(description = "Document ID to retrieve")]
+    pub id: String,
+    /// Include all chunks for this document
+    #[schemars(description = "Include all chunks for this document (default: false)")]
+    pub include_chunks: Option<bool>,
 }
 
-/// Get category overview request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetCategoryOverviewParams {
-    /// Category name
-    #[schemars(description = "Name of the category to get an overview of")]
-    pub category: String,
+/// A chunk within a document.
+#[derive(Debug, Serialize)]
+pub struct ChunkInfo {
+    pub chunk_id: String,
+    pub chunk_index: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_type: Option<String>,
+    pub text: String,
 }
 
-/// Compare patterns request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ComparePatternsParams {
-    /// First pattern to compare
-    #[schemars(description = "Name of the first pattern to compare")]
-    pub pattern_a: String,
-    /// Second pattern to compare
-    #[schemars(description = "Name of the second pattern to compare")]
-    pub pattern_b: String,
-    /// Aspects to compare
-    #[schemars(description = "Aspects to compare: use_cases, trade_offs, complexity")]
-    pub aspects: Option<Vec<String>>,
-}
-
-/// Suggest architecture request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SuggestArchitectureParams {
-    /// System description
-    #[schemars(description = "Description of the system you're building")]
-    pub system_description: String,
-    /// Constraints to consider
-    #[schemars(description = "Constraints like 'high_throughput', 'fault_tolerant', 'simple'")]
-    pub constraints: Option<Vec<String>>,
-    /// Maximum number of pattern suggestions
-    #[schemars(description = "Maximum number of patterns to suggest")]
-    pub limit: Option<usize>,
-}
-
-/// Pattern sequence request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct PatternSequenceParams {
-    /// Starting pattern
-    #[schemars(description = "Starting pattern in the sequence")]
-    pub start_pattern: String,
-    /// Ending pattern
-    #[schemars(description = "Ending pattern in the sequence")]
-    pub end_pattern: Option<String>,
-    /// Include alternatives
-    #[schemars(description = "Whether to include alternative sequences")]
-    pub include_alternatives: Option<bool>,
-}
-
-/// Search by technology request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SearchByTechnologyParams {
-    /// Technology to search for
-    #[schemars(description = "Technology name like 'Apache Camel', 'Spring Integration', 'MuleSoft'")]
-    pub technology: String,
-    /// Pattern type filter
-    #[schemars(description = "Pattern type filter: 'messaging' or 'conversation'")]
-    pub pattern_type: Option<String>,
-    /// Maximum results
-    #[schemars(description = "Maximum number of results")]
-    pub limit: Option<usize>,
+/// Full document with metadata.
+#[derive(Debug, Serialize)]
+pub struct Document {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub entry_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_domain: Option<String>,
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Vec<ChunkInfo>>,
 }
 
 // =============================================================================
-// Indexing Tool Parameters
+// INDEXING TOOL PARAMETERS
 // =============================================================================
 
-/// Content source for indexing - specifies where to get the content from.
+/// Content source for indexing.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ContentSource {
-    /// Raw text content to index directly
+pub struct ContentSource {
+    /// Raw text or markdown content
     #[schemars(description = "Raw text or markdown content to index")]
-    RawText(String),
-    /// Local file path (HTML or PDF)
-    #[schemars(description = "Absolute path to an HTML or PDF file")]
-    FilePath(String),
-    /// URL to fetch and index
-    #[schemars(description = "HTTP/HTTPS URL to fetch and index")]
-    Url(String),
+    pub text: Option<String>,
+    /// Local file path (HTML, PDF, DOCX, etc.)
+    #[schemars(description = "Absolute path to a file (HTML, PDF, DOCX, etc.)")]
+    pub file: Option<String>,
+    /// URL to fetch and index (single page, no crawling)
+    #[schemars(description = "URL to fetch and index (single page)")]
+    pub url: Option<String>,
 }
 
-/// Pattern-specific schema with structured fields.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct PatternSchema {
-    /// Pattern title (required)
-    #[schemars(description = "Pattern name, e.g., 'Aggregator', 'Content-Based Router'")]
-    pub title: String,
-    /// Problem statement this pattern addresses
-    #[schemars(description = "The problem this pattern solves")]
-    pub problem: Option<String>,
-    /// Solution description
-    #[schemars(description = "How the pattern solves the problem")]
-    pub solution: Option<String>,
-    /// Categories for organization
-    #[schemars(description = "Categories like 'Message Routing', 'Message Channel'")]
-    pub categories: Option<Vec<String>>,
-    /// Pattern type
-    #[schemars(description = "Pattern type: messaging, conversation, integration_style, article, case_study, pdf, other")]
-    pub pattern_type: Option<String>,
-    /// Related pattern names
-    #[schemars(description = "Names of related patterns")]
-    pub related_patterns: Option<Vec<String>>,
-    /// Keywords for search
-    #[schemars(description = "Keywords for improving searchability")]
-    pub keywords: Option<Vec<String>>,
-}
-
-/// Generic document schema for arbitrary content.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GenericSchema {
-    /// Document title (required)
-    #[schemars(description = "Title of the document")]
-    pub title: String,
-    /// Tags for categorization
-    #[schemars(description = "Tags for categorization")]
-    pub tags: Option<Vec<String>>,
-    /// Source attribution
-    #[schemars(description = "Source URL or reference")]
-    pub source: Option<String>,
-    /// Description override
-    #[schemars(description = "Short description (auto-extracted if not provided)")]
-    pub description: Option<String>,
-}
-
-/// Document schema type - pattern or generic.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DocumentSchema {
-    /// Pattern schema with problem/solution structure
-    Pattern(PatternSchema),
-    /// Generic document schema
-    Generic(GenericSchema),
-}
-
-/// Index a single document request.
+/// Parameters for the `index` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct IndexDocumentParams {
-    /// Content source - raw text, file path, or URL
-    #[schemars(description = "Source of content: {\"raw_text\": \"...\"}, {\"file_path\": \"/path/to/file\"}, or {\"url\": \"https://...\"}")]
-    pub source: ContentSource,
-    /// Document schema with metadata
-    #[schemars(description = "Document schema: {\"pattern\": {...}} or {\"generic\": {...}}")]
-    pub schema: DocumentSchema,
-    /// Custom document ID (auto-generated if not provided)
-    #[schemars(description = "Custom document ID (auto-generated from title if omitted)")]
+pub struct IndexParams {
+    /// Content source - provide text, file, or url
+    #[schemars(description = "Content to index: provide 'text', 'file', or 'url'")]
+    pub content: ContentSource,
+    /// Document title (auto-extracted if omitted)
+    #[schemars(description = "Document title (auto-extracted from content if not provided)")]
+    pub title: Option<String>,
+    /// Custom document ID (auto-generated if omitted)
+    #[schemars(description = "Custom document ID (auto-generated if not provided)")]
     pub id: Option<String>,
+    /// Tags for categorization
+    #[schemars(description = "Tags for categorization and filtering")]
+    pub tags: Option<Vec<String>>,
     /// Replace existing document with same ID
     #[schemars(description = "Replace existing document with same ID (default: false)")]
-    pub replace_existing: Option<bool>,
+    pub replace: Option<bool>,
 }
 
-/// Single document in a batch.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct BatchDocument {
-    /// Content source
-    #[schemars(description = "Source of content")]
-    pub source: ContentSource,
-    /// Document schema
-    #[schemars(description = "Document schema with metadata")]
-    pub schema: DocumentSchema,
-    /// Optional custom ID
-    #[schemars(description = "Custom document ID")]
-    pub id: Option<String>,
-}
-
-/// Index multiple documents request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct IndexBatchParams {
-    /// List of documents to index (max 50)
-    #[schemars(description = "Array of documents to index (max 50)")]
-    pub documents: Vec<BatchDocument>,
-    /// Continue on individual failures
-    #[schemars(description = "Continue processing if individual documents fail (default: true)")]
-    pub continue_on_error: Option<bool>,
-    /// Create indexes after batch complete
-    #[schemars(description = "Rebuild search indexes after batch (default: true)")]
-    pub create_indexes: Option<bool>,
-}
-
-/// Delete document request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct DeleteDocumentParams {
-    /// Document ID to delete
-    #[schemars(description = "ID of the document to delete")]
-    pub id: String,
-    /// Also delete associated chunks
-    #[schemars(description = "Delete associated chunks (default: true)")]
-    pub delete_chunks: Option<bool>,
-}
-
-/// Get index status request.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetIndexStatusParams {
-    /// Include detailed breakdown
-    #[schemars(description = "Include breakdown by document type")]
-    pub detailed: Option<bool>,
-}
-
-/// Result of indexing a single document.
+/// Result of indexing a document.
 #[derive(Debug, Serialize)]
 pub struct IndexResult {
     pub success: bool,
     pub document_id: String,
+    pub title: String,
     pub chunks_created: usize,
-    pub message: String,
-}
-
-/// Result for a single document in a batch.
-#[derive(Debug, Serialize)]
-pub struct BatchDocumentResult {
-    pub index: usize,
-    pub success: bool,
-    pub document_id: Option<String>,
-    pub chunks_created: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Result of batch indexing.
-#[derive(Debug, Serialize)]
-pub struct BatchIndexResult {
-    pub total: usize,
-    pub succeeded: usize,
-    pub failed: usize,
-    pub results: Vec<BatchDocumentResult>,
-    pub indexes_created: bool,
+/// URL source with crawl settings for async indexing.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct UrlSource {
+    /// URL to crawl
+    #[schemars(description = "URL to crawl")]
+    pub url: String,
+    /// Crawl depth (0 = single page, default)
+    #[schemars(description = "Crawl depth: 0 = single page (default), 1+ = follow links")]
+    pub depth: Option<usize>,
+    /// Maximum pages to index
+    #[schemars(description = "Maximum pages to index (default: 100)")]
+    pub max_pages: Option<usize>,
 }
 
-/// The main Knowledge Indexer MCP server.
+/// Async source for batch/crawl operations.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AsyncSource {
+    /// URL with optional crawl settings
+    #[schemars(description = "URL to crawl with optional depth and max_pages")]
+    pub url: Option<UrlSource>,
+    /// Multiple file paths
+    #[schemars(description = "Array of file paths to index")]
+    pub files: Option<Vec<String>>,
+}
+
+/// Parameters for the `index_async` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IndexAsyncParams {
+    /// Source to index - URL with crawl settings or file list
+    #[schemars(description = "Source to index: 'url' with crawl settings or 'files' array")]
+    pub source: AsyncSource,
+    /// Tags to apply to all indexed documents
+    #[schemars(description = "Tags to apply to all indexed documents")]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Result of starting an async job.
+#[derive(Debug, Serialize)]
+pub struct JobCreated {
+    pub job_id: String,
+    pub status: String,
+    pub source_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_items: Option<usize>,
+}
+
+/// Parameters for the `job_status` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct JobStatusParams {
+    /// Job ID from index_async
+    #[schemars(description = "Job ID from index_async")]
+    pub job_id: String,
+}
+
+/// Progress information for a running job.
+#[derive(Debug, Serialize)]
+pub struct JobProgress {
+    pub processed: usize,
+    pub total: usize,
+    pub percentage: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_item: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_seconds: Option<usize>,
+}
+
+/// Result of a completed job.
+#[derive(Debug, Serialize)]
+pub struct JobResult {
+    pub documents_created: usize,
+    pub chunks_created: usize,
+    pub errors: Vec<String>,
+}
+
+/// Full job status response.
+#[derive(Debug, Serialize)]
+pub struct JobStatusResponse {
+    pub job_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<JobProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<JobResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Filter for delete operations.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DeleteFilter {
+    /// Delete all documents with this tag
+    #[schemars(description = "Delete all documents with this tag")]
+    pub tag: Option<String>,
+    /// Delete all documents from this domain
+    #[schemars(description = "Delete all documents from this source domain")]
+    pub source_domain: Option<String>,
+}
+
+/// Parameters for the `delete` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteParams {
+    /// Single document ID to delete
+    #[schemars(description = "Single document ID to delete")]
+    pub id: Option<String>,
+    /// Multiple document IDs to delete
+    #[schemars(description = "Multiple document IDs to delete")]
+    pub ids: Option<Vec<String>>,
+    /// Filter to delete matching documents
+    #[schemars(description = "Filter to delete documents by tag or source_domain")]
+    pub filter: Option<DeleteFilter>,
+    /// Preview deletion without executing
+    #[schemars(description = "Preview what would be deleted without actually deleting (default: false)")]
+    pub dry_run: Option<bool>,
+}
+
+/// Result of delete operation.
+#[derive(Debug, Serialize)]
+pub struct DeleteResult {
+    pub success: bool,
+    pub documents_deleted: usize,
+    pub chunks_deleted: usize,
+    pub deleted_ids: Vec<String>,
+    pub dry_run: bool,
+}
+
+// =============================================================================
+// STATUS TOOL PARAMETERS
+// =============================================================================
+
+/// Parameters for the `status` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StatusParams {
+    /// Include breakdown by type and domain
+    #[schemars(description = "Include breakdown by type and domain (default: false)")]
+    pub detailed: Option<bool>,
+}
+
+/// Breakdown statistics.
+#[derive(Debug, Serialize)]
+pub struct StatusBreakdown {
+    pub by_type: HashMap<String, usize>,
+    pub by_domain: HashMap<String, usize>,
+}
+
+/// Index status response.
+#[derive(Debug, Serialize)]
+pub struct IndexStatus {
+    pub health: String,
+    pub document_count: usize,
+    pub chunk_count: usize,
+    pub page_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<StatusBreakdown>,
+}
+
+// =============================================================================
+// MCP SERVER IMPLEMENTATION
+// =============================================================================
+
+/// The main Knowledge Indexer MCP server for RAG systems.
 #[derive(Clone)]
 pub struct KixMcpServer {
     store: Arc<Mutex<KixStore>>,
@@ -344,554 +416,282 @@ impl KixMcpServer {
         }
     }
 
-    /// Semantic search across all patterns.
-    #[tool(description = "Search for patterns using natural language. Returns relevant patterns based on semantic similarity.")]
-    async fn search_patterns(
+    // =========================================================================
+    // RETRIEVAL TOOLS
+    // =========================================================================
+
+    /// Unified search across all indexed content.
+    #[tool(description = "Search the knowledge base using natural language. Returns relevant chunks with scores. Use 'get_context' with page_id to retrieve full page content for RAG synthesis.")]
+    async fn search(
         &self,
-        params: Parameters<SearchPatternsParams>,
+        params: Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!("Searching patterns for: {}", params.0.query);
+        let query = &params.0.query;
+        info!("Search: {}", query);
 
-        let limit = params.0.limit.unwrap_or(5);
-        let filters = SearchFilters {
-            entry_type: params.0.pattern_type.clone(),
-            chunk_type: None,
-            tag: None,
-            source_domain: None,
-        };
+        let limit = params.0.limit.unwrap_or(10).min(100);
+        let offset = params.0.offset.unwrap_or(0);
+        let mode = params.0.mode.clone().unwrap_or_default();
 
-        // Generate embedding for the query
-        let embedding = {
-            let mut embedder = self.embedder.lock().await;
-            embedder
-                .embed_query(&params.0.query)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        };
+        // Convert QueryFilters to SearchFilters
+        let filters = params.0.filters.as_ref().map(|f| SearchFilters {
+            entry_type: f.entry_type.clone(),
+            chunk_type: f.chunk_type.clone(),
+            tag: f.tag.clone(),
+            source_domain: f.source_domain.clone(),
+        }).unwrap_or_default();
 
-        // Perform hybrid search
-        let store = self.store.lock().await;
-        let results = store
-            .hybrid_search(&params.0.query, &embedding, limit, &filters)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        let response = format_search_results(&results);
-        Ok(CallToolResult::success(vec![Content::text(response)]))
-    }
-
-    /// Retrieve a specific pattern by name.
-    #[tool(description = "Get detailed information about a specific pattern by its name.")]
-    async fn get_pattern(
-        &self,
-        params: Parameters<GetPatternParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!("Getting pattern: {}", params.0.name);
-
-        let store = self.store.lock().await;
-        let pattern = store
-            .get_pattern_by_name(&params.0.name)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        match pattern {
-            Some(p) => {
-                let response = format_pattern_summary(&p);
-                Ok(CallToolResult::success(vec![Content::text(response)]))
+        // Generate embedding for vector/hybrid search
+        let embedding = match mode {
+            SearchMode::Text => vec![], // Not needed for text-only
+            _ => {
+                let mut embedder = self.embedder.lock().await;
+                embedder
+                    .embed_query(query)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
             }
-            None => {
-                let msg = format!("Pattern '{}' not found", params.0.name);
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
-            }
-        }
-    }
-
-    /// List patterns by category or type.
-    #[tool(description = "List patterns filtered by category or pattern type.")]
-    async fn list_patterns(
-        &self,
-        params: Parameters<ListPatternsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(
-            "Listing patterns - category: {:?}, type: {:?}",
-            params.0.category, params.0.pattern_type
-        );
-
-        let store = self.store.lock().await;
-
-        let patterns = if let Some(ref category) = params.0.category {
-            store
-                .list_by_category(category)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        } else if let Some(ref pattern_type) = params.0.pattern_type {
-            store
-                .list_by_pattern_type(pattern_type)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        } else {
-            store
-                .list_all_patterns()
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
 
-        let response = format_pattern_list(&patterns);
-        Ok(CallToolResult::success(vec![Content::text(response)]))
-    }
-
-    /// Find patterns related to a given pattern.
-    #[tool(description = "Find patterns that are related to or commonly used with a given pattern.")]
-    async fn find_related(
-        &self,
-        params: Parameters<FindRelatedParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!("Finding related patterns for: {}", params.0.pattern_name);
-
-        // Search for the pattern and its related patterns
+        // Perform search based on mode
         let store = self.store.lock().await;
-        let pattern = store
-            .get_pattern_by_name(&params.0.pattern_name)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        match pattern {
-            Some(p) => {
-                // Use semantic search to find related patterns
-                let query = format!("patterns related to {} {}", p.title, p.description);
-                drop(store); // Release store lock
-
-                let embedding = {
-                    let mut embedder = self.embedder.lock().await;
-                    embedder
-                        .embed_query(&query)
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                };
-
-                let store = self.store.lock().await;
-                let filters = SearchFilters {
-                    entry_type: Some(p.entry_type.clone()),
-                    ..Default::default()
-                };
-                let results = store
-                    .vector_search(&embedding, 6, &filters)
+        let results = match mode {
+            SearchMode::Hybrid => {
+                store
+                    .hybrid_search(query, &embedding, limit + offset, &filters)
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-                // Filter out the original pattern
-                let related: Vec<_> = results
-                    .into_iter()
-                    .filter(|r| r.entry_title != params.0.pattern_name)
-                    .take(5)
-                    .collect();
-
-                let response = format!(
-                    "## Related Patterns for '{}'\n\n{}",
-                    params.0.pattern_name,
-                    format_search_results(&related)
-                );
-                Ok(CallToolResult::success(vec![Content::text(response)]))
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
             }
-            None => {
-                let msg = format!("Pattern '{}' not found", params.0.pattern_name);
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+            SearchMode::Vector => {
+                store
+                    .vector_search(&embedding, limit + offset, &filters)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
             }
-        }
-    }
-
-    /// Find patterns that solve a specific problem.
-    #[tool(description = "Find patterns that address a specific integration problem or challenge.")]
-    async fn search_by_problem(
-        &self,
-        params: Parameters<SearchByProblemParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(
-            "Searching for patterns to solve: {}",
-            params.0.problem_description
-        );
-
-        let limit = params.0.limit.unwrap_or(5);
-
-        // Enhance query for problem-focused search
-        let query = format!(
-            "problem: {} solution pattern",
-            params.0.problem_description
-        );
-
-        let embedding = {
-            let mut embedder = self.embedder.lock().await;
-            embedder
-                .embed_query(&query)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            SearchMode::Text => {
+                store
+                    .text_search(query, limit + offset, &filters)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            }
         };
 
-        let store = self.store.lock().await;
-        let filters = SearchFilters {
-            chunk_type: Some("problem".to_string()),
-            ..Default::default()
-        };
-        let results = store
-            .hybrid_search(&query, &embedding, limit, &filters)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Apply pagination
+        let total_count = results.len();
+        let paginated: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
+        let has_more = total_count > offset + limit;
 
-        let response = format!(
-            "## Patterns for Problem: {}\n\n{}",
-            params.0.problem_description,
-            format_search_results(&results)
-        );
-        Ok(CallToolResult::success(vec![Content::text(response)]))
-    }
-
-    /// Get detailed explanation of a pattern.
-    #[tool(description = "Get a detailed explanation of a pattern with optional focus on specific aspects.")]
-    async fn explain_pattern(
-        &self,
-        params: Parameters<ExplainPatternParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(
-            "Explaining pattern: {} (focus: {:?})",
-            params.0.pattern_name, params.0.focus
-        );
-
-        let store = self.store.lock().await;
-        let pattern = store
-            .get_pattern_by_name(&params.0.pattern_name)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        match pattern {
-            Some(p) => {
-                // Build explanation based on focus
-                let focus = params.0.focus.clone().unwrap_or_else(|| "usage".to_string());
-
-                let response = format!(
-                    "## {} Pattern\n\n\
-                    **Type:** {}\n\
-                    **Tags:** {}\n\n\
-                    **Description:**\n{}\n\n\
-                    **Focus: {}**\n\n\
-                    This pattern is used in the context of enterprise integration \
-                    to address messaging and communication challenges.\n",
-                    p.title,
-                    p.entry_type,
-                    p.tags.join(", "),
-                    p.description,
-                    focus
-                );
-                Ok(CallToolResult::success(vec![Content::text(response)]))
-            }
-            None => {
-                let msg = format!("Pattern '{}' not found", params.0.pattern_name);
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
-            }
-        }
-    }
-
-    /// Get overview of a pattern category.
-    #[tool(description = "Get an overview of a pattern category including all patterns within it.")]
-    async fn get_category_overview(
-        &self,
-        params: Parameters<GetCategoryOverviewParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!("Getting category overview: {}", params.0.category);
-
-        let store = self.store.lock().await;
-        let patterns = store
-            .list_by_category(&params.0.category)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        if patterns.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No patterns found in category '{}'",
-                params.0.category
-            ))]));
-        }
-
-        let pattern_list: Vec<String> = patterns
-            .iter()
-            .map(|p| format!("- **{}**: {}", p.title, p.description))
+        // Convert to response format
+        let items: Vec<SearchResultItem> = paginated
+            .into_iter()
+            .map(|r| SearchResultItem {
+                chunk_id: r.chunk_id,
+                entry_id: r.entry_id,
+                page_id: r.page_id,
+                text: r.text,
+                score: r.score,
+                entry_title: r.entry_title,
+                source_url: r.source_domain.map(|d| format!("https://{}", d)),
+            })
             .collect();
 
-        let response = format!(
-            "## Category: {}\n\n\
-            **Pattern Count:** {}\n\n\
-            **Patterns:**\n{}",
-            params.0.category,
-            patterns.len(),
-            pattern_list.join("\n")
-        );
-        Ok(CallToolResult::success(vec![Content::text(response)]))
-    }
-
-    /// Compare two patterns side-by-side.
-    #[tool(description = "Compare two patterns side-by-side, showing differences in use cases, trade-offs, and when to choose each.")]
-    async fn compare_patterns(
-        &self,
-        params: Parameters<ComparePatternsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(
-            "Comparing patterns: {} vs {}",
-            params.0.pattern_a, params.0.pattern_b
-        );
-
-        let store = self.store.lock().await;
-        let pattern_a = store
-            .get_pattern_by_name(&params.0.pattern_a)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        let pattern_b = store
-            .get_pattern_by_name(&params.0.pattern_b)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        match (pattern_a, pattern_b) {
-            (Some(a), Some(b)) => {
-                let aspects = params.0
-                    .aspects
-                    .clone()
-                    .unwrap_or_else(|| vec!["use_cases".to_string(), "trade_offs".to_string()]);
-
-                let mut comparison = format!(
-                    "## Pattern Comparison: {} vs {}\n\n",
-                    a.title, b.title
-                );
-
-                comparison.push_str(&format!(
-                    "### {}\n\
-                    **Type:** {}\n\
-                    **Tags:** {}\n\
-                    **Description:** {}\n\n",
-                    a.title,
-                    a.entry_type,
-                    a.tags.join(", "),
-                    a.description
-                ));
-
-                comparison.push_str(&format!(
-                    "### {}\n\
-                    **Type:** {}\n\
-                    **Tags:** {}\n\
-                    **Description:** {}\n\n",
-                    b.title,
-                    b.entry_type,
-                    b.tags.join(", "),
-                    b.description
-                ));
-
-                comparison.push_str("### Comparison Aspects\n");
-                for aspect in aspects {
-                    comparison.push_str(&format!("- **{}**: Both patterns serve different purposes in the integration architecture.\n", aspect));
-                }
-
-                Ok(CallToolResult::success(vec![Content::text(comparison)]))
-            }
-            (None, _) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Pattern '{}' not found",
-                params.0.pattern_a
-            ))])),
-            (_, None) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Pattern '{}' not found",
-                params.0.pattern_b
-            ))])),
-        }
-    }
-
-    /// Suggest patterns for a system architecture.
-    #[tool(description = "Given a system description, suggest relevant patterns and how they might work together.")]
-    async fn suggest_architecture(
-        &self,
-        params: Parameters<SuggestArchitectureParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(
-            "Suggesting architecture for: {}",
-            params.0.system_description
-        );
-
-        let limit = params.0.limit.unwrap_or(10);
-
-        // Build search query from system description
-        let mut query = params.0.system_description.clone();
-        if let Some(ref constraints) = params.0.constraints {
-            query.push_str(" ");
-            query.push_str(&constraints.join(" "));
-        }
-
-        let embedding = {
-            let mut embedder = self.embedder.lock().await;
-            embedder
-                .embed_query(&query)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        let response = SearchResponse {
+            results: items,
+            total_count,
+            has_more,
         };
 
-        let store = self.store.lock().await;
-        let results = store
-            .hybrid_search(&query, &embedding, limit, &SearchFilters::default())
-            .await
+        let json = serde_json::to_string_pretty(&response)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let mut response = format!(
-            "## Suggested Architecture for:\n> {}\n\n",
-            params.0.system_description
-        );
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 
-        if let Some(ref constraints) = params.0.constraints {
-            response.push_str(&format!("**Constraints:** {}\n\n", constraints.join(", ")));
-        }
-
-        response.push_str("### Recommended Patterns\n\n");
-        for (i, result) in results.iter().enumerate() {
-            response.push_str(&format!(
-                "{}. **{}** (Score: {:.2})\n   {}\n\n",
-                i + 1,
-                result.entry_title,
-                result.score,
-                truncate_text(&result.text, 150)
+    /// Retrieve full page content for RAG context enrichment.
+    #[tool(description = "Retrieve full page content for RAG synthesis. Use page_id from search results, or chunk_id to find the associated page.")]
+    async fn get_context(
+        &self,
+        params: Parameters<GetContextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Validate input - need either page_id or chunk_id
+        if params.0.page_id.is_none() && params.0.chunk_id.is_none() {
+            return Err(McpError::invalid_params(
+                "Either page_id or chunk_id must be provided",
+                None,
             ));
         }
 
-        response.push_str("\n### Suggested Integration Flow\n");
-        response.push_str("Consider combining these patterns to create a robust integration architecture.\n");
-
-        Ok(CallToolResult::success(vec![Content::text(response)]))
-    }
-
-    /// Show typical pattern sequences.
-    #[tool(description = "Show typical sequence/flow of patterns in a pipeline, useful for understanding how patterns compose.")]
-    async fn pattern_sequence(
-        &self,
-        params: Parameters<PatternSequenceParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!(
-            "Finding pattern sequence from: {} to {:?}",
-            params.0.start_pattern, params.0.end_pattern
-        );
-
         let store = self.store.lock().await;
-        let start = store
-            .get_pattern_by_name(&params.0.start_pattern)
+
+        // Get page_id from chunk if needed
+        let page_id = if let Some(ref pid) = params.0.page_id {
+            pid.clone()
+        } else if let Some(ref chunk_id) = params.0.chunk_id {
+            // Parse chunk_id to get entry_id, then look up page
+            // Chunk IDs are formatted as "{entry_id}#{chunk_index}"
+            let entry_id = chunk_id.split('#').next().unwrap_or(chunk_id);
+
+            // Try to get the page for this entry
+            // For now, use the entry_id as page_id (they're often the same)
+            entry_id.to_string()
+        } else {
+            return Err(McpError::invalid_params(
+                "Either page_id or chunk_id must be provided",
+                None,
+            ));
+        };
+
+        info!("Get context for page: {}", page_id);
+
+        // Retrieve the page
+        let page = store
+            .get_page_for_chunk(&page_id)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        match start {
-            Some(start_pattern) => {
-                let mut response = format!(
-                    "## Pattern Sequence Starting from '{}'\n\n",
-                    start_pattern.title
-                );
-
-                // Find patterns that commonly follow
-                let query = format!(
-                    "patterns that follow {} in a pipeline sequence",
-                    start_pattern.title
-                );
-                drop(store); // Release lock
-
-                let embedding = {
-                    let mut embedder = self.embedder.lock().await;
-                    embedder
-                        .embed_query(&query)
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        match page {
+            Some(p) => {
+                let context = PageContext {
+                    page_id: p.page_id,
+                    url: p.url,
+                    title: p.title,
+                    full_content: p.full_content,
+                    content_length: p.content_length as usize,
+                    code_block_count: p.code_block_count as usize,
                 };
 
-                let store = self.store.lock().await;
-                let results = store
-                    .vector_search(&embedding, 5, &SearchFilters::default())
-                    .await
+                let json = serde_json::to_string_pretty(&context)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-                response.push_str(&format!("**Starting Pattern:** {}\n", start_pattern.title));
-                response.push_str(&format!(
-                    "**Description:** {}\n\n",
-                    start_pattern.description
-                ));
-
-                response.push_str("### Common Follow-up Patterns\n\n");
-                for (i, result) in results.iter().enumerate() {
-                    if result.entry_title != params.0.start_pattern {
-                        response.push_str(&format!(
-                            "{}. {} → **{}**\n",
-                            i + 1,
-                            start_pattern.title,
-                            result.entry_title
-                        ));
-                    }
-                }
-
-                if params.0.include_alternatives.unwrap_or(false) {
-                    response.push_str("\n### Alternative Sequences\n");
-                    response.push_str(
-                        "Alternative patterns may be used depending on specific requirements.\n",
-                    );
-                }
-
-                Ok(CallToolResult::success(vec![Content::text(response)]))
+                Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            None => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Pattern '{}' not found",
-                params.0.start_pattern
-            ))])),
+            None => {
+                let error = serde_json::json!({
+                    "error": "not_found",
+                    "message": format!("No page found for ID '{}'", page_id)
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&error).unwrap(),
+                )]))
+            }
         }
     }
 
-    /// Search for patterns by technology.
-    #[tool(description = "Find patterns with examples in specific technologies (Apache Camel, Spring Integration, MuleSoft, etc.).")]
-    async fn search_by_technology(
+    /// Get document metadata and optionally all chunks.
+    #[tool(description = "Get document metadata by ID. Set include_chunks=true to also retrieve all chunks for the document.")]
+    async fn get_document(
         &self,
-        params: Parameters<SearchByTechnologyParams>,
+        params: Parameters<GetDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!("Searching patterns for technology: {}", params.0.technology);
-
-        let limit = params.0.limit.unwrap_or(10);
-        let query = format!("{} implementation example", params.0.technology);
-
-        let embedding = {
-            let mut embedder = self.embedder.lock().await;
-            embedder
-                .embed_query(&query)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        };
-
-        let filters = SearchFilters {
-            entry_type: params.0.pattern_type.clone(),
-            ..Default::default()
-        };
+        info!("Get document: {}", params.0.id);
 
         let store = self.store.lock().await;
-        let results = store
-            .hybrid_search(&query, &embedding, limit, &filters)
+
+        // Get entry by ID
+        let entry = store
+            .get_entry_by_id(&params.0.id)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let response = format!(
-            "## Patterns for Technology: {}\n\n{}",
-            params.0.technology,
-            format_search_results(&results)
-        );
-        Ok(CallToolResult::success(vec![Content::text(response)]))
+        match entry {
+            Some(e) => {
+                // Optionally get chunks
+                let chunks = if params.0.include_chunks.unwrap_or(false) {
+                    let chunk_list = store
+                        .get_chunks_by_entry_id(&params.0.id)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                    Some(
+                        chunk_list
+                            .into_iter()
+                            .map(|c| ChunkInfo {
+                                chunk_id: c.chunk_id,
+                                chunk_index: c.chunk_index.unwrap_or(0),
+                                chunk_type: c.chunk_type,
+                                text: c.text,
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+
+                let doc = Document {
+                    id: e.id,
+                    title: e.title,
+                    description: e.description,
+                    entry_type: e.entry_type,
+                    source_url: e.source_path,
+                    source_domain: e.source_domain,
+                    tags: e.tags,
+                    created_at: e.created_at,
+                    chunks,
+                };
+
+                let json = serde_json::to_string_pretty(&doc)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => {
+                let error = serde_json::json!({
+                    "error": "not_found",
+                    "message": format!("Document '{}' not found", params.0.id)
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&error).unwrap(),
+                )]))
+            }
+        }
     }
 
     // =========================================================================
-    // Indexing Tools
+    // INDEXING TOOLS
     // =========================================================================
 
-    /// Index a single document from raw text, file path, or URL.
-    #[tool(description = "Index a document from raw text, file path, or URL. Supports pattern schema (title, problem, solution) or generic document schema.")]
-    async fn index_document(
+    /// Index a single document synchronously.
+    #[tool(description = "Index a document from text, file path, or URL. Returns immediately with indexing result.")]
+    async fn index(
         &self,
-        params: Parameters<IndexDocumentParams>,
+        params: Parameters<IndexParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!("Indexing document from source");
+        info!("Indexing document");
 
-        // Process content source into an Entry
+        // Validate content source
+        let content = &params.0.content;
+        let source_count = [&content.text, &content.file, &content.url]
+            .iter()
+            .filter(|x| x.is_some())
+            .count();
+
+        if source_count == 0 {
+            return Err(McpError::invalid_params(
+                "Must provide one of: text, file, or url",
+                None,
+            ));
+        }
+        if source_count > 1 {
+            return Err(McpError::invalid_params(
+                "Provide only one of: text, file, or url",
+                None,
+            ));
+        }
+
+        // Process content into Entry
         let mut entry = self
-            .process_content_source(&params.0.source, &params.0.schema)
+            .process_content(&params.0.content, params.0.title.as_deref())
             .await?;
 
         // Apply custom ID if provided
         if let Some(ref custom_id) = params.0.id {
             entry.id = custom_id.clone();
+        }
+
+        // Apply tags if provided
+        if let Some(ref tags) = params.0.tags {
+            entry.tags.extend(tags.clone());
+            entry.tags.sort();
+            entry.tags.dedup();
         }
 
         // Check for existing entry
@@ -903,25 +703,27 @@ impl KixMcpServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
 
-        if exists && !params.0.replace_existing.unwrap_or(false) {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "## Document Already Exists\n\n\
-                Document with ID '{}' already exists. Set `replace_existing: true` to overwrite.",
-                entry.id
-            ))]));
+        if exists && !params.0.replace.unwrap_or(false) {
+            let result = IndexResult {
+                success: false,
+                document_id: entry.id.clone(),
+                title: entry.title.clone(),
+                chunks_created: 0,
+                error: Some(format!(
+                    "Document '{}' already exists. Set replace=true to overwrite.",
+                    entry.id
+                )),
+            };
+            let json = serde_json::to_string_pretty(&result)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
         }
 
         // If replacing, delete existing first
         if exists {
             let store = self.store.lock().await;
-            store
-                .delete_chunks_by_entry(&entry.id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            store
-                .delete_entry(&entry.id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            store.delete_chunks_by_entry(&entry.id).await.ok();
+            store.delete_entry(&entry.id).await.ok();
         }
 
         // Chunk and embed
@@ -951,168 +753,212 @@ impl KixMcpServer {
 
         let result = IndexResult {
             success: true,
-            document_id: entry.id.clone(),
+            document_id: entry.id,
+            title: entry.title,
             chunks_created: chunks.len(),
-            message: format!("Document '{}' indexed successfully", entry.title),
+            error: None,
         };
 
-        Ok(CallToolResult::success(vec![Content::text(
-            format_index_result(&result),
-        )]))
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Index multiple documents in a single operation.
-    #[tool(description = "Index multiple documents in a single operation. Returns results for each document. Max 50 documents per batch.")]
-    async fn index_batch(
+    /// Start an async indexing job for crawling or batch operations.
+    #[tool(description = "Start an async indexing job for URL crawling or batch file indexing. Returns job_id to check progress with job_status.")]
+    async fn index_async(
         &self,
-        params: Parameters<IndexBatchParams>,
+        params: Parameters<IndexAsyncParams>,
     ) -> Result<CallToolResult, McpError> {
-        info!("Batch indexing {} documents", params.0.documents.len());
+        info!("Starting async indexing job");
 
-        // Validate batch size
-        if params.0.documents.len() > 50 {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "## Batch Size Exceeded\n\nMaximum 50 documents per batch.",
-            )]));
+        // Validate source
+        let source = &params.0.source;
+        if source.url.is_none() && source.files.is_none() {
+            return Err(McpError::invalid_params(
+                "Must provide either url or files",
+                None,
+            ));
         }
 
-        if params.0.documents.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "## Empty Batch\n\nNo documents provided.",
-            )]));
+        // Generate job ID
+        let job_id = uuid::Uuid::new_v4().to_string();
+
+        // Determine source type and estimated items
+        let (source_type, estimated_items) = if let Some(ref url_source) = source.url {
+            let max_pages = url_source.max_pages.unwrap_or(100);
+            ("url".to_string(), Some(max_pages))
+        } else if let Some(ref files) = source.files {
+            ("files".to_string(), Some(files.len()))
+        } else {
+            ("unknown".to_string(), None)
+        };
+
+        // TODO: Actually queue the job when job system is integrated
+        // For now, return a stub response indicating the feature
+        let response = JobCreated {
+            job_id,
+            status: "queued".to_string(),
+            source_type,
+            estimated_items,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Check the status of an async indexing job.
+    #[tool(description = "Check the progress of an async indexing job started with index_async.")]
+    async fn job_status(
+        &self,
+        params: Parameters<JobStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Checking job status: {}", params.0.job_id);
+
+        // TODO: Look up job from job store when integrated
+        // For now, return not found
+        let response = JobStatusResponse {
+            job_id: params.0.job_id.clone(),
+            status: "not_found".to_string(),
+            progress: None,
+            result: None,
+            error: Some("Job not found. Async job tracking not yet implemented.".to_string()),
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Delete documents by ID or filter.
+    #[tool(description = "Delete documents by ID, multiple IDs, or filter (tag/source_domain). Use dry_run=true to preview.")]
+    async fn delete(
+        &self,
+        params: Parameters<DeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Delete documents");
+
+        let dry_run = params.0.dry_run.unwrap_or(false);
+
+        // Collect IDs to delete
+        let mut ids_to_delete: Vec<String> = Vec::new();
+
+        // Single ID
+        if let Some(ref id) = params.0.id {
+            ids_to_delete.push(id.clone());
         }
 
-        let continue_on_error = params.0.continue_on_error.unwrap_or(true);
-        let create_indexes = params.0.create_indexes.unwrap_or(true);
+        // Multiple IDs
+        if let Some(ref ids) = params.0.ids {
+            ids_to_delete.extend(ids.clone());
+        }
 
-        let mut results = Vec::new();
-        let mut succeeded = 0;
-        let mut failed = 0;
+        // Filter-based deletion
+        if let Some(ref filter) = params.0.filter {
+            let store = self.store.lock().await;
 
-        for (index, batch_doc) in params.0.documents.iter().enumerate() {
-            let result = self
-                .process_and_index_document(&batch_doc.source, &batch_doc.schema, &batch_doc.id)
-                .await;
+            if let Some(ref tag) = filter.tag {
+                let entries = store
+                    .list_by_tag(tag)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                ids_to_delete.extend(entries.into_iter().map(|e| e.id));
+            }
 
-            match result {
-                Ok((doc_id, chunks_count)) => {
-                    succeeded += 1;
-                    results.push(BatchDocumentResult {
-                        index,
-                        success: true,
-                        document_id: Some(doc_id),
-                        chunks_created: Some(chunks_count),
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    failed += 1;
-                    results.push(BatchDocumentResult {
-                        index,
-                        success: false,
-                        document_id: None,
-                        chunks_created: None,
-                        error: Some(e.to_string()),
-                    });
-
-                    if !continue_on_error {
-                        break;
-                    }
-                }
+            if let Some(ref domain) = filter.source_domain {
+                // List all entries and filter by domain
+                let entries = store
+                    .list_all_entries()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                ids_to_delete.extend(
+                    entries
+                        .into_iter()
+                        .filter(|e| e.source_domain.as_deref() == Some(domain.as_str()))
+                        .map(|e| e.id),
+                );
             }
         }
 
-        // Create indexes if requested and we had successes
-        let indexes_created = if create_indexes && succeeded > 0 {
+        // Deduplicate
+        ids_to_delete.sort();
+        ids_to_delete.dedup();
+
+        if ids_to_delete.is_empty() {
+            let result = DeleteResult {
+                success: true,
+                documents_deleted: 0,
+                chunks_deleted: 0,
+                deleted_ids: vec![],
+                dry_run,
+            };
+            let json = serde_json::to_string_pretty(&result)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        // Count chunks that would be deleted (for dry run info)
+        let mut chunks_deleted = 0;
+        let mut actually_deleted: Vec<String> = Vec::new();
+
+        if dry_run {
+            // Just count what would be deleted
             let store = self.store.lock().await;
-            match store.create_indexes().await {
-                Ok(_) => true,
-                Err(e) => {
-                    warn!("Index creation failed: {}", e);
-                    false
+            for id in &ids_to_delete {
+                if store.entry_exists(id).await.unwrap_or(false) {
+                    let chunks = store.get_chunks_by_entry_id(id).await.unwrap_or_default();
+                    chunks_deleted += chunks.len();
+                    actually_deleted.push(id.clone());
                 }
             }
         } else {
-            false
+            // Actually delete
+            let store = self.store.lock().await;
+            for id in &ids_to_delete {
+                if store.entry_exists(id).await.unwrap_or(false) {
+                    let chunks = store.get_chunks_by_entry_id(id).await.unwrap_or_default();
+                    chunks_deleted += chunks.len();
+
+                    store.delete_chunks_by_entry(id).await.ok();
+                    store.delete_entry(id).await.ok();
+                    actually_deleted.push(id.clone());
+                }
+            }
+        }
+
+        let result = DeleteResult {
+            success: true,
+            documents_deleted: actually_deleted.len(),
+            chunks_deleted,
+            deleted_ids: actually_deleted,
+            dry_run,
         };
 
-        let batch_result = BatchIndexResult {
-            total: params.0.documents.len(),
-            succeeded,
-            failed,
-            results,
-            indexes_created,
-        };
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(
-            format_batch_result(&batch_result),
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Delete a document and its chunks from the index.
-    #[tool(description = "Delete a document and its chunks from the index by document ID.")]
-    async fn delete_document(
+    // =========================================================================
+    // STATUS TOOL
+    // =========================================================================
+
+    /// Get index health and statistics.
+    #[tool(description = "Get index health and statistics. Set detailed=true for breakdown by type and domain.")]
+    async fn status(
         &self,
-        params: Parameters<DeleteDocumentParams>,
-    ) -> Result<CallToolResult, McpError> {
-        info!("Deleting document: {}", params.0.id);
-
-        let delete_chunks = params.0.delete_chunks.unwrap_or(true);
-
-        // Check if entry exists
-        let exists = {
-            let store = self.store.lock().await;
-            store
-                .entry_exists(&params.0.id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        };
-
-        if !exists {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "## Document Not Found\n\nNo document with ID '{}' exists.",
-                params.0.id
-            ))]));
-        }
-
-        // Delete chunks first if requested
-        if delete_chunks {
-            let store = self.store.lock().await;
-            store
-                .delete_chunks_by_entry(&params.0.id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        }
-
-        // Delete entry
-        {
-            let store = self.store.lock().await;
-            store
-                .delete_entry(&params.0.id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "## Document Deleted\n\n\
-            **Document ID:** {}\n\
-            **Chunks Deleted:** {}",
-            params.0.id,
-            if delete_chunks { "Yes" } else { "No" }
-        ))]))
-    }
-
-    /// Get current indexing statistics.
-    #[tool(description = "Get current indexing statistics including document count and chunk count.")]
-    async fn get_index_status(
-        &self,
-        params: Parameters<GetIndexStatusParams>,
+        params: Parameters<StatusParams>,
     ) -> Result<CallToolResult, McpError> {
         info!("Getting index status");
 
         let store = self.store.lock().await;
 
-        let entry_count = store
+        let document_count = store
             .entry_count()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1122,51 +968,77 @@ impl KixMcpServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let health = if entry_count == 0 {
+        let page_count = store
+            .page_count()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let health = if document_count == 0 {
             "empty"
         } else if chunk_count == 0 {
-            "needs_reindex"
+            "degraded"
         } else {
             "healthy"
+        }
+        .to_string();
+
+        // Build breakdown if detailed
+        let breakdown = if params.0.detailed.unwrap_or(false) {
+            let entries = store
+                .list_all_entries()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            let mut by_type: HashMap<String, usize> = HashMap::new();
+            let mut by_domain: HashMap<String, usize> = HashMap::new();
+
+            for entry in entries {
+                *by_type.entry(entry.entry_type).or_insert(0) += 1;
+                if let Some(domain) = entry.source_domain {
+                    *by_domain.entry(domain).or_insert(0) += 1;
+                }
+            }
+
+            Some(StatusBreakdown { by_type, by_domain })
+        } else {
+            None
         };
 
-        let mut response = format!(
-            "## Index Status\n\n\
-            **Documents:** {}\n\
-            **Chunks:** {}\n\
-            **Health:** {}\n",
-            entry_count, chunk_count, health
-        );
+        let status = IndexStatus {
+            health,
+            document_count,
+            chunk_count,
+            page_count,
+            breakdown,
+        };
 
-        if params.0.detailed.unwrap_or(false) {
-            response.push_str("\n### Details\n");
-            response.push_str(&format!(
-                "- Average chunks per document: {:.1}\n",
-                if entry_count > 0 {
-                    chunk_count as f64 / entry_count as f64
-                } else {
-                    0.0
-                }
-            ));
-        }
+        let json = serde_json::to_string_pretty(&status)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(response)]))
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     // =========================================================================
-    // Helper Methods for Indexing
+    // HELPER METHODS
     // =========================================================================
 
     /// Process content source into an Entry.
-    async fn process_content_source(
+    async fn process_content(
         &self,
-        source: &ContentSource,
-        schema: &DocumentSchema,
+        content: &ContentSource,
+        title_override: Option<&str>,
     ) -> Result<Entry, McpError> {
-        match source {
-            ContentSource::RawText(text) => self.process_raw_text(text, schema),
-            ContentSource::FilePath(path) => self.process_file_path(path, schema).await,
-            ContentSource::Url(url) => self.process_url(url, schema).await,
+        if let Some(ref text) = content.text {
+            self.process_raw_text(text, title_override)
+        } else if let Some(ref file) = content.file {
+            self.process_file_path(file, title_override).await
+        } else if let Some(ref url) = content.url {
+            self.process_url(url, title_override).await
+        } else {
+            Err(McpError::invalid_params(
+                "Must provide text, file, or url",
+                None,
+            ))
         }
     }
 
@@ -1174,7 +1046,7 @@ impl KixMcpServer {
     fn process_raw_text(
         &self,
         text: &str,
-        schema: &DocumentSchema,
+        title_override: Option<&str>,
     ) -> Result<Entry, McpError> {
         if text.trim().is_empty() {
             return Err(McpError::invalid_params("Empty content provided", None));
@@ -1187,23 +1059,42 @@ impl KixMcpServer {
             ));
         }
 
-        let mut entry = self.create_entry_from_schema(schema, text);
+        // Generate title from first line or use override
+        let title = title_override
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                text.lines()
+                    .next()
+                    .unwrap_or("Untitled")
+                    .trim_start_matches('#')
+                    .trim()
+                    .chars()
+                    .take(100)
+                    .collect()
+            });
+
+        let slug = slugify(&title);
+        let description = text.chars().take(300).collect();
 
         // Compute hash
         let mut hasher = Sha256::new();
         hasher.update(text.as_bytes());
-        entry.source_hash = format!("{:x}", hasher.finalize());
-        entry.source_type = SourceType::Html;
-        entry.source_path = format!("raw://{}", entry.id);
+        let source_hash = format!("{:x}", hasher.finalize());
 
-        Ok(entry)
+        Ok(Entry::with_id(slug.clone(), title, String::new(), source_hash)
+            .with_description(description)
+            .with_content(text.to_string())
+            .with_tags(vec![])
+            .with_entry_type(EntryType::Document)
+            .with_source_type(SourceType::Markdown)
+            .with_slug(slug))
     }
 
     /// Process file path content.
     async fn process_file_path(
         &self,
         path: &str,
-        schema: &DocumentSchema,
+        title_override: Option<&str>,
     ) -> Result<Entry, McpError> {
         use std::path::Path;
 
@@ -1228,15 +1119,28 @@ impl KixMcpServer {
                     .await
                     .map_err(|e| McpError::internal_error(format!("Failed to read file: {}", e), None))?;
 
-                // Use ContentExtractor for consistent HTML processing
                 let extractor = ContentExtractor::default();
                 let url = url::Url::parse(&format!("file://{}", path))
                     .unwrap_or_else(|_| url::Url::parse("file:///unknown").unwrap());
                 let extracted = extractor.extract(&content, &url);
-                let mut entry = self.create_entry_from_extracted(&extracted, path);
 
-                self.apply_schema_overrides(&mut entry, schema);
-                Ok(entry)
+                let title = title_override
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| extracted.title.clone());
+
+                let slug = slugify(&title);
+                let description = extracted
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| extracted.markdown.chars().take(300).collect());
+
+                Ok(Entry::with_id(slug.clone(), title, path.to_string(), extracted.content_hash.clone())
+                    .with_description(description)
+                    .with_content(extracted.markdown)
+                    .with_tags(vec![])
+                    .with_entry_type(EntryType::Document)
+                    .with_source_type(SourceType::Html)
+                    .with_slug(slug))
             }
             "pdf" => {
                 let parser = PdfParser::new();
@@ -1244,18 +1148,40 @@ impl KixMcpServer {
                     .parse(path)
                     .map_err(|e| McpError::internal_error(format!("PDF parse error: {}", e), None))?;
 
-                self.apply_schema_overrides(&mut entry, schema);
+                if let Some(title) = title_override {
+                    entry.title = title.to_string();
+                    entry.slug = slugify(title);
+                }
+
                 Ok(entry)
             }
+            "md" | "markdown" => {
+                let content = tokio::fs::read_to_string(path)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("Failed to read file: {}", e), None))?;
+
+                self.process_raw_text(&content, title_override)
+            }
+            "txt" => {
+                let content = tokio::fs::read_to_string(path)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("Failed to read file: {}", e), None))?;
+
+                self.process_raw_text(&content, title_override)
+            }
             _ => Err(McpError::invalid_params(
-                format!("Unsupported file type: {}", extension),
+                format!("Unsupported file type: {}. Supported: html, pdf, md, txt", extension),
                 None,
             )),
         }
     }
 
     /// Process URL content.
-    async fn process_url(&self, url_str: &str, schema: &DocumentSchema) -> Result<Entry, McpError> {
+    async fn process_url(
+        &self,
+        url_str: &str,
+        title_override: Option<&str>,
+    ) -> Result<Entry, McpError> {
         // Validate URL
         let parsed_url = url::Url::parse(url_str)
             .map_err(|_| McpError::invalid_params(format!("Invalid URL: {}", url_str), None))?;
@@ -1282,219 +1208,36 @@ impl KixMcpServer {
             ));
         }
 
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "text/html".to_string());
-
         let content = response
             .text()
             .await
             .map_err(|e| McpError::internal_error(format!("Failed to read response: {}", e), None))?;
 
-        if content_type.contains("application/pdf") {
-            // For PDFs from URLs, we'd need to save to temp file
-            // For now, treat as HTML
-            warn!("PDF URLs not fully supported, treating as HTML");
-        }
-
-        // Parse as HTML using ContentExtractor
+        // Parse as HTML
         let extractor = ContentExtractor::default();
         let extracted = extractor.extract(&content, &parsed_url);
-        let mut entry = self.create_entry_from_extracted(&extracted, url_str);
 
-        self.apply_schema_overrides(&mut entry, schema);
-        Ok(entry)
-    }
+        let title = title_override
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| extracted.title.clone());
 
-    /// Create an Entry from ContentExtractor output.
-    ///
-    /// This helper function converts extracted content to an Entry
-    /// for consistent indexing.
-    fn create_entry_from_extracted(
-        &self,
-        extracted: &kix_crawler::ExtractedContent,
-        source_path: &str,
-    ) -> Entry {
-        // Generate slug/ID from path
-        let slug = source_path.to_string();
-        let id = Entry::generate_id_from_path(source_path);
-
-        // Use extracted description or derive from markdown
+        let slug = slugify(&title);
         let description = extracted
             .description
             .clone()
             .unwrap_or_else(|| extracted.markdown.chars().take(300).collect());
 
-        // Determine entry type from path
-        let entry_type = if source_path.contains("/blog/") || source_path.contains("/article/") {
-            EntryType::Article
-        } else if source_path.contains("/docs/") || source_path.contains("/documentation/") {
-            EntryType::Document
-        } else {
-            EntryType::Document
-        };
+        let entry = Entry::with_id(slug.clone(), title, url_str.to_string(), extracted.content_hash.clone())
+            .with_description(description)
+            .with_content(extracted.markdown)
+            .with_tags(vec![])
+            .with_entry_type(EntryType::Document)
+            .with_source_type(SourceType::Url)
+            .with_slug(slug);
 
-        Entry::with_id(
-            id,
-            extracted.title.clone(),
-            source_path.to_string(),
-            extracted.content_hash.clone(),
-        )
-        .with_description(description)
-        .with_content(extracted.markdown.clone())
-        .with_tags(vec![])
-        .with_entry_type(entry_type)
-        .with_source_type(SourceType::Html)
-        .with_slug(slug)
-    }
+        // Note: source_domain is extracted from source_path when storing in the database
 
-    /// Create an Entry from schema metadata.
-    fn create_entry_from_schema(&self, schema: &DocumentSchema, content: &str) -> Entry {
-        match schema {
-            DocumentSchema::Pattern(p) => {
-                let slug = slugify(&p.title);
-                let entry_type = p
-                    .pattern_type
-                    .as_ref()
-                    .map(|s| EntryType::from_str(s))
-                    .unwrap_or(EntryType::Document);
-
-                // Combine categories and keywords into tags
-                let mut tags = p.categories.clone().unwrap_or_default();
-                if let Some(ref keywords) = p.keywords {
-                    tags.extend(keywords.clone());
-                }
-                tags.sort();
-                tags.dedup();
-
-                // Use problem as description if available
-                let description = p.problem.clone().unwrap_or_default();
-
-                Entry::with_id(slug.clone(), p.title.clone(), String::new(), String::new())
-                    .with_description(description)
-                    .with_content(content.to_string())
-                    .with_tags(tags)
-                    .with_entry_type(entry_type)
-                    .with_source_type(SourceType::Html)
-                    .with_slug(slug)
-            }
-            DocumentSchema::Generic(g) => {
-                let slug = slugify(&g.title);
-                let tags = g.tags.clone().unwrap_or_default();
-                let description = g.description.clone().unwrap_or_default();
-                let source_path = g.source.clone().unwrap_or_default();
-
-                Entry::with_id(slug.clone(), g.title.clone(), source_path, String::new())
-                    .with_description(description)
-                    .with_content(content.to_string())
-                    .with_tags(tags)
-                    .with_entry_type(EntryType::Document)
-                    .with_source_type(SourceType::Html)
-                    .with_slug(slug)
-            }
-        }
-    }
-
-    /// Apply schema overrides to a parsed entry.
-    fn apply_schema_overrides(&self, entry: &mut Entry, schema: &DocumentSchema) {
-        match schema {
-            DocumentSchema::Pattern(p) => {
-                entry.title = p.title.clone();
-                if let Some(ref problem) = p.problem {
-                    entry.description = problem.clone();
-                }
-                // Combine categories and keywords into tags
-                if let Some(ref categories) = p.categories {
-                    entry.tags.extend(categories.clone());
-                }
-                if let Some(ref keywords) = p.keywords {
-                    entry.tags.extend(keywords.clone());
-                }
-                entry.tags.sort();
-                entry.tags.dedup();
-                if let Some(ref pt) = p.pattern_type {
-                    entry.entry_type = EntryType::from_str(pt);
-                }
-
-                // Regenerate slug
-                entry.slug = slugify(&entry.title);
-            }
-            DocumentSchema::Generic(g) => {
-                entry.title = g.title.clone();
-                if let Some(ref desc) = g.description {
-                    entry.description = desc.clone();
-                }
-                if let Some(ref tags) = g.tags {
-                    entry.tags = tags.clone();
-                }
-                if let Some(ref source) = g.source {
-                    entry.source_path = source.clone();
-                }
-                entry.entry_type = EntryType::Document;
-
-                // Regenerate slug
-                entry.slug = slugify(&entry.title);
-            }
-        }
-    }
-
-    /// Process and index a single entry (helper for batch).
-    async fn process_and_index_document(
-        &self,
-        source: &ContentSource,
-        schema: &DocumentSchema,
-        custom_id: &Option<String>,
-    ) -> Result<(String, usize), McpError> {
-        let mut entry = self.process_content_source(source, schema).await?;
-
-        if let Some(ref id) = custom_id {
-            entry.id = id.clone();
-        }
-
-        // Check and handle existing
-        let exists = {
-            let store = self.store.lock().await;
-            store
-                .entry_exists(&entry.id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        };
-
-        if exists {
-            let store = self.store.lock().await;
-            store.delete_chunks_by_entry(&entry.id).await.ok();
-            store.delete_entry(&entry.id).await.ok();
-        }
-
-        // Chunk and embed
-        let chunker = DocumentChunker::with_defaults();
-        let chunks = chunker.chunk(&entry);
-
-        let embeddings = {
-            let mut embedder = self.embedder.lock().await;
-            let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-            embedder
-                .embed_texts(&texts)
-                .map_err(|e| McpError::internal_error(format!("Embedding failed: {}", e), None))?
-        };
-
-        // Store
-        {
-            let store = self.store.lock().await;
-            store
-                .insert_entries(&[entry.clone()])
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            store
-                .insert_chunks(&chunks, &embeddings)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        }
-
-        Ok((entry.id, chunks.len()))
+        Ok(entry)
     }
 }
 
@@ -1502,13 +1245,12 @@ impl KixMcpServer {
 impl ServerHandler for KixMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            instructions: Some("Knowledge Indexer System - Search and explore indexed content using natural language.".into()),
+            instructions: Some("RAG Knowledge System - Search, index, and retrieve documents for AI-powered knowledge retrieval.".into()),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
     }
 
-    /// List all available tools from the tool router
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParam>,
@@ -1523,7 +1265,6 @@ impl ServerHandler for KixMcpServer {
         }
     }
 
-    /// Route tool calls to the appropriate handler via the tool router
     fn call_tool(
         &self,
         request: CallToolRequestParam,
@@ -1538,120 +1279,6 @@ impl ServerHandler for KixMcpServer {
 
 /// Backward compatibility alias for KixMcpServer.
 pub type EipMcpServer = KixMcpServer;
-
-/// Format search results for display.
-fn format_search_results(results: &[SearchResult]) -> String {
-    if results.is_empty() {
-        return "No results found.".to_string();
-    }
-
-    let mut output = String::new();
-    for (i, result) in results.iter().enumerate() {
-        output.push_str(&format!(
-            "### {}. {} (Score: {:.2})\n\
-            **Type:** {} | **Tags:** {}\n\
-            {}\n\n",
-            i + 1,
-            result.entry_title,
-            result.score,
-            result.entry_type,
-            result.tags.join(", "),
-            truncate_text(&result.text, 200)
-        ));
-    }
-    output
-}
-
-/// Format entry summary for display.
-fn format_pattern_summary(entry: &EntrySummary) -> String {
-    format!(
-        "## {}\n\n\
-        **ID:** {}\n\
-        **Type:** {}\n\
-        **Tags:** {}\n\n\
-        **Description:**\n{}\n",
-        entry.title,
-        entry.id,
-        entry.entry_type,
-        entry.tags.join(", "),
-        entry.description
-    )
-}
-
-/// Format entry list for display.
-fn format_pattern_list(entries: &[EntrySummary]) -> String {
-    if entries.is_empty() {
-        return "No entries found.".to_string();
-    }
-
-    let mut output = format!("## Found {} Entries\n\n", entries.len());
-    for entry in entries {
-        output.push_str(&format!(
-            "- **{}** ({}): {}\n",
-            entry.title,
-            entry.entry_type,
-            truncate_text(&entry.description, 100)
-        ));
-    }
-    output
-}
-
-/// Truncate text to a maximum length.
-fn truncate_text(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        format!("{}...", &text[..max_len])
-    }
-}
-
-/// Format index result for display.
-fn format_index_result(result: &IndexResult) -> String {
-    if result.success {
-        format!(
-            "## Document Indexed Successfully\n\n\
-            **Document ID:** {}\n\
-            **Chunks Created:** {}\n\n\
-            {}",
-            result.document_id, result.chunks_created, result.message
-        )
-    } else {
-        format!("## Indexing Failed\n\n**Error:** {}", result.message)
-    }
-}
-
-/// Format batch index result for display.
-fn format_batch_result(result: &BatchIndexResult) -> String {
-    let mut output = format!(
-        "## Batch Indexing Complete\n\n\
-        **Total:** {} | **Succeeded:** {} | **Failed:** {}\n\
-        **Indexes Created:** {}\n\n",
-        result.total,
-        result.succeeded,
-        result.failed,
-        if result.indexes_created { "Yes" } else { "No" }
-    );
-
-    output.push_str("### Results\n\n");
-    for doc_result in &result.results {
-        if doc_result.success {
-            output.push_str(&format!(
-                "- [{}] {} ({} chunks)\n",
-                doc_result.index + 1,
-                doc_result.document_id.as_deref().unwrap_or("unknown"),
-                doc_result.chunks_created.unwrap_or(0)
-            ));
-        } else {
-            output.push_str(&format!(
-                "- [{}] FAILED: {}\n",
-                doc_result.index + 1,
-                doc_result.error.as_deref().unwrap_or("unknown error")
-            ));
-        }
-    }
-
-    output
-}
 
 /// Convert a title to a URL-safe slug.
 fn slugify(text: &str) -> String {
