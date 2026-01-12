@@ -194,33 +194,27 @@ run_local_mode() {
     export OLLAMA_MODEL="${OLLAMA_MODEL:-nomic-embed-text}"
     export KIX_EMBEDDING_DIM="${KIX_EMBEDDING_DIM:-768}"
 
-    # Start MCP HTTP server in background
+    # Start unified server (API + MCP with shared store) in background
     echo ""
-    echo "Starting MCP HTTP server on port 3002..."
-    $BINARY serve-http --port 3002 &
-    MCP_PID=$!
+    echo "Starting unified server (API + MCP with shared KixStore)..."
+    $BINARY run --api-port 3001 --mcp-port 3002 &
+    UNIFIED_PID=$!
 
-    # Give MCP server a moment to start
-    sleep 2
-
-    # Start API server in background
-    echo ""
-    echo "Starting API server on port 3001..."
-    $BINARY api --port 3001 &
-    API_PID=$!
-
-    # Give API a moment to start
+    # Give server a moment to start
     sleep 2
 
     # Start client dev server
     echo "Starting client dev server on port 3000..."
     echo ""
-    echo "=== Services Running (Local) ==="
+    echo "=== Services Running (Local - Unified Mode) ==="
     echo "  Web UI:   http://localhost:3000"
     echo "  API:      http://localhost:3001 (proxied via /api)"
     echo "  Indexing: http://localhost:3001/api/indexing/* (with SSE)"
     echo "  MCP:      http://localhost:3002/mcp (proxied via /mcp)"
     echo "  Ollama:   http://localhost:11434"
+    echo ""
+    echo "API and MCP servers share a single KixStore instance."
+    echo "Data indexed via MCP is immediately searchable via API."
     echo ""
     if [ "$ARCH" = "arm64" ]; then
         echo "GPU: Apple Silicon Metal acceleration enabled"
@@ -233,7 +227,7 @@ run_local_mode() {
     cleanup() {
         echo ""
         echo "Stopping services..."
-        kill $MCP_PID $API_PID 2>/dev/null || true
+        kill $UNIFIED_PID 2>/dev/null || true
         if [ -n "$OLLAMA_PID" ]; then
             kill $OLLAMA_PID 2>/dev/null || true
         fi

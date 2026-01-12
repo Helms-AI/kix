@@ -185,7 +185,10 @@ pub struct ContentProcessor {
 }
 
 impl ContentProcessor {
-    /// Create a new content processor
+    /// Create a new content processor with its own KixStore instance.
+    ///
+    /// Use this for standalone CLI commands that don't share state with other services.
+    /// For API/MCP server contexts, prefer `with_shared_store()` to share a single store.
     pub async fn new(
         db_path: &str,
         config: ProcessorConfig,
@@ -199,6 +202,23 @@ impl ContentProcessor {
 
         store.init_tables().await
             .map_err(|e| JobError::Processing(format!("Failed to init tables: {}", e)))?;
+
+        // Use RwLock for better concurrent read access
+        let store = Arc::new(RwLock::new(store));
+
+        Self::with_shared_store(store, config).await
+    }
+
+    /// Create a new content processor with a shared KixStore instance.
+    ///
+    /// This is the preferred constructor for API/MCP server contexts where
+    /// multiple components (API handlers, job executor) need to share the same
+    /// store instance for consistent data visibility and reduced memory usage.
+    pub async fn with_shared_store(
+        store: Arc<RwLock<KixStore>>,
+        config: ProcessorConfig,
+    ) -> Result<Self, JobError> {
+        info!("Initializing content processor with shared store");
 
         // Create embedding worker pool (auto-scales based on GPU/CPU)
         // Max 8 workers for CPU mode, queue size of 64
@@ -223,8 +243,6 @@ impl ContentProcessor {
             ..Default::default()
         });
 
-        // Use RwLock for better concurrent read access
-        let store = Arc::new(RwLock::new(store));
         let embedder_compat = Arc::new(Mutex::new(embedder_compat));
 
         // Initialize pattern linker (still uses mutex-based embedder for compatibility)

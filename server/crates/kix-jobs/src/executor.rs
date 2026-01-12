@@ -16,7 +16,7 @@ use url::Url;
 use kix_crawler::crawler::{CrawlResult, Crawler, CrawlerConfig};
 use kix_sse::event::{Event, EventType, SourceType};
 use kix_sse::ConnectionManager;
-use kix_store::{JobItemRecord, JobRecord, JobStats, JobStore};
+use kix_store::{JobItemRecord, JobRecord, JobStats, JobStore, KixStore};
 
 use crate::job::{Job, JobResult, JobType};
 use crate::processor::{ContentProcessor, ProcessorConfig};
@@ -71,6 +71,10 @@ pub struct ExecutorConfig {
     pub processor_config: ProcessorConfig,
     /// Optional callback invoked when a job completes (for cache invalidation)
     pub on_job_complete: Option<CacheInvalidationCallback>,
+    /// Optional shared KixStore instance.
+    /// When provided, ContentProcessor will use this store instead of creating its own.
+    /// This enables sharing a single store across API handlers and the job executor.
+    pub shared_store: Option<Arc<RwLock<KixStore>>>,
 }
 
 impl Default for ExecutorConfig {
@@ -83,6 +87,7 @@ impl Default for ExecutorConfig {
             jobs_db_path: Some("./data/lancedb/jobs.lance".to_string()),
             processor_config: ProcessorConfig::default(),
             on_job_complete: None,
+            shared_store: None,
         }
     }
 }
@@ -123,9 +128,16 @@ impl JobExecutor {
     ) -> Result<Self, JobError> {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
-        // Initialize content processor
-        let processor = ContentProcessor::new(&config.db_path, config.processor_config.clone())
-            .await?;
+        // Initialize content processor - use shared store if provided
+        let processor = if let Some(ref shared_store) = config.shared_store {
+            info!("JobExecutor using shared KixStore instance");
+            ContentProcessor::with_shared_store(shared_store.clone(), config.processor_config.clone())
+                .await?
+        } else {
+            info!("JobExecutor creating its own KixStore instance");
+            ContentProcessor::new(&config.db_path, config.processor_config.clone())
+                .await?
+        };
 
         // Initialize job history store if configured
         let job_store = if let Some(ref jobs_path) = config.jobs_db_path {

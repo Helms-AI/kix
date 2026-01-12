@@ -19,6 +19,7 @@ use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{error, info};
 
 use kix_api::{create_router, create_indexing_router, AppState, IndexingState};
@@ -79,6 +80,21 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value = "3001")]
         port: u16,
+    },
+
+    /// Start both API and MCP servers in a single process (shared store)
+    Run {
+        /// API server port
+        #[arg(long, default_value = "3001")]
+        api_port: u16,
+
+        /// MCP server port
+        #[arg(long, default_value = "3002")]
+        mcp_port: u16,
+
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
     },
 
     /// Test search from command line
@@ -145,6 +161,9 @@ async fn main() -> Result<()> {
         }
         Commands::Api { port } => {
             run_api(&db_path_str, port).await?;
+        }
+        Commands::Run { api_port, mcp_port, host } => {
+            run_unified(&db_path_str, &host, api_port, mcp_port).await?;
         }
         Commands::Search {
             query,
@@ -439,7 +458,7 @@ async fn run_serve_http(db_path: &str, host: &str, port: u16) -> Result<()> {
     // Auto-setup: download models if not present
     auto_setup()?;
 
-    // Pre-initialize the embedder and store
+    // Pre-initialize the embedder and store for MCP server
     let embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
     let mut store = KixStore::new(db_path)
         .await
@@ -455,7 +474,9 @@ async fn run_serve_http(db_path: &str, host: &str, port: u16) -> Result<()> {
     // Create SSE manager for progress tracking
     let sse_manager = Arc::new(ConnectionManager::new(Default::default()));
 
-    // Create and start the job executor to process queued jobs
+    // Create and start the job executor
+    // Note: JobExecutor creates its own store instance here since KixMcpServer
+    // takes ownership of its store. Both use refresh_tables() for data consistency.
     let executor_config = ExecutorConfig {
         db_path: db_path.to_string(),
         jobs_db_path: None,
@@ -530,8 +551,12 @@ async fn run_api(db_path: &str, port: u16) -> Result<()> {
         .await
         .context("Failed to initialize tables")?;
 
-    // Create app state for the main router
-    let state = AppState::new(store, embedder);
+    // Create shared store - single instance shared between API and JobExecutor
+    let shared_store = Arc::new(RwLock::new(store));
+    info!("Created shared KixStore instance for API and JobExecutor");
+
+    // Create app state using the shared store
+    let state = AppState::new_with_store(shared_store.clone(), embedder);
 
     // Create indexing components
     let job_queue = Arc::new(JobQueue::new(QueueConfig::default()));
@@ -576,12 +601,12 @@ async fn run_api(db_path: &str, port: u16) -> Result<()> {
         indexing_state = indexing_state.with_job_store(store);
     }
 
-    // Create and start the job executor
-    // Note: Cache invalidation callback removed - tables are refreshed before each search
+    // Create and start the job executor with shared store
     let executor_config = ExecutorConfig {
         db_path: db_path.to_string(),
         jobs_db_path: job_store.as_ref().map(|_| jobs_db_path.to_string_lossy().to_string()),
         on_job_complete: None,
+        shared_store: Some(shared_store),  // Pass shared store to executor
         ..Default::default()
     };
 
@@ -617,6 +642,163 @@ async fn run_api(db_path: &str, port: u16) -> Result<()> {
         executor.shutdown().await;
     })
     .await?;
+
+    Ok(())
+}
+
+/// Start both API and MCP servers in a single process with a shared store.
+/// This is the recommended mode for single-node deployments as it ensures
+/// data indexed via MCP is immediately visible to API searches.
+async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) -> Result<()> {
+    info!("Starting unified server (API + MCP with shared store)...");
+
+    // Auto-setup: download models if not present
+    auto_setup()?;
+
+    // Initialize store - SINGLE SHARED INSTANCE
+    let mut store = KixStore::new(db_path)
+        .await
+        .context("Failed to open database")?;
+    store
+        .init_tables()
+        .await
+        .context("Failed to initialize tables")?;
+
+    // Create the single shared store
+    let shared_store = Arc::new(RwLock::new(store));
+    info!("Created single shared KixStore instance for API and MCP servers");
+
+    // Create single shared embedder for both API and MCP
+    let embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
+    let shared_embedder = Arc::new(RwLock::new(embedder));
+    info!("Created single shared EmbeddingGenerator for API and MCP servers");
+
+    // Create shared components
+    let job_queue = Arc::new(JobQueue::new(QueueConfig::default()));
+    let sse_manager = Arc::new(ConnectionManager::new(Default::default()));
+
+    // Start SSE cleanup background task
+    spawn_cleanup_task(sse_manager.clone());
+
+    let file_handler = Arc::new(FileHandler::with_defaults());
+    file_handler.init().await?;
+
+    // Initialize job history store
+    let jobs_db_path = PathBuf::from(db_path).join("jobs.lance");
+    let job_store = match JobStore::new(jobs_db_path.to_string_lossy().as_ref()).await {
+        Ok(mut store) => {
+            if let Err(e) = store.init_tables().await {
+                error!("Failed to initialize job history tables: {}", e);
+                None
+            } else {
+                info!("Job history store initialized at {}", jobs_db_path.display());
+                Some(Arc::new(store))
+            }
+        }
+        Err(e) => {
+            error!("Failed to create job history store: {}", e);
+            None
+        }
+    };
+
+    // Create API state using the shared store and shared embedder
+    let api_state = AppState::with_shared(shared_store.clone(), shared_embedder.clone());
+
+    // Create indexing state for API
+    let mut indexing_state = IndexingState::new(
+        api_state.clone(),
+        job_queue.clone(),
+        sse_manager.clone(),
+        file_handler,
+    );
+    if let Some(store) = job_store.clone() {
+        indexing_state = indexing_state.with_job_store(store);
+    }
+
+    // Create and start the job executor with shared store
+    let executor_config = ExecutorConfig {
+        db_path: db_path.to_string(),
+        jobs_db_path: job_store.as_ref().map(|_| jobs_db_path.to_string_lossy().to_string()),
+        on_job_complete: None,
+        shared_store: Some(shared_store.clone()), // Pass shared store to executor
+        ..Default::default()
+    };
+
+    let mut executor = JobExecutor::new(job_queue.clone(), sse_manager.clone(), executor_config)
+        .await
+        .context("Failed to create job executor")?;
+    executor.start();
+    info!("Job executor started with shared store");
+
+    // Create API router
+    let main_router = create_router(api_state);
+    let indexing_router = create_indexing_router(indexing_state);
+    let api_app = main_router.merge(indexing_router);
+
+    // Create MCP server using the SAME shared store and shared embedder
+    let mcp_server = KixMcpServer::with_shared(shared_store.clone(), shared_embedder, job_queue);
+
+    // Create the MCP streamable HTTP service
+    let mcp_service = StreamableHttpService::new(
+        move || {
+            let server = mcp_server.clone();
+            Ok(server)
+        },
+        Arc::new(LocalSessionManager::default()),
+        Default::default(),
+    );
+
+    // Create MCP router with OAuth stubs
+    let mcp_app = axum::Router::new()
+        .route("/.well-known/oauth-authorization-server", get(oauth_metadata_handler))
+        .route("/.well-known/oauth-protected-resource", get(oauth_resource_handler))
+        .route("/oauth/register", axum::routing::post(oauth_register_handler))
+        .route("/oauth/authorize", get(oauth_authorize_handler))
+        .route("/oauth/token", axum::routing::post(oauth_token_handler))
+        .nest_service("/mcp", mcp_service);
+
+    // Bind to addresses
+    let api_addr: SocketAddr = format!("{}:{}", host, api_port).parse()?;
+    let mcp_addr: SocketAddr = format!("{}:{}", host, mcp_port).parse()?;
+
+    let api_listener = tokio::net::TcpListener::bind(api_addr).await?;
+    let mcp_listener = tokio::net::TcpListener::bind(mcp_addr).await?;
+
+    println!("=== Unified Server (Shared Store) ===");
+    println!("  REST API:  http://{}", api_addr);
+    println!("  MCP:       http://{}/mcp", mcp_addr);
+    println!("");
+    println!("Both servers share a single KixStore instance.");
+    println!("Data indexed via MCP is immediately searchable via API.");
+    info!("Unified server started - API on {}, MCP on {}", api_addr, mcp_addr);
+
+    // Create shutdown signal
+    let shutdown = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for ctrl-c");
+        info!("Shutting down unified server...");
+    };
+
+    // Run both servers concurrently
+    tokio::select! {
+        result = axum::serve(api_listener, api_app.into_make_service_with_connect_info::<SocketAddr>()) => {
+            if let Err(e) = result {
+                error!("API server error: {}", e);
+            }
+        }
+        result = axum::serve(mcp_listener, mcp_app) => {
+            if let Err(e) = result {
+                error!("MCP server error: {}", e);
+            }
+        }
+        _ = shutdown => {
+            info!("Shutdown signal received");
+        }
+    }
+
+    executor.shutdown().await;
+    info!("Unified server stopped");
 
     Ok(())
 }

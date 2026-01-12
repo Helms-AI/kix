@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
@@ -408,8 +408,8 @@ pub struct IndexStatus {
 /// The main Knowledge Indexer MCP server for RAG systems.
 #[derive(Clone)]
 pub struct KixMcpServer {
-    store: Arc<Mutex<KixStore>>,
-    embedder: Arc<Mutex<EmbeddingGenerator>>,
+    store: Arc<RwLock<KixStore>>,
+    embedder: Arc<RwLock<EmbeddingGenerator>>,
     http_client: HttpClient,
     /// Job queue for async indexing operations
     job_queue: Arc<JobQueue>,
@@ -420,10 +420,35 @@ pub struct KixMcpServer {
 #[tool_router]
 impl KixMcpServer {
     /// Creates a new MCP server with the given store, embedder, and job queue.
+    /// This creates owned store and embedder wrapped in Arc<RwLock<>>.
     pub fn new(store: KixStore, embedder: EmbeddingGenerator, job_queue: Arc<JobQueue>) -> Self {
+        Self::with_shared(
+            Arc::new(RwLock::new(store)),
+            Arc::new(RwLock::new(embedder)),
+            job_queue,
+        )
+    }
+
+    /// Creates a new MCP server with a shared store.
+    /// Use this when running MCP and API servers in the same process to share the store.
+    pub fn with_shared_store(
+        store: Arc<RwLock<KixStore>>,
+        embedder: EmbeddingGenerator,
+        job_queue: Arc<JobQueue>,
+    ) -> Self {
+        Self::with_shared(store, Arc::new(RwLock::new(embedder)), job_queue)
+    }
+
+    /// Creates a new MCP server with both shared store and shared embedder.
+    /// Use this in unified server mode where API and MCP share all resources.
+    pub fn with_shared(
+        store: Arc<RwLock<KixStore>>,
+        embedder: Arc<RwLock<EmbeddingGenerator>>,
+        job_queue: Arc<JobQueue>,
+    ) -> Self {
         Self {
-            store: Arc::new(Mutex::new(store)),
-            embedder: Arc::new(Mutex::new(embedder)),
+            store,
+            embedder,
             http_client: HttpClient::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -462,7 +487,7 @@ impl KixMcpServer {
         let embedding = match mode {
             SearchMode::Text => vec![], // Not needed for text-only
             _ => {
-                let mut embedder = self.embedder.lock().await;
+                let mut embedder = self.embedder.write().await;
                 embedder
                     .embed_query(query)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -470,7 +495,7 @@ impl KixMcpServer {
         };
 
         // Perform search based on mode
-        let store = self.store.lock().await;
+        let store = self.store.read().await;
         let results = match mode {
             SearchMode::Hybrid => {
                 store
@@ -537,7 +562,7 @@ impl KixMcpServer {
             ));
         }
 
-        let store = self.store.lock().await;
+        let store = self.store.read().await;
 
         // Get page_id from chunk if needed
         let page_id = if let Some(ref pid) = params.0.page_id {
@@ -601,7 +626,7 @@ impl KixMcpServer {
     ) -> Result<CallToolResult, McpError> {
         info!("Get document: {}", params.0.id);
 
-        let store = self.store.lock().await;
+        let store = self.store.read().await;
 
         // Get entry by ID
         let entry = store
@@ -713,7 +738,7 @@ impl KixMcpServer {
 
         // Check for existing entry
         let exists = {
-            let store = self.store.lock().await;
+            let store = self.store.read().await;
             store
                 .entry_exists(&entry.id)
                 .await
@@ -738,7 +763,7 @@ impl KixMcpServer {
 
         // If replacing, delete existing first
         if exists {
-            let store = self.store.lock().await;
+            let store = self.store.write().await;
             store.delete_chunks_by_entry(&entry.id).await.ok();
             store.delete_entry(&entry.id).await.ok();
         }
@@ -748,7 +773,7 @@ impl KixMcpServer {
         let chunks = chunker.chunk(&entry);
 
         let embeddings = {
-            let mut embedder = self.embedder.lock().await;
+            let mut embedder = self.embedder.write().await;
             let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
             embedder
                 .embed_texts(&texts)
@@ -757,7 +782,7 @@ impl KixMcpServer {
 
         // Store entry and chunks
         {
-            let store = self.store.lock().await;
+            let store = self.store.write().await;
             store
                 .insert_entries(&[entry.clone()])
                 .await
@@ -969,7 +994,7 @@ impl KixMcpServer {
 
         // Filter-based deletion
         if let Some(ref filter) = params.0.filter {
-            let store = self.store.lock().await;
+            let store = self.store.read().await;
 
             if let Some(ref tag) = filter.tag {
                 let entries = store
@@ -1017,7 +1042,7 @@ impl KixMcpServer {
 
         if dry_run {
             // Just count what would be deleted
-            let store = self.store.lock().await;
+            let store = self.store.read().await;
             for id in &ids_to_delete {
                 if store.entry_exists(id).await.unwrap_or(false) {
                     let chunks = store.get_chunks_by_entry_id(id).await.unwrap_or_default();
@@ -1027,7 +1052,7 @@ impl KixMcpServer {
             }
         } else {
             // Actually delete
-            let store = self.store.lock().await;
+            let store = self.store.write().await;
             for id in &ids_to_delete {
                 if store.entry_exists(id).await.unwrap_or(false) {
                     let chunks = store.get_chunks_by_entry_id(id).await.unwrap_or_default();
@@ -1066,7 +1091,7 @@ impl KixMcpServer {
     ) -> Result<CallToolResult, McpError> {
         info!("Getting index status");
 
-        let store = self.store.lock().await;
+        let store = self.store.read().await;
 
         let document_count = store
             .entry_count()

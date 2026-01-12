@@ -29,14 +29,34 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Create a new application state.
+    /// Create a new application state with an owned store.
+    ///
+    /// This wraps the store in Arc<RwLock> internally.
+    /// For sharing a store with other components (e.g., JobExecutor),
+    /// use `new_with_store()` instead.
     pub fn new(store: KixStore, embedder: EmbeddingGenerator) -> Self {
-        info!("Initialized API state (no caching - real-time data mode)");
+        Self::new_with_store(Arc::new(RwLock::new(store)), embedder)
+    }
 
-        Self {
-            store: Arc::new(RwLock::new(store)),
-            embedder: Arc::new(RwLock::new(embedder)),
-        }
+    /// Create a new application state with a pre-wrapped shared store.
+    ///
+    /// This is the preferred constructor when the store needs to be shared
+    /// with other components like the JobExecutor's ContentProcessor.
+    pub fn new_with_store(store: Arc<RwLock<KixStore>>, embedder: EmbeddingGenerator) -> Self {
+        Self::with_shared(store, Arc::new(RwLock::new(embedder)))
+    }
+
+    /// Create a new application state with both shared store and shared embedder.
+    ///
+    /// This is the preferred constructor for unified server mode where both
+    /// API and MCP servers share the same resources.
+    pub fn with_shared(
+        store: Arc<RwLock<KixStore>>,
+        embedder: Arc<RwLock<EmbeddingGenerator>>,
+    ) -> Self {
+        info!("Initialized API state with shared store and embedder (real-time data mode)");
+
+        Self { store, embedder }
     }
 
     /// Get a reference to the store (for read operations use .read().await).
