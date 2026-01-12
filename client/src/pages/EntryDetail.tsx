@@ -47,8 +47,18 @@ export default function EntryDetail() {
     enabled: !!decodedId,
   });
 
-  const relatedEntries = relatedData?.entries || [];
   const rawChunks = chunksData?.chunks || [];
+
+  // Deduplicate related entries by ID and exclude current entry
+  const relatedEntries = useMemo(() => {
+    const entries = relatedData?.entries || [];
+    const seen = new Set<string>();
+    return entries.filter((entry) => {
+      if (seen.has(entry.id) || entry.id === decodedId) return false;
+      seen.add(entry.id);
+      return true;
+    });
+  }, [relatedData?.entries, decodedId]);
 
   // Sort chunks by chunk_index to ensure proper order
   const chunks = useMemo(() => {
