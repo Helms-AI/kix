@@ -9,6 +9,7 @@ export type SSEEventType =
   | 'error'
   | 'job_completed'
   | 'job_cancelled'
+  | 'job_history_updated'
   | 'heartbeat';
 
 // Backend sends this structure
@@ -260,6 +261,7 @@ export function useSSE({
       'error',
       'job_completed',
       'job_cancelled',
+      'job_history_updated',
       'heartbeat',
     ];
 

@@ -99,6 +99,7 @@ fn event_type_name(event: &EventType) -> &'static str {
         EventType::Error { .. } => "error",
         EventType::JobCompleted { .. } => "job_completed",
         EventType::JobCancelled { .. } => "job_cancelled",
+        EventType::JobHistoryUpdated { .. } => "job_history_updated",
         EventType::ItemDiscovered { .. } => "item_discovered",
         EventType::ItemStarted { .. } => "item_started",
         EventType::Heartbeat { .. } => "heartbeat",

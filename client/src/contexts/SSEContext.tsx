@@ -24,6 +24,8 @@ interface SSEContextType {
   connectionError: Event | null;
   /** Number of reconnection attempts */
   reconnectAttempts: number;
+  /** Maximum reconnection attempts allowed */
+  maxReconnectAttempts: number;
   /** Manual reconnect function */
   reconnect: () => void;
   /** Live job data keyed by job ID */
@@ -346,6 +348,12 @@ export function SSEProvider({ children }: { children: ReactNode }) {
     if (event.event_type === 'job_completed' || event.event_type === 'job_cancelled') {
       queryClient.invalidateQueries({ queryKey: ['jobs'] });
     }
+
+    // Invalidate job history when a job is persisted to history
+    if (event.event_type === 'job_history_updated') {
+      console.log('[SSE] Job history updated, refreshing history');
+      queryClient.invalidateQueries({ queryKey: ['job-history'] });
+    }
   }, [queryClient]);
 
   // Disconnect function
@@ -404,6 +412,7 @@ export function SSEProvider({ children }: { children: ReactNode }) {
       'error',
       'job_completed',
       'job_cancelled',
+      'job_history_updated',
       'heartbeat',
     ];
 
@@ -468,6 +477,7 @@ export function SSEProvider({ children }: { children: ReactNode }) {
     isConnecting,
     connectionError,
     reconnectAttempts,
+    maxReconnectAttempts,
     reconnect,
     jobs,
     clearJobLog,

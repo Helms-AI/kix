@@ -58,6 +58,13 @@ pub enum EventType {
         reason: String,
     },
 
+    /// Job history was updated (job persisted to history store)
+    /// Frontend should refresh job history when receiving this event.
+    JobHistoryUpdated {
+        job_id: Uuid,
+        status: String,
+    },
+
     /// Item (URL/file) was discovered and added to processing queue
     ItemDiscovered {
         job_id: Uuid,

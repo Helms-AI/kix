@@ -75,6 +75,10 @@ pub struct ExecutorConfig {
     /// When provided, ContentProcessor will use this store instead of creating its own.
     /// This enables sharing a single store across API handlers and the job executor.
     pub shared_store: Option<Arc<RwLock<KixStore>>>,
+    /// Optional shared JobStore instance for job history persistence.
+    /// When provided, the executor uses this store instead of creating its own.
+    /// This ensures job history is immediately visible to API queries.
+    pub shared_job_store: Option<Arc<JobStore>>,
 }
 
 impl Default for ExecutorConfig {
@@ -88,6 +92,7 @@ impl Default for ExecutorConfig {
             processor_config: ProcessorConfig::default(),
             on_job_complete: None,
             shared_store: None,
+            shared_job_store: None,
         }
     }
 }
@@ -139,8 +144,11 @@ impl JobExecutor {
                 .await?
         };
 
-        // Initialize job history store if configured
-        let job_store = if let Some(ref jobs_path) = config.jobs_db_path {
+        // Initialize job history store - use shared store if provided
+        let job_store = if let Some(store) = config.shared_job_store.clone() {
+            info!("JobExecutor using shared JobStore instance");
+            Some(store)
+        } else if let Some(ref jobs_path) = config.jobs_db_path {
             match JobStore::new(jobs_path).await {
                 Ok(mut store) => {
                     if let Err(e) = store.init_tables().await {
@@ -261,6 +269,16 @@ impl JobExecutor {
                             if let Some(ref store) = job_store {
                                 if let Err(e) = Self::persist_job(&job, &result, "completed", &ctx, store).await {
                                     warn!(job_id = %job.id, error = %e, "Failed to persist job history");
+                                } else {
+                                    // Notify frontend that job history was updated
+                                    let _ = sse_manager.broadcast_to_job(
+                                        job.id,
+                                        Event::new(EventType::JobHistoryUpdated {
+                                            job_id: job.id,
+                                            status: "completed".to_string(),
+                                        }),
+                                    );
+                                    info!(job_id = %job.id, "Job history updated, SSE notification sent");
                                 }
                             }
                             queue.complete(job.id, result).await;
@@ -284,6 +302,15 @@ impl JobExecutor {
                                 };
                                 if let Err(pe) = Self::persist_job(&job, &failed_result, "failed", &ctx, store).await {
                                     warn!(job_id = %job.id, error = %pe, "Failed to persist failed job history");
+                                } else {
+                                    // Notify frontend that job history was updated (even for failures)
+                                    let _ = sse_manager.broadcast_to_job(
+                                        job.id,
+                                        Event::new(EventType::JobHistoryUpdated {
+                                            job_id: job.id,
+                                            status: "failed".to_string(),
+                                        }),
+                                    );
                                 }
                             }
                             queue.fail(job.id, e.to_string(), 0).await;
