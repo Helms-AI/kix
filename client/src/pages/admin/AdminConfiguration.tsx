@@ -10,7 +10,6 @@ import {
   CheckCircle,
   AlertCircle,
   Loader2,
-  Settings,
   Sliders
 } from 'lucide-react';
 

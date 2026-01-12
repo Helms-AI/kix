@@ -41,7 +41,7 @@ scraper = { workspace = true }
 regex = { workspace = true }
 mime = "0.3"
 quick-xml = "0.37"  # For sitemap XML parsing
-htmd = "0.1"        # For HTML to markdown conversion
+html-to-markdown-rs = "2"  # For HTML to markdown conversion (with escape control)
 readability = "0.3" # Mozilla Readability algorithm for main content extraction
 
 # Robots.txt

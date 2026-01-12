@@ -158,6 +158,24 @@ impl ContentExtractor {
         }
     }
 
+    /// Convert HTML to markdown using html-to-markdown-rs with escaping disabled
+    ///
+    /// This helper ensures consistent markdown conversion across all extraction
+    /// methods with the following behavior:
+    /// - Escaping of asterisks and underscores is disabled to preserve markdown formatting
+    /// - Script, style, and noscript tags are stripped
+    fn html_to_markdown(html: &str) -> Option<String> {
+        use html_to_markdown_rs::{convert, ConversionOptions};
+
+        let options = ConversionOptions {
+            escape_asterisks: false,
+            escape_underscores: false,
+            ..Default::default()
+        };
+
+        convert(html, Some(options)).ok()
+    }
+
     /// Compile CSS selectors for boilerplate elements
     fn compile_boilerplate_selectors() -> Vec<Selector> {
         let patterns = [
@@ -346,12 +364,8 @@ impl ContentExtractor {
                 if content.len() >= MIN_READABILITY_CONTENT_LEN
                     && !self.is_mostly_boilerplate(&content)
                 {
-                    // Convert the extracted HTML to markdown
-                    let options = htmd::HtmlToMarkdown::builder()
-                        .skip_tags(vec!["script", "style", "noscript"])
-                        .build();
-
-                    options.convert(&content).ok()
+                    // Convert the extracted HTML to markdown (with escape disabled)
+                    Self::html_to_markdown(&content)
                 } else {
                     None
                 }
@@ -408,12 +422,8 @@ impl ContentExtractor {
             // Remove boilerplate from the selected element
             let cleaned = self.remove_boilerplate(&html_content);
 
-            // Convert to markdown
-            let options = htmd::HtmlToMarkdown::builder()
-                .skip_tags(vec!["script", "style", "noscript"])
-                .build();
-
-            options.convert(&cleaned).unwrap_or_default()
+            // Convert to markdown (with escape disabled)
+            Self::html_to_markdown(&cleaned).unwrap_or_default()
         } else {
             String::new()
         }
@@ -502,12 +512,8 @@ impl ContentExtractor {
         // Remove boilerplate from the content
         let cleaned_html = self.remove_boilerplate(&html_content);
 
-        // Convert to markdown using htmd
-        let options = htmd::HtmlToMarkdown::builder()
-            .skip_tags(vec!["script", "style", "noscript"])
-            .build();
-
-        options.convert(&cleaned_html).unwrap_or_default()
+        // Convert to markdown (with escape disabled)
+        Self::html_to_markdown(&cleaned_html).unwrap_or_default()
     }
 
     /// Extract the page title

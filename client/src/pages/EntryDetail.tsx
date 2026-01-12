@@ -2,6 +2,7 @@ import { useParams, Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState, useMemo } from 'react';
 import { ArrowLeft, Tag, Link as LinkIcon, ChevronRight, Layers, RefreshCw } from 'lucide-react';
+import MarkdownViewer from '../components/MarkdownViewer';
 import clsx from 'clsx';
 import { api } from '../api/client';
 import type { Chunk } from '../types';
@@ -197,9 +198,7 @@ export default function EntryDetail() {
                         <span className="flex-shrink-0 px-2 py-0.5 text-xs font-mono bg-slate-700 text-slate-400 rounded-full">
                           {chunk.chunk_index ?? index}
                         </span>
-                        <p className="text-slate-300 leading-relaxed whitespace-pre-wrap flex-1">
-                          {chunk.text}
-                        </p>
+                        <MarkdownViewer content={chunk.text} className="flex-1" />
                       </div>
                       {index < chunks.length - 1 && (
                         <hr className="border-slate-700/50 mt-4" />
@@ -208,9 +207,7 @@ export default function EntryDetail() {
                   ))}
                 </div>
               ) : entry.description ? (
-                <p className="text-slate-300 leading-relaxed whitespace-pre-wrap">
-                  {entry.description}
-                </p>
+                <MarkdownViewer content={entry.description} />
               ) : (
                 <p className="text-slate-500 italic">No content available</p>
               )}
