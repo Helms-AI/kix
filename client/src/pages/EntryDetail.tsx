@@ -1,7 +1,21 @@
 import { useParams, Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState, useMemo } from 'react';
-import { ArrowLeft, Tag, Link as LinkIcon, ChevronRight, Layers, RefreshCw } from 'lucide-react';
+import {
+  ArrowLeft,
+  Tag,
+  Link as LinkIcon,
+  ChevronRight,
+  Layers,
+  RefreshCw,
+  Globe,
+  ExternalLink,
+  Copy,
+  Clock,
+  FileText,
+  Code,
+  FileType,
+} from 'lucide-react';
 import MarkdownViewer from '../components/MarkdownViewer';
 import clsx from 'clsx';
 import { api } from '../api/client';
@@ -13,6 +27,7 @@ export default function EntryDetail() {
   const queryClient = useQueryClient();
   const [isReindexing, setIsReindexing] = useState(false);
   const [reindexError, setReindexError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const { data: entry, isLoading, error } = useQuery({
     queryKey: ['entry', decodedId],
@@ -63,6 +78,42 @@ export default function EntryDetail() {
     }
   };
 
+  const handleCopy = async () => {
+    const textToCopy = entry?.source_path || entry?.id || '';
+    await navigator.clipboard.writeText(textToCopy);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  // Helper for relative time
+  const formatRelativeTime = (dateStr?: string) => {
+    if (!dateStr) return null;
+    const date = new Date(dateStr);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+    if (diffDays === 0) return 'Today';
+    if (diffDays === 1) return 'Yesterday';
+    if (diffDays < 7) return `${diffDays} days ago`;
+    if (diffDays < 30) return `${Math.floor(diffDays / 7)} weeks ago`;
+    return date.toLocaleDateString();
+  };
+
+  // Helper for source type icon
+  const getSourceTypeIcon = (type?: string) => {
+    switch (type) {
+      case 'html':
+      case 'url':
+        return Globe;
+      case 'pdf':
+        return FileText;
+      case 'source_code':
+        return Code;
+      default:
+        return FileType;
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-[60vh]">
@@ -101,69 +152,146 @@ export default function EntryDetail() {
       </nav>
 
       {/* Header */}
-      <div className="card p-8">
-        <div className="flex flex-col lg:flex-row lg:items-start gap-6">
-          <div className="flex-1">
-            <div className="flex items-center gap-3 mb-4">
-              <span
-                className={clsx(
-                  'px-3 py-1 text-sm font-mono rounded-full',
-                  entry.entry_type === 'messaging'
-                    ? 'bg-violet-500/20 text-violet-400 border border-violet-500/30'
-                    : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                )}
-              >
-                {entry.entry_type}
-              </span>
-            </div>
-            <h1 className="text-4xl font-bold text-white mb-4">{entry.title}</h1>
-
-            {/* Tags */}
-            {entry.tags && entry.tags.length > 0 && (
-              <div className="flex items-center gap-2 flex-wrap">
-                <Tag className="w-4 h-4 text-slate-500" />
-                {entry.tags.map((tag) => (
-                  <Link
-                    key={tag}
-                    to={`/patterns?tag=${encodeURIComponent(tag)}`}
-                    className="px-3 py-1 text-sm bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 hover:text-white transition-colors"
-                  >
-                    {tag}
-                  </Link>
-                ))}
-              </div>
+      <div className="card overflow-hidden">
+        {/* Metadata Bar */}
+        <div className="px-6 py-3 bg-slate-800/50 border-b border-slate-700/50 flex flex-wrap items-center gap-3">
+          {/* Entry Type Badge */}
+          <span
+            className={clsx(
+              'px-2.5 py-1 text-xs font-semibold rounded-md uppercase tracking-wide',
+              entry.entry_type === 'messaging'
+                ? 'bg-violet-500/20 text-violet-400 ring-1 ring-violet-500/30'
+                : entry.entry_type === 'code'
+                  ? 'bg-emerald-500/20 text-emerald-400 ring-1 ring-emerald-500/30'
+                  : 'bg-amber-500/20 text-amber-400 ring-1 ring-amber-500/30'
             )}
-          </div>
+          >
+            {entry.entry_type}
+          </span>
 
-          {/* Entry ID and Re-index */}
-          <div className="lg:text-right space-y-3">
-            <div>
-              <p className="text-xs text-slate-500 font-mono uppercase tracking-wider mb-1">Entry ID</p>
-              <p className="text-sm text-slate-400 font-mono bg-slate-800 px-3 py-1.5 rounded-lg inline-block">
-                {entry.id}
-              </p>
+          {/* Source Type Badge */}
+          {entry.source_type && (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md bg-slate-700/50 text-slate-300 ring-1 ring-slate-600/50">
+              {(() => {
+                const Icon = getSourceTypeIcon(entry.source_type);
+                return <Icon className="w-3 h-3" />;
+              })()}
+              {entry.source_type}
+            </span>
+          )}
+
+          {/* Source Domain */}
+          {entry.source_domain && (
+            <a
+              href={entry.source_path}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md bg-cyan-500/10 text-cyan-400 ring-1 ring-cyan-500/30 hover:bg-cyan-500/20 transition-colors"
+            >
+              <Globe className="w-3 h-3" />
+              {entry.source_domain}
+              <ExternalLink className="w-3 h-3 opacity-50" />
+            </a>
+          )}
+
+          {/* Divider */}
+          <div className="h-4 w-px bg-slate-700 hidden sm:block" />
+
+          {/* Chunks Count */}
+          <span className="inline-flex items-center gap-1.5 text-xs text-slate-400">
+            <Layers className="w-3.5 h-3.5" />
+            <span className="font-mono">{chunks.length}</span> chunks
+          </span>
+
+          {/* Indexed Date */}
+          {(entry.updated_at || entry.created_at) && (
+            <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
+              <Clock className="w-3.5 h-3.5" />
+              {formatRelativeTime(entry.updated_at || entry.created_at)}
+            </span>
+          )}
+        </div>
+
+        {/* Main Content */}
+        <div className="p-6">
+          <div className="flex flex-col lg:flex-row lg:items-start gap-6">
+            {/* Title & Tags */}
+            <div className="flex-1 min-w-0">
+              <h1 className="text-3xl font-bold text-white mb-4 leading-tight">
+                {entry.title}
+              </h1>
+
+              {/* Tags */}
+              {entry.tags && entry.tags.length > 0 && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Tag className="w-4 h-4 text-slate-500 flex-shrink-0" />
+                  {entry.tags.map((tag) => (
+                    <Link
+                      key={tag}
+                      to={`/entries?tag=${encodeURIComponent(tag)}`}
+                      className="px-2.5 py-1 text-xs font-medium bg-slate-800 text-slate-300 rounded-md hover:bg-slate-700 hover:text-white transition-colors ring-1 ring-slate-700 hover:ring-slate-600"
+                    >
+                      {tag}
+                    </Link>
+                  ))}
+                </div>
+              )}
             </div>
-            {entry.source_path && (
-              <div>
+
+            {/* Actions */}
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {/* External Link */}
+              {entry.source_path && (
+                <a
+                  href={entry.source_path}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="p-2.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 transition-colors ring-1 ring-slate-700"
+                  title="Open source"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                </a>
+              )}
+
+              {/* Copy Button */}
+              <button
+                onClick={handleCopy}
+                className={clsx(
+                  'p-2.5 rounded-lg transition-all ring-1',
+                  copied
+                    ? 'bg-emerald-500/20 text-emerald-400 ring-emerald-500/30'
+                    : 'bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 ring-slate-700'
+                )}
+                title={copied ? 'Copied!' : 'Copy URL'}
+              >
+                <Copy className="w-4 h-4" />
+              </button>
+
+              {/* Re-index Button */}
+              {entry.source_path && (
                 <button
                   onClick={handleReindex}
                   disabled={isReindexing}
                   className={clsx(
-                    "inline-flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all",
+                    'inline-flex items-center gap-2 px-4 py-2.5 rounded-lg font-medium transition-all ring-1',
                     isReindexing
-                      ? "bg-slate-700 text-slate-400 cursor-not-allowed"
-                      : "bg-cyan-600 hover:bg-cyan-500 text-white"
+                      ? 'bg-slate-700 text-slate-400 cursor-not-allowed ring-slate-600'
+                      : 'bg-cyan-600 hover:bg-cyan-500 text-white ring-cyan-500 shadow-lg shadow-cyan-500/20'
                   )}
                 >
-                  <RefreshCw className={clsx("w-4 h-4", isReindexing && "animate-spin")} />
-                  {isReindexing ? 'Re-indexing...' : 'Re-index Entry'}
+                  <RefreshCw className={clsx('w-4 h-4', isReindexing && 'animate-spin')} />
+                  {isReindexing ? 'Re-indexing...' : 'Re-index'}
                 </button>
-                {reindexError && (
-                  <p className="text-red-400 text-sm mt-2">{reindexError}</p>
-                )}
-              </div>
-            )}
+              )}
+            </div>
           </div>
+
+          {/* Error Message */}
+          {reindexError && (
+            <p className="mt-4 text-sm text-red-400 bg-red-500/10 px-3 py-2 rounded-lg">
+              {reindexError}
+            </p>
+          )}
         </div>
       </div>
 
