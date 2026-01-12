@@ -577,14 +577,11 @@ async fn run_api(db_path: &str, port: u16) -> Result<()> {
     }
 
     // Create and start the job executor
-    // Clone state for cache invalidation callback
-    let state_for_callback = state.clone();
+    // Note: Cache invalidation callback removed - tables are refreshed before each search
     let executor_config = ExecutorConfig {
         db_path: db_path.to_string(),
         jobs_db_path: job_store.as_ref().map(|_| jobs_db_path.to_string_lossy().to_string()),
-        on_job_complete: Some(Arc::new(move || {
-            state_for_callback.invalidate_caches();
-        })),
+        on_job_complete: None,
         ..Default::default()
     };
 

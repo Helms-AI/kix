@@ -532,8 +532,7 @@ async fn delete_all_data(
     })?;
     drop(store);
 
-    // Invalidate all caches since data has changed
-    state.app_state.invalidate_caches();
+    // Note: No cache invalidation needed - tables are refreshed before each search
 
     info!(
         documents = doc_count,
@@ -622,8 +621,7 @@ async fn reindex_entry(
         }
     }
 
-    // Invalidate caches
-    state.app_state.invalidate_caches();
+    // Note: No cache invalidation needed - tables are refreshed before each search
 
     // Create a new URL indexing job with browser rendering
     let mut config = JobConfig::default();
@@ -745,8 +743,7 @@ async fn reindex_by_domain(
         }
     }
 
-    // Invalidate caches
-    state.app_state.invalidate_caches();
+    // Note: No cache invalidation needed - tables are refreshed before each search
 
     info!(
         domain = %request.domain,

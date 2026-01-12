@@ -26,8 +26,6 @@ chrono = { version = "0.4", features = ["serde"] }
 url = { workspace = true }
 futures-util = { workspace = true }
 base64 = "0.22"
-moka = { workspace = true }
-sha2 = { workspace = true }
 
 [dev-dependencies]
 axum-test = "16"

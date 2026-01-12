@@ -142,13 +142,14 @@ pub fn admin_routes() -> Router<AppState> {
 }
 
 /// POST /api/admin/cache/invalidate
-pub async fn invalidate_caches(State(state): State<AppState>) -> impl IntoResponse {
-    info!("Admin: Invalidating all caches");
-    state.invalidate_caches();
+/// Note: Caching has been removed for real-time data availability.
+/// This endpoint is kept for backwards compatibility but is now a no-op.
+pub async fn invalidate_caches(State(_state): State<AppState>) -> impl IntoResponse {
+    info!("Admin: Cache invalidation requested (no-op - caching disabled for real-time data)");
 
     Json(OperationResponse {
         status: "ok".to_string(),
-        message: "All caches invalidated successfully".to_string(),
+        message: "Cache invalidation is no longer needed - data is always fresh (tables refreshed before each search)".to_string(),
         affected_items: None,
     })
 }

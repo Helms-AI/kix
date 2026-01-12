@@ -165,6 +165,9 @@ impl KixStore {
         limit: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<SearchResult>, StoreError> {
+        // Refresh tables to see the latest data written by other processes
+        self.refresh_tables().await?;
+
         let table = self
             .chunks_table()
             .ok_or_else(|| StoreError::Database("Chunks table not initialized".to_string()))?;
@@ -209,6 +212,9 @@ impl KixStore {
         limit: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<SearchResult>, StoreError> {
+        // Refresh tables to see the latest data written by other processes
+        self.refresh_tables().await?;
+
         let table = self
             .chunks_table()
             .ok_or_else(|| StoreError::Database("Chunks table not initialized".to_string()))?;
@@ -251,6 +257,9 @@ impl KixStore {
         limit: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<SearchResult>, StoreError> {
+        // Refresh tables to see the latest data written by other processes
+        self.refresh_tables().await?;
+
         let table = self
             .chunks_table()
             .ok_or_else(|| StoreError::Database("Chunks table not initialized".to_string()))?;

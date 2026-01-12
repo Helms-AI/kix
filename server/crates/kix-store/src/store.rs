@@ -104,6 +104,36 @@ impl KixStore {
         Ok(())
     }
 
+    /// Refresh all table handles to see the latest data.
+    ///
+    /// LanceDB uses immutable versioning - table handles opened at one point
+    /// don't automatically see data written by other processes. This method
+    /// calls `checkout_latest()` on all tables to refresh to the current version.
+    ///
+    /// Call this before searches if data may have been written by other processes
+    /// (e.g., by the JobExecutor or MCP server).
+    pub async fn refresh_tables(&self) -> Result<(), StoreError> {
+        if let Some(ref table) = self.entries_table {
+            table
+                .checkout_latest()
+                .await
+                .map_err(|e| StoreError::Database(format!("Failed to refresh entries table: {}", e)))?;
+        }
+        if let Some(ref table) = self.chunks_table {
+            table
+                .checkout_latest()
+                .await
+                .map_err(|e| StoreError::Database(format!("Failed to refresh chunks table: {}", e)))?;
+        }
+        if let Some(ref table) = self.pages_table {
+            table
+                .checkout_latest()
+                .await
+                .map_err(|e| StoreError::Database(format!("Failed to refresh pages table: {}", e)))?;
+        }
+        Ok(())
+    }
+
     /// Gets or creates the entries table.
     async fn get_or_create_entries_table(&self) -> Result<Table, StoreError> {
         let table_names = self

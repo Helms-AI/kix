@@ -1,4 +1,7 @@
 //! API route definitions for the EIP Knowledge System dashboard.
+//!
+//! NOTE: Caching has been intentionally removed to ensure real-time data availability.
+//! LanceDB table handles are refreshed before each search operation to see the latest data.
 
 use axum::{
     extract::{Path, Query, State},
@@ -7,76 +10,32 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use moka::future::Cache;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, info, error};
+use tracing::{info, error};
 
 use kix_embeddings::EmbeddingGenerator;
 use kix_store::search::{PatternSummary, SearchFilters, SearchResult, EntryChunk};
 use kix_store::KixStore;
 
-/// Cache configuration constants
-const SEARCH_CACHE_MAX_CAPACITY: u64 = 1000;  // Max cached search results
-const SEARCH_CACHE_TTL_SECS: u64 = 30;        // 30 second TTL (reduced for better data freshness)
-const EMBEDDING_CACHE_MAX_CAPACITY: u64 = 500; // Max cached embeddings
-const EMBEDDING_CACHE_TTL_SECS: u64 = 600;    // 10 minute TTL for embeddings
-
-/// Cached search result (must be cloneable)
-#[derive(Clone)]
-struct CachedSearchResult {
-    results: Vec<SearchResult>,
-}
-
-/// Cached embedding vector
-#[derive(Clone)]
-struct CachedEmbedding {
-    vector: Vec<f32>,
-}
-
 /// Application state shared across all routes.
 /// Uses RwLock for high-concurrency read access - most API operations are reads.
-/// Includes query caches for improved performance.
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<RwLock<KixStore>>,
     embedder: Arc<RwLock<EmbeddingGenerator>>,
-    /// Cache for search results (key: hash of query+filters)
-    search_cache: Cache<String, CachedSearchResult>,
-    /// Cache for query embeddings (key: query text hash)
-    embedding_cache: Cache<String, CachedEmbedding>,
 }
 
 impl AppState {
-    /// Create a new application state with caching enabled.
+    /// Create a new application state.
     pub fn new(store: KixStore, embedder: EmbeddingGenerator) -> Self {
-        // Build search cache with TTL and max capacity
-        let search_cache: Cache<String, CachedSearchResult> = Cache::builder()
-            .max_capacity(SEARCH_CACHE_MAX_CAPACITY)
-            .time_to_live(Duration::from_secs(SEARCH_CACHE_TTL_SECS))
-            .build();
-
-        // Build embedding cache with TTL and max capacity
-        let embedding_cache: Cache<String, CachedEmbedding> = Cache::builder()
-            .max_capacity(EMBEDDING_CACHE_MAX_CAPACITY)
-            .time_to_live(Duration::from_secs(EMBEDDING_CACHE_TTL_SECS))
-            .build();
-
-        info!(
-            "Initialized API caches: search_cache(max={}, ttl={}s), embedding_cache(max={}, ttl={}s)",
-            SEARCH_CACHE_MAX_CAPACITY, SEARCH_CACHE_TTL_SECS,
-            EMBEDDING_CACHE_MAX_CAPACITY, EMBEDDING_CACHE_TTL_SECS
-        );
+        info!("Initialized API state (no caching - real-time data mode)");
 
         Self {
             store: Arc::new(RwLock::new(store)),
             embedder: Arc::new(RwLock::new(embedder)),
-            search_cache,
-            embedding_cache,
         }
     }
 
@@ -84,31 +43,6 @@ impl AppState {
     pub fn store(&self) -> &Arc<RwLock<KixStore>> {
         &self.store
     }
-
-    /// Invalidate all caches (call after data changes).
-    pub fn invalidate_caches(&self) {
-        self.search_cache.invalidate_all();
-        self.embedding_cache.invalidate_all();
-        info!("All caches invalidated");
-    }
-}
-
-/// Generate a cache key from query parameters.
-fn cache_key(query: &str, filters: &SearchFilters, limit: usize) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(query.as_bytes());
-    hasher.update(filters.entry_type.as_deref().unwrap_or("").as_bytes());
-    hasher.update(filters.chunk_type.as_deref().unwrap_or("").as_bytes());
-    hasher.update(filters.tag.as_deref().unwrap_or("").as_bytes());
-    hasher.update(limit.to_le_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-/// Generate an embedding cache key from query text.
-fn embedding_cache_key(query: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(query.as_bytes());
-    format!("emb_{:x}", hasher.finalize())
 }
 
 /// Create the API router with all routes.
@@ -610,7 +544,7 @@ async fn list_categories(
     Ok(Json(CategoriesResponse { categories }))
 }
 
-/// GET /api/search - Search entries with caching.
+/// GET /api/search - Search entries (real-time, no caching).
 async fn search_entries(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -623,50 +557,17 @@ async fn search_entries(
         source_domain: query.source_domain.clone(),
     };
 
-    // Generate cache key for the full search
-    let search_key = cache_key(&query.q, &filters, limit);
+    info!("Executing real-time search for: {}", query.q);
 
-    // Check search cache first
-    if let Some(cached) = state.search_cache.get(&search_key).await {
-        debug!("Search cache hit for query: {}", query.q);
-        let total = cached.results.len();
-        let results: Vec<SearchResultResponse> = cached
-            .results
-            .into_iter()
-            .map(SearchResultResponse::from)
-            .collect();
-        return Ok(Json(SearchResponse {
-            results,
-            total,
-            query: query.q,
-        }));
-    }
+    // Generate embedding for the query
+    let mut embedder = state.embedder.write().await;
+    let embedding = embedder.embed_query(&query.q).map_err(|e| {
+        error!("Failed to generate embedding for search query: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    drop(embedder);
 
-    info!("Search cache miss, executing search for: {}", query.q);
-
-    // Check embedding cache or generate new embedding
-    let emb_key = embedding_cache_key(&query.q);
-    let embedding = if let Some(cached_emb) = state.embedding_cache.get(&emb_key).await {
-        debug!("Embedding cache hit for query: {}", query.q);
-        cached_emb.vector
-    } else {
-        // Generate embedding and cache it
-        let mut embedder = state.embedder.write().await;
-        let vec = embedder.embed_query(&query.q).map_err(|e| {
-            error!("Failed to generate embedding for search query: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        drop(embedder); // Release lock before caching
-
-        // Cache the embedding
-        state
-            .embedding_cache
-            .insert(emb_key, CachedEmbedding { vector: vec.clone() })
-            .await;
-        vec
-    };
-
-    // Perform hybrid search
+    // Perform hybrid search (tables are refreshed internally to see latest data)
     let store = state.store.read().await;
     let results = store
         .hybrid_search(&query.q, &embedding, limit, &filters)
@@ -675,13 +576,6 @@ async fn search_entries(
             error!("Hybrid search failed: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    drop(store); // Release lock before caching
-
-    // Cache the search results
-    state
-        .search_cache
-        .insert(search_key, CachedSearchResult { results: results.clone() })
-        .await;
 
     let total = results.len();
     let results: Vec<SearchResultResponse> =
