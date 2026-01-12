@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation, Navigate, useParams } from 'react-router-dom';
-import { LayoutDashboard, Grid, BookOpen, Network, Menu, X, Zap, Settings } from 'lucide-react';
+import { LayoutDashboard, Grid, BookOpen, Network, Menu, X, Zap, Settings, Plug2 } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
 
@@ -9,6 +9,7 @@ import EntryDetail from './pages/EntryDetail';
 import EntryGraph from './pages/EntryGraph';
 import IndexingDashboard from './pages/IndexingDashboard';
 import AdminPage from './pages/AdminPage';
+import MCPDocs from './pages/MCPDocs';
 
 // Redirect component for /patterns/:id to /entries/:id
 function PatternRedirect() {
@@ -21,6 +22,7 @@ const navigation = [
   { name: 'Indexing', href: '/indexing', icon: Zap },
   { name: 'Entries', href: '/entries', icon: Grid },
   { name: 'Graph', href: '/graph', icon: Network },
+  { name: 'MCP', href: '/mcp', icon: Plug2 },
 ];
 
 function Sidebar() {
@@ -140,6 +142,7 @@ function AppContent() {
               <Route path="/patterns/:id" element={<PatternRedirect />} />
               <Route path="/search" element={<Navigate to="/entries" replace />} />
               <Route path="/graph" element={<EntryGraph />} />
+              <Route path="/mcp" element={<MCPDocs />} />
             </Routes>
           </div>
         )}
