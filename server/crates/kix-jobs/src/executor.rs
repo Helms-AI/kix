@@ -628,7 +628,13 @@ impl JobExecutor {
 
                     if let Some(ref p) = proc {
                         // Use raw URL for content processing with two-layer storage
-                        match p.process_html_with_page(&result.content, &raw_url, Some(result.fetch_time_ms)).await {
+                        // Pass title from structured_content (extracted by ContentExtractor)
+                        let title = if result.structured_content.title.is_empty() {
+                            None
+                        } else {
+                            Some(result.structured_content.title.clone())
+                        };
+                        match p.process_html_with_page(&result.content, &raw_url, Some(result.fetch_time_ms), title).await {
                             Ok(res) => PageResult {
                                 url: display_url,
                                 chunks: res.chunks_created,

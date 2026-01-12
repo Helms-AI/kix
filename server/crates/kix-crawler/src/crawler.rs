@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use htmd::HtmlToMarkdown;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 
+use crate::extractor::{ContentExtractor, ExtractedContent};
 use crate::frontier::{CrawlFrontier, CrawlTask, FrontierStats};
 use crate::rate_limiter::DomainRateLimiter;
 use crate::robots::RobotsChecker;
@@ -73,51 +73,16 @@ impl Default for CrawlerConfig {
     }
 }
 
-/// A code block extracted from HTML content
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CodeBlock {
-    /// Programming language (if detected from class)
-    pub language: Option<String>,
-    /// The code content
-    pub content: String,
-    /// Number of lines
-    pub line_count: usize,
-}
-
-/// A header extracted from HTML content
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ExtractedHeader {
-    /// Header level (1-6)
-    pub level: u8,
-    /// Header text
-    pub text: String,
-}
-
-/// Structured content extracted from HTML
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ExtractedContent {
-    /// Content converted to markdown (preserves structure)
-    pub markdown: String,
-    /// Extracted code blocks (preserved separately for special chunking)
-    pub code_blocks: Vec<CodeBlock>,
-    /// Extracted headers for hierarchy
-    pub headers: Vec<ExtractedHeader>,
-    /// Plain text for fallback/embedding
-    pub plain_text: String,
-}
-
 /// Result of crawling a single page
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct CrawlResult {
     /// The URL that was crawled
     pub url: Url,
     /// HTTP status code
     pub status: u16,
-    /// Page title
-    pub title: Option<String>,
-    /// Extracted text content (plain text, for backward compatibility)
+    /// Extracted markdown content
     pub content: String,
-    /// Structured content with preserved markdown, code blocks, headers
+    /// Structured content from ContentExtractor (includes title, description, code blocks, etc.)
     pub structured_content: ExtractedContent,
     /// Links found on the page
     pub links: Vec<Url>,
@@ -140,6 +105,8 @@ pub struct Crawler {
     robots_checker: Arc<RobotsChecker>,
     semaphore: Arc<Semaphore>,
     cancellation: CancellationToken,
+    /// Content extractor for HTML processing (uses Mozilla Readability)
+    extractor: ContentExtractor,
     /// Browser pool for JavaScript rendering (per-job, created fresh for each crawler)
     #[cfg(feature = "browser")]
     browser_pool: Option<Arc<BrowserPool>>,
@@ -203,6 +170,7 @@ impl Crawler {
             robots_checker,
             semaphore,
             cancellation: CancellationToken::new(),
+            extractor: ContentExtractor::default(),
             #[cfg(feature = "browser")]
             browser_pool,
         })
@@ -526,16 +494,8 @@ impl Crawler {
             ))
         })?;
 
-        // Parse rendered HTML
+        // Parse rendered HTML for link extraction
         let document = Html::parse_document(&render_result.html);
-
-        // Extract title from rendered content
-        let title_selector = Selector::parse("title").unwrap();
-        let title = document
-            .select(&title_selector)
-            .next()
-            .map(|el| el.text().collect::<String>().trim().to_string())
-            .or(render_result.title);
 
         // Extract links
         let link_selector = Selector::parse("a[href]").unwrap();
@@ -546,22 +506,22 @@ impl Crawler {
             .filter(|u| u.scheme() == "http" || u.scheme() == "https")
             .collect();
 
-        // Extract structured content from RENDERED HTML
-        let structured_content = extract_structured_content(&render_result.html, &document);
-        let content = structured_content.plain_text.clone();
+        // Extract structured content using ContentExtractor (includes title, description, etc.)
+        let structured_content = self.extractor.extract(&render_result.html, &render_result.url);
+        let content = structured_content.markdown.clone();
         let source_domain = url.domain().map(|d| d.to_string());
 
         info!(
             url = %url,
             render_time_ms = render_result.render_time_ms,
             content_len = content.len(),
+            title = %structured_content.title,
             "Page rendered with browser"
         );
 
         Ok(CrawlResult {
             url: render_result.url,
             status: 200,
-            title,
             content,
             structured_content,
             links,
@@ -594,9 +554,8 @@ impl Crawler {
             return Ok(CrawlResult {
                 url: url.clone(),
                 status,
-                title: None,
                 content: String::new(),
-                structured_content: ExtractedContent::default(),
+                structured_content: ExtractedContent::empty(),
                 links: vec![],
                 content_type,
                 size: 0,
@@ -608,15 +567,8 @@ impl Crawler {
         let body = response.text().await?;
         let size = body.len();
 
-        // Parse HTML
+        // Parse HTML for link extraction
         let document = Html::parse_document(&body);
-
-        // Extract title
-        let title_selector = Selector::parse("title").unwrap();
-        let title = document
-            .select(&title_selector)
-            .next()
-            .map(|el| el.text().collect::<String>().trim().to_string());
 
         // Extract links
         let link_selector = Selector::parse("a[href]").unwrap();
@@ -627,16 +579,13 @@ impl Crawler {
             .filter(|u| u.scheme() == "http" || u.scheme() == "https")
             .collect();
 
-        // Extract structured content (markdown, code blocks, headers)
-        let structured_content = extract_structured_content(&body, &document);
-
-        // Keep plain text for backward compatibility
-        let content = structured_content.plain_text.clone();
+        // Extract structured content using ContentExtractor (includes title, description, etc.)
+        let structured_content = self.extractor.extract(&body, url);
+        let content = structured_content.markdown.clone();
 
         Ok(CrawlResult {
             url: url.clone(),
             status,
-            title,
             content,
             structured_content,
             links,
@@ -678,175 +627,6 @@ impl Crawler {
     pub async fn stats(&self) -> crate::frontier::FrontierStats {
         self.frontier.stats().await
     }
-}
-
-/// Extract structured content from HTML including markdown, code blocks, and headers
-fn extract_structured_content(html: &str, document: &Html) -> ExtractedContent {
-    // Convert HTML to markdown using htmd
-    let converter = HtmlToMarkdown::new();
-    let markdown = converter.convert(html).unwrap_or_default();
-
-    // Extract code blocks
-    let code_blocks = extract_code_blocks(document);
-
-    // Extract headers
-    let headers = extract_headers(document);
-
-    // Extract plain text for embeddings (fallback)
-    let plain_text = extract_plain_text(document);
-
-    ExtractedContent {
-        markdown,
-        code_blocks,
-        headers,
-        plain_text,
-    }
-}
-
-/// Extract code blocks from HTML (pre, code elements)
-fn extract_code_blocks(document: &Html) -> Vec<CodeBlock> {
-    let mut blocks = Vec::new();
-
-    // Match <pre><code> and standalone <pre> elements
-    let pre_selector = Selector::parse("pre").unwrap();
-    let code_selector = Selector::parse("code").unwrap();
-
-    for pre in document.select(&pre_selector) {
-        // Check if there's a nested code element
-        let (content, language) = if let Some(code_el) = pre.select(&code_selector).next() {
-            let content = code_el.text().collect::<String>();
-            let language = extract_language_from_class(code_el.value());
-            (content, language)
-        } else {
-            let content = pre.text().collect::<String>();
-            let language = extract_language_from_class(pre.value());
-            (content, language)
-        };
-
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            let line_count = trimmed.lines().count();
-            blocks.push(CodeBlock {
-                language,
-                content: trimmed.to_string(),
-                line_count,
-            });
-        }
-    }
-
-    // Also match standalone code elements (inline code, but significant ones)
-    for code in document.select(&code_selector) {
-        // Skip if already captured inside a pre
-        if code.parent().and_then(|p| p.value().as_element()).map(|e| e.name() == "pre").unwrap_or(false) {
-            continue;
-        }
-
-        let content = code.text().collect::<String>();
-        let trimmed = content.trim();
-
-        // Only capture multi-line code or significant code blocks
-        if trimmed.lines().count() > 1 || trimmed.len() > 100 {
-            let language = extract_language_from_class(code.value());
-            blocks.push(CodeBlock {
-                language,
-                content: trimmed.to_string(),
-                line_count: trimmed.lines().count(),
-            });
-        }
-    }
-
-    blocks
-}
-
-/// Extract language hint from class attribute (e.g., "language-rust", "lang-python", "rust")
-fn extract_language_from_class(element: &scraper::node::Element) -> Option<String> {
-    let class = element.attr("class")?;
-
-    // Common patterns: "language-X", "lang-X", just "X"
-    for part in class.split_whitespace() {
-        if let Some(lang) = part.strip_prefix("language-") {
-            return Some(lang.to_string());
-        }
-        if let Some(lang) = part.strip_prefix("lang-") {
-            return Some(lang.to_string());
-        }
-        // Check if it's a known language name directly
-        let known_langs = [
-            "rust", "python", "javascript", "typescript", "java", "go", "c", "cpp",
-            "csharp", "ruby", "php", "swift", "kotlin", "scala", "bash", "shell",
-            "sql", "html", "css", "json", "yaml", "toml", "xml", "markdown",
-        ];
-        if known_langs.contains(&part.to_lowercase().as_str()) {
-            return Some(part.to_lowercase());
-        }
-    }
-
-    None
-}
-
-/// Extract headers from HTML (h1-h6) in DOM order
-fn extract_headers(document: &Html) -> Vec<ExtractedHeader> {
-    let mut headers = Vec::new();
-    let body_selector = Selector::parse("body").unwrap();
-
-    if let Some(body) = document.select(&body_selector).next() {
-        // Traverse DOM in document order to preserve visual reading order
-        for node in body.descendants() {
-            if let Some(el) = node.value().as_element() {
-                let name = el.name();
-                // Check if it's a header element (h1-h6)
-                let level = match name {
-                    "h1" => Some(1u8),
-                    "h2" => Some(2u8),
-                    "h3" => Some(3u8),
-                    "h4" => Some(4u8),
-                    "h5" => Some(5u8),
-                    "h6" => Some(6u8),
-                    _ => None,
-                };
-
-                if let Some(level) = level {
-                    if let Some(el_ref) = scraper::ElementRef::wrap(node) {
-                        let text = el_ref.text().collect::<String>().trim().to_string();
-                        if !text.is_empty() {
-                            headers.push(ExtractedHeader { level, text });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    headers
-}
-
-/// Extract plain text from HTML (for embeddings)
-fn extract_plain_text(document: &Html) -> String {
-    let body_selector = Selector::parse("body").unwrap();
-    let skip_selector = Selector::parse("script, style, nav, footer, header, noscript").unwrap();
-
-    let mut text = String::new();
-
-    if let Some(body) = document.select(&body_selector).next() {
-        for node in body.descendants() {
-            if let Some(_el) = node.value().as_element() {
-                // Skip certain elements
-                if skip_selector.matches(&scraper::ElementRef::wrap(node).unwrap()) {
-                    continue;
-                }
-            }
-
-            if let Some(t) = node.value().as_text() {
-                let trimmed = t.trim();
-                if !trimmed.is_empty() {
-                    text.push_str(trimmed);
-                    text.push(' ');
-                }
-            }
-        }
-    }
-
-    text.trim().to_string()
 }
 
 /// Crawl statistics

@@ -175,7 +175,7 @@ async fn test_two_layer_storage() {
 
     // Process HTML with two-layer storage
     let result = processor
-        .process_html_with_page(SAMPLE_HTML, "https://example.com/patterns/message-queue", Some(150))
+        .process_html_with_page(SAMPLE_HTML, "https://example.com/patterns/message-queue", Some(150), None)
         .await
         .expect("Failed to process HTML with page");
 
@@ -206,7 +206,7 @@ async fn test_page_context_retrieval() {
 
     // Process HTML with two-layer storage
     let result = processor
-        .process_html_with_page(SAMPLE_HTML, "https://example.com/patterns/message-queue", None)
+        .process_html_with_page(SAMPLE_HTML, "https://example.com/patterns/message-queue", None, None)
         .await
         .expect("Failed to process HTML with page");
 
@@ -335,7 +335,7 @@ async fn test_code_block_preservation() {
 
     // Process HTML with code blocks
     let result = processor
-        .process_html_with_page(SAMPLE_HTML, "https://example.com/patterns/message-queue", None)
+        .process_html_with_page(SAMPLE_HTML, "https://example.com/patterns/message-queue", None, None)
         .await
         .expect("Failed to process HTML");
 

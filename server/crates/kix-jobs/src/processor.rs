@@ -752,11 +752,15 @@ impl ContentProcessor {
     ///
     /// Use this for crawled pages where full context is valuable for RAG.
     /// Uses ContentExtractor (source of truth) for all HTML processing.
+    ///
+    /// If `title` is provided, it will be used instead of re-extracting from content.
+    /// This is useful when the crawler has already extracted the title from raw HTML.
     pub async fn process_html_with_page(
         &self,
         content: &str,
         source_url: &str,
         crawl_time_ms: Option<u64>,
+        title: Option<String>,
     ) -> Result<TwoLayerResult, JobError> {
         debug!(url = source_url, "Processing HTML with two-layer storage using ContentExtractor");
 
@@ -765,7 +769,14 @@ impl ContentProcessor {
             .unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
 
         // Use content extraction (source of truth, never fails)
-        let extracted = self.content_extractor.extract(content, &url);
+        let mut extracted = self.content_extractor.extract(content, &url);
+
+        // Use provided title if available (crawler already extracted it from raw HTML)
+        if let Some(t) = title {
+            if !t.is_empty() {
+                extracted.title = t;
+            }
+        }
 
         debug!(
             url = source_url,
