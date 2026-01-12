@@ -488,6 +488,83 @@ impl ContentProcessor {
         self.process_document(document).await
     }
 
+    /// Process a file with two-layer storage pattern.
+    ///
+    /// This method:
+    /// 1. Stores the full page content in the pages table (for RAG context)
+    /// 2. Stores chunks with page_id FK (for vector search)
+    ///
+    /// Use this for uploaded files where full context is valuable for RAG.
+    pub async fn process_file_with_page(
+        &self,
+        file_path: &Path,
+        original_name: &str,
+    ) -> Result<TwoLayerResult, JobError> {
+        debug!(path = ?file_path, name = original_name, "Processing file with two-layer storage");
+
+        let extension = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        // Read file content
+        let content = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| JobError::Processing(format!("Failed to read file: {}", e)))?;
+
+        // Process based on file type and get both entry and markdown content
+        let (document, markdown_content) = match extension.as_str() {
+            "html" | "htm" => {
+                let text = String::from_utf8_lossy(&content);
+                let url = url::Url::parse(&format!("file://{}", original_name))
+                    .unwrap_or_else(|_| url::Url::parse("file:///unknown").unwrap());
+                let extracted = self.content_extractor.extract(&text, &url);
+                let entry = self.create_entry_from_extracted(&extracted, original_name)?;
+                (entry, extracted.markdown)
+            }
+            "pdf" => {
+                let entry = self.pdf_parser
+                    .parse(file_path.to_str().unwrap_or(""))
+                    .map_err(|e| JobError::Processing(format!("Failed to parse PDF: {}", e)))?;
+                let markdown = entry.content.clone();
+                (entry, markdown)
+            }
+            "txt" | "md" | "markdown" => {
+                let text = String::from_utf8_lossy(&content).to_string();
+                let entry = self.create_text_document(&text, original_name, file_path)?;
+                (entry, text)
+            }
+            "json" => {
+                let text = String::from_utf8_lossy(&content).to_string();
+                let entry = self.create_text_document(&text, original_name, file_path)?;
+                (entry, text)
+            }
+            _ => {
+                // Try to process as text
+                if let Ok(text) = String::from_utf8(content.clone()) {
+                    let entry = self.create_text_document(&text, original_name, file_path)?;
+                    (entry, text)
+                } else {
+                    return Err(JobError::Processing(format!(
+                        "Unsupported file type: {}",
+                        extension
+                    )));
+                }
+            }
+        };
+
+        let entry_id = document.id.clone();
+        let source_url = format!("file://{}", original_name);
+
+        // Create page record for full content storage
+        let page = PageRecord::new(&entry_id, &source_url, &markdown_content)
+            .with_title(document.title.clone());
+
+        // Process with two-layer storage
+        self.process_document_with_page(document, &markdown_content, page).await
+    }
+
     /// Create a simple text document
     fn create_text_document(
         &self,

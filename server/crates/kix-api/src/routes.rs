@@ -22,7 +22,7 @@ use kix_store::KixStore;
 
 /// Cache configuration constants
 const SEARCH_CACHE_MAX_CAPACITY: u64 = 1000;  // Max cached search results
-const SEARCH_CACHE_TTL_SECS: u64 = 300;       // 5 minute TTL
+const SEARCH_CACHE_TTL_SECS: u64 = 30;        // 30 second TTL (reduced for better data freshness)
 const EMBEDDING_CACHE_MAX_CAPACITY: u64 = 500; // Max cached embeddings
 const EMBEDDING_CACHE_TTL_SECS: u64 = 600;    // 10 minute TTL for embeddings
 
@@ -128,6 +128,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/search", get(search_entries))
         .route("/api/graph", get(get_entry_graph))
         .route("/api/health", get(health_check))
+        // Admin routes are now nested under /api/admin
+        .nest("/api/admin", crate::admin::admin_routes())
         .layer(cors)
         .with_state(state)
 }
@@ -751,6 +753,8 @@ async fn get_entry_graph(
 
     Ok(Json(PatternGraphResponse { nodes, edges }))
 }
+
+// Admin endpoints are now in the admin module
 
 #[cfg(test)]
 mod tests {

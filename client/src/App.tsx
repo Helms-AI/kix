@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation, Navigate, useParams } from 'react-router-dom';
-import { LayoutDashboard, Grid, BookOpen, Network, Menu, X, Zap } from 'lucide-react';
+import { LayoutDashboard, Grid, BookOpen, Network, Menu, X, Zap, Settings } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
 
@@ -8,6 +8,7 @@ import EntryBrowser from './pages/EntryBrowser';
 import EntryDetail from './pages/EntryDetail';
 import EntryGraph from './pages/EntryGraph';
 import IndexingDashboard from './pages/IndexingDashboard';
+import AdminPage from './pages/AdminPage';
 
 // Redirect component for /patterns/:id to /entries/:id
 function PatternRedirect() {
@@ -77,6 +78,21 @@ function Sidebar() {
             })}
           </nav>
 
+          {/* Administration Link */}
+          <nav className="mt-auto pt-4 pb-2 px-4 border-t border-slate-800">
+            <NavLink
+              to="/admin"
+              onClick={() => setMobileOpen(false)}
+              className={(isActive) => clsx(
+                'nav-link',
+                isActive && 'nav-link-active'
+              )}
+            >
+              <Settings className="w-5 h-5" />
+              <span className="font-medium">Administration</span>
+            </NavLink>
+          </nav>
+
           {/* Footer */}
           <div className="px-6 py-4 border-t border-slate-800">
             <p className="text-xs text-slate-500 font-mono">
@@ -100,12 +116,19 @@ function Sidebar() {
   );
 }
 
-function App() {
+function AppContent() {
+  const location = useLocation();
+  const isAdminPage = location.pathname.startsWith('/admin');
+
   return (
-    <BrowserRouter>
-      <div className="min-h-screen">
-        <Sidebar />
-        <main className="lg:ml-64 min-h-screen">
+    <div className="min-h-screen">
+      <Sidebar />
+      <main className="lg:ml-64 min-h-screen">
+        {isAdminPage ? (
+          <Routes>
+            <Route path="/admin/*" element={<AdminPage />} />
+          </Routes>
+        ) : (
           <div className="container mx-auto px-4 py-8 lg:px-8">
             <Routes>
               <Route path="/" element={<Dashboard />} />
@@ -119,8 +142,16 @@ function App() {
               <Route path="/graph" element={<EntryGraph />} />
             </Routes>
           </div>
-        </main>
-      </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <BrowserRouter>
+      <AppContent />
     </BrowserRouter>
   );
 }

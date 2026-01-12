@@ -51,8 +51,11 @@ fn normalize_url_for_display(url: &Url) -> String {
     result
 }
 
+/// Type alias for cache invalidation callback
+pub type CacheInvalidationCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Configuration for job executor
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ExecutorConfig {
     /// Maximum concurrent jobs
     pub max_concurrent: usize,
@@ -66,6 +69,8 @@ pub struct ExecutorConfig {
     pub jobs_db_path: Option<String>,
     /// Content processor configuration
     pub processor_config: ProcessorConfig,
+    /// Optional callback invoked when a job completes (for cache invalidation)
+    pub on_job_complete: Option<CacheInvalidationCallback>,
 }
 
 impl Default for ExecutorConfig {
@@ -77,6 +82,7 @@ impl Default for ExecutorConfig {
             db_path: "./data/eip.lance".to_string(),
             jobs_db_path: Some("./data/lancedb/jobs.lance".to_string()),
             processor_config: ProcessorConfig::default(),
+            on_job_complete: None,
         }
     }
 }
@@ -104,6 +110,8 @@ pub struct JobExecutor {
     processor: Option<Arc<ContentProcessor>>,
     /// Job history store (optional - for persisting completed jobs)
     job_store: Option<Arc<JobStore>>,
+    /// Callback invoked when a job completes (for cache invalidation)
+    on_job_complete: Option<CacheInvalidationCallback>,
 }
 
 impl JobExecutor {
@@ -140,6 +148,8 @@ impl JobExecutor {
             None
         };
 
+        let on_job_complete = config.on_job_complete.clone();
+
         Ok(Self {
             queue,
             sse_manager,
@@ -149,6 +159,7 @@ impl JobExecutor {
             workers: Vec::new(),
             processor: Some(Arc::new(processor)),
             job_store,
+            on_job_complete,
         })
     }
 
@@ -159,6 +170,7 @@ impl JobExecutor {
         config: ExecutorConfig,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
+        let on_job_complete = config.on_job_complete.clone();
 
         Self {
             queue,
@@ -169,6 +181,7 @@ impl JobExecutor {
             workers: Vec::new(),
             processor: None,
             job_store: None,
+            on_job_complete,
         }
     }
 
@@ -188,9 +201,10 @@ impl JobExecutor {
             let shutdown = self.shutdown_token.clone();
             let processor = self.processor.clone();
             let job_store = self.job_store.clone();
+            let on_job_complete = self.on_job_complete.clone();
 
             let handle = tokio::spawn(async move {
-                Self::worker_loop(i, queue, sse_manager, semaphore, shutdown, processor, job_store).await;
+                Self::worker_loop(i, queue, sse_manager, semaphore, shutdown, processor, job_store, on_job_complete).await;
             });
 
             self.workers.push(handle);
@@ -206,6 +220,7 @@ impl JobExecutor {
         shutdown: CancellationToken,
         processor: Option<Arc<ContentProcessor>>,
         job_store: Option<Arc<JobStore>>,
+        on_job_complete: Option<CacheInvalidationCallback>,
     ) {
         info!(worker_id, "Worker started");
 
@@ -237,6 +252,12 @@ impl JobExecutor {
                                 }
                             }
                             queue.complete(job.id, result).await;
+
+                            // Invalidate caches after successful job completion
+                            if let Some(ref callback) = on_job_complete {
+                                callback();
+                                info!(job_id = %job.id, "Cache invalidation triggered after job completion");
+                            }
                         }
                         Err(e) => {
                             error!(worker_id, job_id = %job.id, error = %e, "Job failed");
@@ -597,8 +618,8 @@ impl JobExecutor {
                         .collect();
 
                     if let Some(ref p) = proc {
-                        // Use raw URL for content processing
-                        match p.process_html(&result.content, &raw_url).await {
+                        // Use raw URL for content processing with two-layer storage
+                        match p.process_html_with_page(&result.content, &raw_url, Some(result.fetch_time_ms)).await {
                             Ok(res) => PageResult {
                                 url: display_url,
                                 chunks: res.chunks_created,
@@ -822,7 +843,8 @@ impl JobExecutor {
 
                 async move {
                     if let Some(proc) = proc {
-                        match proc.process_file(&path, &name).await {
+                        // Use two-layer storage for file uploads
+                        match proc.process_file_with_page(&path, &name).await {
                             Ok(result) => FileResult {
                                 name,
                                 chunks: result.chunks_created,
