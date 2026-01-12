@@ -2,13 +2,18 @@
 
 use reqwest::Client as HttpClient;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolRequestParam, CallToolResult, Content, ListToolsResult,
+    PaginatedRequestParam, ServerCapabilities, ServerInfo,
+};
 use rmcp::schemars;
+use rmcp::service::RequestContext;
 use rmcp::tool;
 use rmcp::tool_router;
 use rmcp::ErrorData as McpError;
-use rmcp::ServerHandler;
+use rmcp::{RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1500,6 +1505,33 @@ impl ServerHandler for KixMcpServer {
             instructions: Some("Knowledge Indexer System - Search and explore indexed content using natural language.".into()),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
+        }
+    }
+
+    /// List all available tools from the tool router
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        async move {
+            let tools = self.tool_router.list_all();
+            Ok(ListToolsResult {
+                tools,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Route tool calls to the appropriate handler via the tool router
+    fn call_tool(
+        &self,
+        request: CallToolRequestParam,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        async move {
+            let tool_context = ToolCallContext::new(self, request, context);
+            self.tool_router.call(tool_context).await
         }
     }
 }

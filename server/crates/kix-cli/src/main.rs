@@ -9,9 +9,13 @@ use jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 use anyhow::{Context, Result};
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Json;
 use clap::{Parser, Subcommand};
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
+use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,8 +69,8 @@ enum Commands {
         #[arg(short, long, default_value = "3002")]
         port: u16,
 
-        /// Host to bind to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind to (defaults to localhost per MCP spec security requirements)
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
 
@@ -442,7 +446,14 @@ async fn run_serve_http(db_path: &str, host: &str, port: u16) -> Result<()> {
     );
 
     // Create Axum router with the MCP service at /mcp
-    let app = axum::Router::new().nest_service("/mcp", service);
+    // Add OAuth stub routes for clients that expect OAuth (returns "no auth required")
+    let app = axum::Router::new()
+        .route("/.well-known/oauth-authorization-server", get(oauth_metadata_handler))
+        .route("/.well-known/oauth-protected-resource", get(oauth_resource_handler))
+        .route("/oauth/register", axum::routing::post(oauth_register_handler))
+        .route("/oauth/authorize", get(oauth_authorize_handler))
+        .route("/oauth/token", axum::routing::post(oauth_token_handler))
+        .nest_service("/mcp", service);
 
     // Start HTTP server
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
@@ -841,4 +852,101 @@ fn create_entry_from_extracted(
     .with_entry_type(entry_type)
     .with_source_type(SourceType::Html)
     .with_slug(slug)
+}
+
+// =============================================================================
+// OAuth Stub Handlers - Allow MCP clients to connect without real authentication
+// =============================================================================
+
+/// OAuth Authorization Server Metadata (RFC 8414)
+/// Returns metadata indicating this server supports OAuth but doesn't require it
+async fn oauth_metadata_handler(
+    axum::extract::Host(host): axum::extract::Host,
+) -> impl IntoResponse {
+    let issuer = format!("http://{}", host);
+    Json(json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{}/oauth/authorize", issuer),
+        "token_endpoint": format!("{}/oauth/token", issuer),
+        "registration_endpoint": format!("{}/oauth/register", issuer),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "service_documentation": "https://github.com/anthropics/claude-code"
+    }))
+}
+
+/// OAuth Protected Resource Metadata
+async fn oauth_resource_handler(
+    axum::extract::Host(host): axum::extract::Host,
+) -> impl IntoResponse {
+    let issuer = format!("http://{}", host);
+    Json(json!({
+        "resource": format!("{}/mcp", issuer),
+        "authorization_servers": [issuer],
+        "bearer_methods_supported": ["header"]
+    }))
+}
+
+/// OAuth Dynamic Client Registration (RFC 7591)
+/// Returns a client_id for any registration request
+async fn oauth_register_handler(
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let client_name = payload
+        .get("client_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mcp-client");
+
+    // Generate a simple client_id based on the client name
+    let client_id = format!("kix-{}-{}", client_name, uuid::Uuid::new_v4().simple());
+
+    Json(json!({
+        "client_id": client_id,
+        "client_name": client_name,
+        "redirect_uris": payload.get("redirect_uris").cloned().unwrap_or(json!([])),
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
+    }))
+}
+
+/// OAuth Authorization Endpoint
+/// Redirects back to the client with an authorization code
+async fn oauth_authorize_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
+    let state = params.get("state").cloned().unwrap_or_default();
+
+    // Generate a dummy authorization code
+    let code = format!("kix-code-{}", uuid::Uuid::new_v4().simple());
+
+    // Build redirect URL with code
+    let redirect_url = if redirect_uri.contains('?') {
+        format!("{}&code={}&state={}", redirect_uri, code, state)
+    } else {
+        format!("{}?code={}&state={}", redirect_uri, code, state)
+    };
+
+    axum::response::Redirect::temporary(&redirect_url)
+}
+
+/// OAuth Token Endpoint
+/// Returns an access token for any valid-looking request
+async fn oauth_token_handler(
+    axum::extract::Form(params): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // Generate a dummy access token
+    let access_token = format!("kix-token-{}", uuid::Uuid::new_v4().simple());
+    let refresh_token = format!("kix-refresh-{}", uuid::Uuid::new_v4().simple());
+
+    Json(json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token": refresh_token,
+        "scope": params.get("scope").cloned().unwrap_or_else(|| "mcp".to_string())
+    }))
 }
