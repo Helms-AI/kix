@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation, Navigate, useParams } from 'react-router-dom';
-import { LayoutDashboard, Grid, BookOpen, Network, Menu, X, Zap, Settings, Plug2 } from 'lucide-react';
+import { LayoutDashboard, Grid, Network, Menu, X, Zap, Settings, Plug2 } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
 
@@ -10,6 +10,8 @@ import EntryGraph from './pages/EntryGraph';
 import IndexingDashboard from './pages/IndexingDashboard';
 import AdminPage from './pages/AdminPage';
 import MCPDocs from './pages/MCPDocs';
+import { Header } from './components/Header';
+import { Footer } from './components/Footer';
 
 // Redirect component for /patterns/:id to /entries/:id
 function PatternRedirect() {
@@ -31,33 +33,22 @@ function Sidebar() {
 
   return (
     <>
-      {/* Mobile menu button */}
+      {/* Mobile menu button - positioned within header area */}
       <button
-        className="lg:hidden fixed top-4 left-4 z-50 p-2 rounded-lg bg-slate-800 text-slate-400"
+        className="lg:hidden fixed top-[18px] left-4 z-[60] p-2 rounded-lg bg-slate-800/80 backdrop-blur text-slate-400 hover:text-white transition-colors"
         onClick={() => setMobileOpen(!mobileOpen)}
       >
         {mobileOpen ? <X size={24} /> : <Menu size={24} />}
       </button>
 
-      {/* Sidebar */}
+      {/* Sidebar - positioned between header and footer */}
       <aside
         className={clsx(
-          'fixed inset-y-0 left-0 z-40 w-64 bg-slate-900/95 backdrop-blur-lg border-r border-slate-800 transform transition-transform duration-300 lg:translate-x-0',
+          'fixed top-16 bottom-12 left-0 z-40 w-64 bg-slate-900/95 backdrop-blur-lg border-r border-slate-800 transform transition-transform duration-300 lg:translate-x-0',
           mobileOpen ? 'translate-x-0' : '-translate-x-full'
         )}
       >
         <div className="flex flex-col h-full">
-          {/* Logo */}
-          <div className="flex items-center gap-3 px-6 py-6 border-b border-slate-800">
-            <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-cyan-500 to-teal-500 flex items-center justify-center">
-              <BookOpen className="w-5 h-5 text-white" />
-            </div>
-            <div>
-              <h1 className="text-lg font-bold text-white">Kix</h1>
-              <p className="text-xs text-slate-500 font-mono">Knowledge Base</p>
-            </div>
-          </div>
-
           {/* Navigation */}
           <nav className="flex-1 px-4 py-6 space-y-1">
             {navigation.map((item) => {
@@ -81,7 +72,7 @@ function Sidebar() {
           </nav>
 
           {/* Administration Link */}
-          <nav className="mt-auto pt-4 pb-2 px-4 border-t border-slate-800">
+          <nav className="mt-auto pt-4 pb-4 px-4 border-t border-slate-800">
             <NavLink
               to="/admin"
               onClick={() => setMobileOpen(false)}
@@ -94,23 +85,13 @@ function Sidebar() {
               <span className="font-medium">Administration</span>
             </NavLink>
           </nav>
-
-          {/* Footer */}
-          <div className="px-6 py-4 border-t border-slate-800">
-            <p className="text-xs text-slate-500 font-mono">
-              Knowledge Indexing System
-            </p>
-            <p className="text-xs text-slate-600 mt-1">
-              v0.1.0
-            </p>
-          </div>
         </div>
       </aside>
 
-      {/* Mobile overlay */}
+      {/* Mobile overlay - positioned between header and footer */}
       {mobileOpen && (
         <div
-          className="fixed inset-0 z-30 bg-black/50 lg:hidden"
+          className="fixed top-16 bottom-12 inset-x-0 z-30 bg-black/50 lg:hidden"
           onClick={() => setMobileOpen(false)}
         />
       )}
@@ -123,15 +104,16 @@ function AppContent() {
   const isAdminPage = location.pathname.startsWith('/admin');
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen pt-16 pb-12">
+      <Header />
       <Sidebar />
-      <main className="lg:ml-64 min-h-screen">
+      <main className="lg:ml-64 min-h-[calc(100vh-64px-48px)]">
         {isAdminPage ? (
           <Routes>
             <Route path="/admin/*" element={<AdminPage />} />
           </Routes>
         ) : (
-          <div className="container mx-auto px-4 py-8 lg:px-8">
+          <div className="px-4 py-8 lg:px-8">
             <Routes>
               <Route path="/" element={<Dashboard />} />
               <Route path="/indexing" element={<IndexingDashboard />} />
@@ -148,6 +130,7 @@ function AppContent() {
           </div>
         )}
       </main>
+      <Footer />
     </div>
   );
 }
