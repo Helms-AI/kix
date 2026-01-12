@@ -566,8 +566,6 @@ impl JobExecutor {
             chunks: usize,
             embeddings: usize,
             error: Option<String>,
-            /// Links discovered from this page (for ItemDiscovered events)
-            discovered_links: Vec<(String, usize)>, // (url, depth)
         }
 
         // Convert receiver to stream for parallel processing
@@ -576,6 +574,8 @@ impl JobExecutor {
 
         // Reference SSE manager for use in processing closure
         let sse_for_processing = sse_manager;
+        // Clone emitted_urls for use in processing closure (to track discovered pages)
+        let emitted_urls_for_processing = emitted_urls.clone();
 
         // Process pages in PARALLEL using buffer_unordered (like file uploads)
         info!(url = url, max_pages = effective_max_pages, concurrency = concurrency, "Starting parallel crawl and process");
@@ -590,11 +590,31 @@ impl JobExecutor {
                 let proc = processor.cloned();
                 let sse = sse_for_processing;
                 let jid = job_id;
+                let emitted = emitted_urls_for_processing.clone();
                 async move {
                     // Keep raw URL for content processing (storage needs original URL)
                     let raw_url = result.url.to_string();
                     // Normalize URL for SSE events (must match ItemDiscovered format)
                     let display_url = normalize_url_for_display(&result.url);
+
+                    // Emit ItemDiscovered when page enters processing (only if not already emitted)
+                    // This ensures discovered count = processable pages (not all links found)
+                    {
+                        let mut emitted_set = emitted.lock().unwrap();
+                        if emitted_set.insert(display_url.clone()) {
+                            // New URL - emit ItemDiscovered
+                            let _ = sse.broadcast_to_job(
+                                jid,
+                                Event::new(EventType::ItemDiscovered {
+                                    job_id: jid,
+                                    item_path: display_url.clone(),
+                                    discovered_at: chrono::Utc::now(),
+                                    parent_url: None,
+                                    depth: 0, // We don't track depth per-page anymore
+                                }),
+                            );
+                        }
+                    }
 
                     // Emit ItemStarted when processing begins
                     let _ = sse.broadcast_to_job(
@@ -606,17 +626,6 @@ impl JobExecutor {
                         }),
                     );
 
-                    // Collect discovered links for ItemDiscovered events
-                    // Filter to same-domain links only (crawler does this too)
-                    // Use normalize_url_for_display to strip query params for deduplication
-                    let seed_domain = result.url.domain().map(|d| d.to_string());
-                    let discovered_links: Vec<(String, usize)> = result.links.iter()
-                        .filter(|link| {
-                            link.domain().map(|d| d.to_string()) == seed_domain
-                        })
-                        .map(|link| (normalize_url_for_display(link), 1))
-                        .collect();
-
                     if let Some(ref p) = proc {
                         // Use raw URL for content processing with two-layer storage
                         match p.process_html_with_page(&result.content, &raw_url, Some(result.fetch_time_ms)).await {
@@ -625,7 +634,6 @@ impl JobExecutor {
                                 chunks: res.chunks_created,
                                 embeddings: res.embeddings_generated,
                                 error: None,
-                                discovered_links,
                             },
                             Err(e) => {
                                 let error_msg = format!("Failed to process {}: {}", raw_url, e);
@@ -635,7 +643,6 @@ impl JobExecutor {
                                     chunks: 0,
                                     embeddings: 0,
                                     error: Some(error_msg),
-                                    discovered_links,
                                 }
                             }
                         }
@@ -645,7 +652,6 @@ impl JobExecutor {
                             chunks: 0,
                             embeddings: 0,
                             error: None,
-                            discovered_links,
                         }
                     }
                 }
@@ -702,44 +708,8 @@ impl JobExecutor {
                 }
             }
 
-            // Emit ItemDiscovered for new URLs found on this page (deduplicated)
-            // Cap at effective_max_pages so we only show pages that will be processed
-            for (link_url, depth) in &result.discovered_links {
-                // Only emit if this URL hasn't been emitted before AND we're under the cap
-                let should_emit = {
-                    let mut emitted = emitted_urls.lock().unwrap();
-                    if emitted.len() >= effective_max_pages {
-                        false // At capacity, don't emit (page won't be processed)
-                    } else {
-                        emitted.insert(link_url.clone()) // Returns true if new
-                    }
-                };
-
-                if should_emit {
-                    let _ = sse_manager.broadcast_to_job(
-                        job_id,
-                        Event::new(EventType::ItemDiscovered {
-                            job_id,
-                            item_path: link_url.clone(),
-                            discovered_at: chrono::Utc::now(),
-                            parent_url: Some(result.url.clone()),
-                            depth: *depth,
-                        }),
-                    );
-                    // Add discovered URL as an item for persistence (may already exist if processed first)
-                    {
-                        let mut items = ctx.items.write().await;
-                        items.entry(link_url.clone()).or_insert_with(|| {
-                            JobItemRecord::new_page(job_id.to_string(), link_url.clone())
-                                .with_parent(result.url.clone(), *depth as u32)
-                        });
-                    }
-                    // Increment discovered count
-                    ctx.items_discovered.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-
             // Get discovered count from our tracking (this is the real-time total)
+            // Discovered = pages that entered processing (emitted in map closure above)
             let discovered = emitted_urls.lock().unwrap().len();
 
             // Update tracker
@@ -754,7 +724,9 @@ impl JobExecutor {
             // Send progress event - total is simply the discovered URLs count
             let progress = tracker.get_progress().await;
             let percentage = if discovered > 0 {
-                (count as f32 / discovered as f32) * 100.0
+                let raw = (count as f32 / discovered as f32) * 100.0;
+                // Cap at 99% during processing - final 100% sent after crawler completes
+                raw.min(99.0)
             } else {
                 0.0
             };
@@ -793,6 +765,54 @@ impl JobExecutor {
                 warn!("Crawler task panic: {}", e);
                 errors.push(format!("Crawler task error: {}", e));
             }
+        }
+
+        // Send final progress event with accurate counts after crawler completes
+        let final_discovered = emitted_urls.lock().unwrap().len();
+        let final_processed = processed_count.load(Ordering::Relaxed);
+        let final_percentage = if final_discovered > 0 {
+            (final_processed as f32 / final_discovered as f32) * 100.0
+        } else {
+            100.0
+        };
+
+        let _ = sse_manager.broadcast_to_job(
+            job_id,
+            Event::new(EventType::Progress {
+                job_id,
+                processed: final_processed,
+                total: final_discovered,
+                current_item: None,
+                rate: 0.0,
+                percentage: final_percentage,
+            }),
+        );
+
+        // Log completion status
+        if final_processed != final_discovered {
+            if final_processed >= effective_max_pages && effective_max_pages < usize::MAX {
+                info!(
+                    job_id = %job_id,
+                    processed = final_processed,
+                    discovered = final_discovered,
+                    max_pages = effective_max_pages,
+                    "Job completed: reached max_pages limit"
+                );
+            } else {
+                warn!(
+                    job_id = %job_id,
+                    processed = final_processed,
+                    discovered = final_discovered,
+                    "Job completed with item count mismatch"
+                );
+            }
+        } else {
+            info!(
+                job_id = %job_id,
+                processed = final_processed,
+                discovered = final_discovered,
+                "Job completed: all discovered items processed"
+            );
         }
 
         Ok(JobResult {

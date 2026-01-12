@@ -425,11 +425,11 @@ impl Crawler {
             // Process results IMMEDIATELY as each page completes (no waiting for batch)
             while let Some((task, result)) = result_stream.next().await {
                 match result {
-                    Ok(crawl_result) => {
+                    Ok(mut crawl_result) => {
                         pages_crawled.fetch_add(1, Ordering::Relaxed);
                         bytes_downloaded.fetch_add(crawl_result.size as u64, Ordering::Relaxed);
 
-                        // Extract and queue links
+                        // Extract and queue links - only if we're not at max depth
                         if task.depth < self.config.max_depth {
                             let new_tasks: Vec<CrawlTask> = crawl_result
                                 .links
@@ -441,6 +441,10 @@ impl Crawler {
                             let added = self.frontier.add_many(new_tasks).await;
                             links_discovered.fetch_add(crawl_result.links.len(), Ordering::Relaxed);
                             links_queued.fetch_add(added, Ordering::Relaxed);
+                        } else {
+                            // At max depth - clear links so they're not reported as "discovered"
+                            // since they won't be crawled. This ensures discovered == processable.
+                            crawl_result.links.clear();
                         }
 
                         // Call result handler IMMEDIATELY - no waiting for other pages
