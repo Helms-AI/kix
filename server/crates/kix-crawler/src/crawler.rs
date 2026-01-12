@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::frontier::{CrawlFrontier, CrawlTask};
+use crate::frontier::{CrawlFrontier, CrawlTask, FrontierStats};
 use crate::rate_limiter::DomainRateLimiter;
 use crate::robots::RobotsChecker;
 use crate::CrawlerError;
@@ -57,7 +57,9 @@ impl Default for CrawlerConfig {
             max_depth: 3,
             max_pages: 10000,            // Increased from 1000 for large crawls
             max_pages_per_domain: Some(500),  // Increased from 100
-            concurrent_requests: 64,     // Increased from 4 for high throughput
+            // Aligned with browser max_contexts (8) to prevent queueing bottleneck
+            // when render_js is enabled. Higher values cause 56+ requests to wait.
+            concurrent_requests: 8,
             timeout: Duration::from_secs(30),
             respect_robots: true,
             follow_redirects: true,
@@ -157,7 +159,6 @@ impl Crawler {
             .build()?;
 
         let robots_checker = Arc::new(RobotsChecker::new(client.clone(), &config.user_agent));
-        let semaphore = Arc::new(Semaphore::new(config.concurrent_requests));
 
         // Initialize browser pool if JS rendering is enabled
         #[cfg(feature = "browser")]
@@ -171,6 +172,28 @@ impl Crawler {
         } else {
             None
         };
+
+        // Cap concurrency at browser max_contexts when using browser rendering
+        // to prevent queueing bottleneck (56+ requests waiting for 8 contexts)
+        #[cfg(feature = "browser")]
+        let effective_concurrency = if config.render_js {
+            let browser_max = BrowserConfig::default().max_contexts;
+            if config.concurrent_requests > browser_max {
+                info!(
+                    requested = config.concurrent_requests,
+                    capped = browser_max,
+                    "Capping concurrency to browser max_contexts"
+                );
+            }
+            config.concurrent_requests.min(browser_max)
+        } else {
+            config.concurrent_requests
+        };
+
+        #[cfg(not(feature = "browser"))]
+        let effective_concurrency = config.concurrent_requests;
+
+        let semaphore = Arc::new(Semaphore::new(effective_concurrency));
 
         Ok(Self {
             client,
@@ -193,6 +216,16 @@ impl Crawler {
             pool.close().await?;
         }
         Ok(())
+    }
+
+    /// Get current frontier statistics
+    pub async fn get_frontier_stats(&self) -> FrontierStats {
+        self.frontier.stats().await
+    }
+
+    /// Check if frontier is exhausted
+    pub async fn is_frontier_empty(&self) -> bool {
+        self.frontier.is_empty().await
     }
 
     /// Filter sitemap URLs to only include those related to the seed URL
@@ -277,7 +310,22 @@ impl Crawler {
         }
 
         // Main parallel crawl loop
+        let mut loop_iteration = 0u64;
         while !self.frontier.is_done().await {
+            loop_iteration += 1;
+
+            // Log every 100 iterations when potentially stuck in empty batch loop
+            if loop_iteration % 100 == 0 {
+                let stats = self.frontier.stats().await;
+                info!(
+                    iteration = loop_iteration,
+                    pages = pages_crawled.load(Ordering::Relaxed),
+                    pending = stats.pending_count,
+                    in_progress = stats.in_progress_count,
+                    "Crawl loop iteration"
+                );
+            }
+
             // Check cancellation
             if self.cancellation.is_cancelled() {
                 info!("Crawl cancelled");
@@ -315,6 +363,15 @@ impl Crawler {
             }
 
             if batch.is_empty() {
+                // Log frontier state when batch is empty but not done
+                let frontier_stats = self.frontier.stats().await;
+                // Use WARN level since this is an unusual state worth investigating
+                warn!(
+                    pending = frontier_stats.pending_count,
+                    in_progress = frontier_stats.in_progress_count,
+                    total_discovered = frontier_stats.total_discovered,
+                    "Empty batch but not done - waiting for in-progress tasks"
+                );
                 // Wait a bit for in-progress tasks
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
@@ -325,8 +382,15 @@ impl Crawler {
             // Process batch in parallel using buffer_unordered - STREAMING results as they complete
             let result_stream = stream::iter(batch)
                 .map(|task| async {
-                    // Acquire semaphore permit
-                    let _permit = self.semaphore.acquire().await.unwrap();
+                    // Acquire semaphore permit (handle closed semaphore gracefully)
+                    let _permit = match self.semaphore.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return (task.clone(), Err(CrawlerError::BrowserError(
+                                "Semaphore closed".to_string()
+                            )));
+                        }
+                    };
 
                     // Check robots.txt
                     if self.config.respect_robots {
@@ -400,6 +464,12 @@ impl Crawler {
                     }
                 }
             }
+            // Log after batch completes
+            debug!(
+                pages = pages_crawled.load(Ordering::Relaxed),
+                errors = errors.load(Ordering::Relaxed),
+                "Batch processing completed"
+            );
         }
 
         let stats = CrawlStats {
@@ -710,27 +780,39 @@ fn extract_language_from_class(element: &scraper::node::Element) -> Option<Strin
     None
 }
 
-/// Extract headers from HTML (h1-h6)
+/// Extract headers from HTML (h1-h6) in DOM order
 fn extract_headers(document: &Html) -> Vec<ExtractedHeader> {
     let mut headers = Vec::new();
+    let body_selector = Selector::parse("body").unwrap();
 
-    for level in 1..=6 {
-        let selector = Selector::parse(&format!("h{}", level)).unwrap();
-        for el in document.select(&selector) {
-            let text = el.text().collect::<String>().trim().to_string();
-            if !text.is_empty() {
-                headers.push(ExtractedHeader {
-                    level: level as u8,
-                    text,
-                });
+    if let Some(body) = document.select(&body_selector).next() {
+        // Traverse DOM in document order to preserve visual reading order
+        for node in body.descendants() {
+            if let Some(el) = node.value().as_element() {
+                let name = el.name();
+                // Check if it's a header element (h1-h6)
+                let level = match name {
+                    "h1" => Some(1u8),
+                    "h2" => Some(2u8),
+                    "h3" => Some(3u8),
+                    "h4" => Some(4u8),
+                    "h5" => Some(5u8),
+                    "h6" => Some(6u8),
+                    _ => None,
+                };
+
+                if let Some(level) = level {
+                    if let Some(el_ref) = scraper::ElementRef::wrap(node) {
+                        let text = el_ref.text().collect::<String>().trim().to_string();
+                        if !text.is_empty() {
+                            headers.push(ExtractedHeader { level, text });
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Sort by document order (approximate by collecting them in order)
-    // Note: The above loop collects in h1, h2, h3... order, not document order
-    // For proper document order, we'd need to traverse the DOM differently
-    // This is good enough for most use cases
     headers
 }
 

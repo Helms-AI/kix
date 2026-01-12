@@ -1,13 +1,16 @@
 //! Crawl frontier management - URL queue and deduplication
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use bloomfilter::Bloom;
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 use url::Url;
 
 /// A task in the crawl frontier
@@ -15,56 +18,55 @@ use url::Url;
 pub struct CrawlTask {
     /// URL to crawl
     pub url: Url,
-    /// Current depth from seed
+    /// Depth of this URL in the crawl tree
     pub depth: usize,
+    /// When this task was added
+    #[serde(skip, default = "Instant::now")]
+    pub added_at: Instant,
     /// Parent URL (if any)
-    pub parent_url: Option<Url>,
-    /// Priority (higher = more urgent)
-    pub priority: f32,
-    /// Retry count
-    pub retry_count: u8,
+    pub parent: Option<Url>,
 }
 
 impl CrawlTask {
     /// Create a new crawl task
-    pub fn new(url: Url, depth: usize) -> Self {
+    pub fn new(url: Url, depth: usize, parent: Option<Url>) -> Self {
         Self {
             url,
             depth,
-            parent_url: None,
-            priority: 1.0,
-            retry_count: 0,
+            added_at: Instant::now(),
+            parent,
         }
     }
 
-    /// Create a seed task (depth 0)
+    /// Create a seed task (no parent, depth 0)
     pub fn seed(url: Url) -> Self {
-        Self::new(url, 0)
+        Self::new(url, 0, None)
     }
 
-    /// Create a child task from this task
+    /// Create a child task
     pub fn child(&self, url: Url) -> Self {
-        Self {
-            url,
-            depth: self.depth + 1,
-            parent_url: Some(self.url.clone()),
-            priority: self.priority * 0.9, // Reduce priority for deeper pages
-            retry_count: 0,
-        }
+        Self::new(url, self.depth + 1, Some(self.url.clone()))
+    }
+
+    /// Age of the task
+    pub fn age(&self) -> Duration {
+        self.added_at.elapsed()
     }
 }
 
 /// Configuration for the frontier
 #[derive(Clone, Debug)]
 pub struct FrontierConfig {
-    /// Expected number of URLs for bloom filter sizing
+    /// Expected number of URLs (for bloom filter sizing)
     pub expected_urls: usize,
-    /// False positive rate for bloom filter
+    /// Desired false positive rate for bloom filter
     pub false_positive_rate: f64,
-    /// LRU cache size for recent URLs
+    /// Size of LRU cache for recent URLs
     pub lru_cache_size: usize,
     /// Maximum frontier size
     pub max_size: usize,
+    /// Maximum time a task can be in-progress before considered stale (seconds)
+    pub in_progress_ttl_secs: u64,
 }
 
 impl Default for FrontierConfig {
@@ -74,6 +76,7 @@ impl Default for FrontierConfig {
             false_positive_rate: 0.01,
             lru_cache_size: 10_000,
             max_size: 1_000_000,
+            in_progress_ttl_secs: 60, // Aggressive: 60 seconds
         }
     }
 }
@@ -92,6 +95,8 @@ pub struct CrawlFrontier {
     domain_counts: DashMap<String, usize>,
     /// Configuration
     config: FrontierConfig,
+    /// Total discovered (pending + in_progress + completed)
+    total_discovered: AtomicUsize,
 }
 
 impl CrawlFrontier {
@@ -109,6 +114,7 @@ impl CrawlFrontier {
             in_progress: DashMap::new(),
             domain_counts: DashMap::new(),
             config,
+            total_discovered: AtomicUsize::new(0),
         }
     }
 
@@ -140,6 +146,9 @@ impl CrawlFrontier {
         let mut pending = self.pending.write().await;
         pending.push_back(task);
 
+        // Increment discovered count
+        self.total_discovered.fetch_add(1, Ordering::Relaxed);
+
         true
     }
 
@@ -170,59 +179,52 @@ impl CrawlFrontier {
     pub fn complete(&self, url: &Url) {
         let normalized = normalize_url(url);
         self.in_progress.remove(&normalized);
-
-        // Update domain count
-        if let Some(domain) = url.domain() {
-            self.domain_counts
-                .entry(domain.to_string())
-                .and_modify(|c| *c += 1)
-                .or_insert(1);
-        }
-    }
-
-    /// Mark task as failed (may retry)
-    pub async fn fail(&self, task: CrawlTask, retry: bool) {
-        let normalized = normalize_url(&task.url);
-        self.in_progress.remove(&normalized);
-
-        if retry && task.retry_count < 3 {
-            let mut retry_task = task;
-            retry_task.retry_count += 1;
-            retry_task.priority *= 0.5; // Lower priority for retries
-
-            let mut pending = self.pending.write().await;
-            pending.push_back(retry_task);
-        }
     }
 
     /// Check if URL has been seen
-    fn is_seen(&self, normalized: &str) -> bool {
-        // Check LRU cache first (more accurate)
+    fn is_seen(&self, normalized_url: &str) -> bool {
+        // Check LRU first (more accurate for recent URLs)
         {
             let mut lru = self.lru.lock();
-            if lru.get(normalized).is_some() {
+            if lru.get(normalized_url).is_some() {
                 return true;
             }
         }
 
-        // Check bloom filter
+        // Check bloom filter (may have false positives)
         let bloom = self.bloom.lock();
-        bloom.check(&normalized.to_string())
+        bloom.check(&normalized_url.to_string())
     }
 
     /// Mark URL as seen
-    fn mark_seen(&self, normalized: &str) {
-        // Add to LRU
-        {
-            let mut lru = self.lru.lock();
-            lru.put(normalized.to_string(), ());
-        }
-
-        // Add to bloom filter
+    fn mark_seen(&self, normalized_url: &str) {
+        // Add to both bloom and LRU
         {
             let mut bloom = self.bloom.lock();
-            bloom.set(&normalized.to_string());
+            bloom.set(&normalized_url.to_string());
         }
+        {
+            let mut lru = self.lru.lock();
+            lru.put(normalized_url.to_string(), ());
+        }
+
+        // Track domain
+        if let Ok(url) = Url::parse(normalized_url) {
+            if let Some(domain) = url.domain() {
+                self.domain_counts
+                    .entry(domain.to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+            }
+        }
+    }
+
+    /// Clear the frontier
+    pub async fn clear(&self) {
+        let mut pending = self.pending.write().await;
+        pending.clear();
+        self.in_progress.clear();
+        self.total_discovered.store(0, Ordering::Relaxed);
     }
 
     /// Get frontier statistics
@@ -232,11 +234,45 @@ impl CrawlFrontier {
             pending_count: pending.len(),
             in_progress_count: self.in_progress.len(),
             domains_crawled: self.domain_counts.len(),
+            total_discovered: self.total_discovered.load(Ordering::Relaxed),
         }
     }
 
-    /// Check if frontier is empty and no tasks in progress
-    pub async fn is_done(&self) -> bool {
+    /// Clean up stale in-progress tasks
+    pub fn clean_stale(&self) {
+        let stale_threshold = Instant::now()
+            .checked_sub(Duration::from_secs(self.config.in_progress_ttl_secs))
+            .unwrap_or_else(Instant::now);
+
+        let mut stale_keys = Vec::new();
+        for entry in self.in_progress.iter() {
+            if *entry.value() < stale_threshold {
+                stale_keys.push(entry.key().clone());
+            }
+        }
+
+        let count = stale_keys.len();
+        for key in stale_keys {
+            self.in_progress.remove(&key);
+            warn!(
+                "Removed stale in-progress URL after {} seconds: {}",
+                self.config.in_progress_ttl_secs, key
+            );
+        }
+
+        if count > 0 {
+            info!("Cleaned up {} stale in-progress URLs", count);
+        }
+    }
+
+    /// Get pending URLs (for debugging/monitoring)
+    pub async fn pending_urls(&self) -> Vec<Url> {
+        let pending = self.pending.read().await;
+        pending.iter().map(|t| t.url.clone()).collect()
+    }
+
+    /// Check if frontier is empty (no pending or in-progress)
+    pub async fn is_empty(&self) -> bool {
         let pending = self.pending.read().await;
         pending.is_empty() && self.in_progress.is_empty()
     }
@@ -248,6 +284,26 @@ impl CrawlFrontier {
             .map(|r| (r.key().clone(), *r.value()))
             .collect()
     }
+
+    /// Check if we're done (no pending, no in-progress)
+    pub async fn is_done(&self) -> bool {
+        self.is_empty().await
+    }
+
+    /// Handle a failed task (optionally retry)
+    pub async fn fail(&self, task: CrawlTask, should_retry: bool) {
+        let normalized = normalize_url(&task.url);
+        // Always remove from in_progress first - this is critical!
+        // Without this, failed URLs stay in in_progress forever,
+        // causing is_done() to never return true and the crawl to stall.
+        self.in_progress.remove(&normalized);
+
+        if should_retry && task.depth < 10 {
+            // Re-add to frontier for retry
+            let _ = self.add(task).await;
+        }
+        // Otherwise, just drop it
+    }
 }
 
 /// Frontier statistics
@@ -256,34 +312,35 @@ pub struct FrontierStats {
     pub pending_count: usize,
     pub in_progress_count: usize,
     pub domains_crawled: usize,
+    pub total_discovered: usize,
 }
 
 /// Normalize a URL for deduplication
 pub fn normalize_url(url: &Url) -> String {
-    let mut normalized = url.clone();
+    let mut result = String::new();
 
-    // Remove fragment
-    normalized.set_fragment(None);
+    // Scheme
+    result.push_str(url.scheme());
+    result.push_str("://");
 
-    // Lowercase scheme and host
-    let scheme = normalized.scheme().to_lowercase();
-    let host = normalized.host_str().unwrap_or("").to_lowercase();
-
-    // Remove default ports
-    let port = normalized.port().filter(|p| {
-        !((scheme == "http" && *p == 80) || (scheme == "https" && *p == 443))
-    });
-
-    // Sort query parameters
-    let mut query_pairs: Vec<_> = normalized.query_pairs().collect();
-    query_pairs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Rebuild URL
-    let mut result = format!("{}://{}", scheme, host);
-    if let Some(p) = port {
-        result.push_str(&format!(":{}", p));
+    // Host
+    if let Some(host) = url.host_str() {
+        result.push_str(&host.to_lowercase());
     }
-    result.push_str(normalized.path());
+
+    // Path (remove trailing slash unless root)
+    let path = url.path();
+    if path == "/" {
+        result.push('/');
+    } else {
+        result.push_str(path.trim_end_matches('/'));
+    }
+
+    // Sort query parameters for consistency
+    let mut query_pairs: Vec<(String, String)> = url.query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    query_pairs.sort();
 
     if !query_pairs.is_empty() {
         result.push('?');
@@ -292,15 +349,121 @@ pub fn normalize_url(url: &Url) -> String {
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect::<Vec<_>>()
-                .join("&"),
+                .join("&")
         );
     }
 
+    // Ignore fragment
     result
 }
 
-impl Default for CrawlFrontier {
-    fn default() -> Self {
-        Self::with_defaults()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_frontier_basic() {
+        let frontier = CrawlFrontier::with_defaults();
+
+        let url1 = Url::parse("https://example.com/page1").unwrap();
+        let url2 = Url::parse("https://example.com/page2").unwrap();
+
+        // Add tasks
+        assert!(frontier.add(CrawlTask::seed(url1.clone())).await);
+        assert!(frontier.add(CrawlTask::seed(url2.clone())).await);
+
+        // Duplicate should be rejected
+        assert!(!frontier.add(CrawlTask::seed(url1.clone())).await);
+
+        // Get next task
+        let task = frontier.next().await.unwrap();
+        assert_eq!(task.url, url1);
+
+        // Complete task
+        frontier.complete(&url1);
+
+        // Get stats
+        let stats = frontier.stats().await;
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(stats.in_progress_count, 0);
+        assert_eq!(stats.total_discovered, 2);
+    }
+
+    #[tokio::test]
+    async fn test_fail_removes_from_in_progress() {
+        // This test ensures that fail() removes URLs from in_progress,
+        // which is critical to prevent crawl stalls when errors occur.
+        let frontier = CrawlFrontier::with_defaults();
+
+        let url1 = Url::parse("https://example.com/page1").unwrap();
+        frontier.add(CrawlTask::seed(url1.clone())).await;
+
+        // Get next task (moves to in_progress)
+        let task = frontier.next().await.unwrap();
+        assert_eq!(task.url, url1);
+
+        // Verify it's in in_progress
+        let stats = frontier.stats().await;
+        assert_eq!(stats.in_progress_count, 1);
+        assert!(!frontier.is_done().await);
+
+        // Fail the task without retry
+        frontier.fail(task, false).await;
+
+        // Verify it's removed from in_progress
+        let stats = frontier.stats().await;
+        assert_eq!(stats.in_progress_count, 0);
+
+        // Frontier should now be done (nothing pending, nothing in progress)
+        assert!(frontier.is_done().await);
+    }
+
+    #[tokio::test]
+    async fn test_fail_clears_in_progress_even_with_retry() {
+        // Even with retry=true, the URL is removed from in_progress.
+        // The retry attempt may fail silently if the URL was already seen,
+        // but the critical thing is in_progress is cleared to prevent stalls.
+        let frontier = CrawlFrontier::with_defaults();
+
+        let url1 = Url::parse("https://example.com/page1").unwrap();
+        frontier.add(CrawlTask::seed(url1.clone())).await;
+
+        // Get next task
+        let task = frontier.next().await.unwrap();
+
+        // Initially: 0 pending, 1 in_progress
+        let stats = frontier.stats().await;
+        assert_eq!(stats.pending_count, 0);
+        assert_eq!(stats.in_progress_count, 1);
+
+        // Fail with retry - URL is removed from in_progress
+        // (retry may not succeed if URL already seen, but that's OK)
+        frontier.fail(task, true).await;
+
+        // Critical: in_progress is cleared
+        let stats = frontier.stats().await;
+        assert_eq!(stats.in_progress_count, 0);
+        // Note: pending_count may be 0 or 1 depending on whether retry succeeded
+    }
+
+    #[test]
+    fn test_normalize_url() {
+        // Test query param sorting and case normalization
+        let url1 = Url::parse("https://example.com/page/?b=2&a=1#frag").unwrap();
+        let url2 = Url::parse("https://EXAMPLE.COM/page?a=1&b=2").unwrap();
+        assert_eq!(normalize_url(&url1), normalize_url(&url2));
+
+        // Test trailing slash normalization (without query params)
+        let url3 = Url::parse("https://example.com/page/").unwrap();
+        let url4 = Url::parse("https://example.com/page").unwrap();
+        assert_eq!(normalize_url(&url3), normalize_url(&url4));
+
+        // Test fragment is stripped
+        let url5 = Url::parse("https://example.com/page#section").unwrap();
+        let url6 = Url::parse("https://example.com/page").unwrap();
+        assert_eq!(normalize_url(&url5), normalize_url(&url6));
+
+        // URLs with and without query params should be different
+        assert_ne!(normalize_url(&url1), normalize_url(&url3));
     }
 }

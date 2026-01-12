@@ -186,8 +186,8 @@ run_local_mode() {
         cd ..
     fi
 
-    # Enable logging
-    export RUST_LOG="${RUST_LOG:-kix=info,warn}"
+    # Enable logging (include debug for parser and embeddings to trace chunk creation)
+    export RUST_LOG="${RUST_LOG:-kix=info,kix_parser=debug,kix_embeddings=debug,warn}"
 
     # Ollama embedding configuration
     export OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"

@@ -16,6 +16,8 @@ use tracing::{info, warn};
 use kix_parser::{Entry, EntryChunk};
 
 use crate::error::StoreError;
+use crate::pages::{PageRecord, PageStore};
+use crate::schema::page_schema;
 
 /// Default embedding dimensions (768 for bge-base-en-v1.5).
 /// Can be overridden via KIX_EMBEDDING_DIM environment variable.
@@ -53,6 +55,8 @@ pub struct KixStore {
     db: Connection,
     entries_table: Option<Table>,
     chunks_table: Option<Table>,
+    /// Pages table for two-layer storage (RAG context retrieval)
+    pages_table: Option<Table>,
     /// Flag to track if indexes have been created
     indexes_created: AtomicBool,
     /// Embedding dimensions for this store
@@ -78,6 +82,7 @@ impl KixStore {
             db,
             entries_table: None,
             chunks_table: None,
+            pages_table: None,
             indexes_created: AtomicBool::new(false),
             embedding_dim,
         })
@@ -93,8 +98,9 @@ impl KixStore {
         // Try to open existing tables or create new ones
         self.entries_table = Some(self.get_or_create_entries_table().await?);
         self.chunks_table = Some(self.get_or_create_chunks_table().await?);
+        self.pages_table = Some(self.get_or_create_pages_table().await?);
 
-        info!("Tables initialized successfully");
+        info!("Tables initialized successfully (entries, chunks, pages)");
         Ok(())
     }
 
@@ -126,6 +132,9 @@ impl KixStore {
     }
 
     /// Gets or creates the chunks table.
+    ///
+    /// Includes schema migration: if the existing table is missing the `page_id` field
+    /// (added for two-layer storage), the table is dropped and recreated.
     async fn get_or_create_chunks_table(&self) -> Result<Table, StoreError> {
         let table_names = self
             .db
@@ -136,16 +145,67 @@ impl KixStore {
 
         if table_names.contains(&"chunks".to_string()) {
             info!("Opening existing chunks table");
-            self.db
+            let table = self.db
                 .open_table("chunks")
                 .execute()
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+
+            // Check if schema has page_id field (required for two-layer storage)
+            let schema = table.schema().await
+                .map_err(|e| StoreError::Database(format!("Failed to get chunks schema: {}", e)))?;
+
+            let has_page_id = schema.fields.iter().any(|f| f.name() == "page_id");
+
+            if !has_page_id {
+                warn!("Chunks table missing page_id field, migrating to new schema...");
+                // Drop old table and recreate with new schema
+                self.db
+                    .drop_table("chunks", &[])
+                    .await
+                    .map_err(|e| StoreError::Database(format!("Failed to drop old chunks table: {}", e)))?;
+
+                info!("Creating new chunks table with page_id field (embedding_dim={})", self.embedding_dim);
+                let schema = Self::chunks_schema_with_dim(self.embedding_dim);
+                return self.db
+                    .create_empty_table("chunks", schema)
+                    .execute()
+                    .await
+                    .map_err(|e| StoreError::Database(e.to_string()));
+            }
+
+            Ok(table)
         } else {
             info!("Creating new chunks table (embedding_dim={})", self.embedding_dim);
             let schema = Self::chunks_schema_with_dim(self.embedding_dim);
             self.db
                 .create_empty_table("chunks", schema)
+                .execute()
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))
+        }
+    }
+
+    /// Gets or creates the pages table (two-layer storage for RAG context).
+    async fn get_or_create_pages_table(&self) -> Result<Table, StoreError> {
+        let table_names = self
+            .db
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        if table_names.contains(&"pages".to_string()) {
+            info!("Opening existing pages table");
+            self.db
+                .open_table("pages")
+                .execute()
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))
+        } else {
+            info!("Creating new pages table");
+            self.db
+                .create_empty_table("pages", page_schema())
                 .execute()
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))
@@ -176,6 +236,7 @@ impl KixStore {
         Arc::new(Schema::new(vec![
             Field::new("chunk_id", DataType::Utf8, false),
             Field::new("entry_id", DataType::Utf8, false),
+            Field::new("page_id", DataType::Utf8, true),  // FK to pages table (two-layer storage)
             Field::new("chunk_index", DataType::UInt32, false),
             Field::new("chunk_type", DataType::Utf8, false),
             Field::new("text", DataType::Utf8, false),
@@ -340,6 +401,10 @@ impl KixStore {
     ) -> Result<RecordBatch, StoreError> {
         let chunk_ids: Vec<&str> = chunks.iter().map(|c| c.chunk_id.as_str()).collect();
         let entry_ids: Vec<&str> = chunks.iter().map(|c| c.entry_id.as_str()).collect();
+        let page_ids: Vec<Option<&str>> = chunks
+            .iter()
+            .map(|c| c.page_id.as_deref())
+            .collect();
         let indices: Vec<u32> = chunks.iter().map(|c| c.chunk_index).collect();
         let chunk_types: Vec<&str> = chunks.iter().map(|c| c.chunk_type.as_str()).collect();
         let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
@@ -366,6 +431,7 @@ impl KixStore {
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(chunk_ids)),
             Arc::new(StringArray::from(entry_ids)),
+            Arc::new(StringArray::from(page_ids)),
             Arc::new(UInt32Array::from(indices)),
             Arc::new(StringArray::from(chunk_types)),
             Arc::new(StringArray::from(texts)),
@@ -461,7 +527,7 @@ impl KixStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        for name in ["entries", "chunks"] {
+        for name in ["entries", "chunks", "pages"] {
             if table_names.contains(&name.to_string()) {
                 self.db
                     .drop_table(name, &[])
@@ -485,6 +551,11 @@ impl KixStore {
     /// Returns the chunks table reference.
     pub fn chunks_table(&self) -> Option<&Table> {
         self.chunks_table.as_ref()
+    }
+
+    /// Returns the pages table reference (two-layer storage for RAG context).
+    pub fn pages_table(&self) -> Option<&Table> {
+        self.pages_table.as_ref()
     }
 
     /// Gets entry count.
@@ -565,6 +636,78 @@ impl KixStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
         Ok(count > 0)
+    }
+
+    // ========================================================================
+    // Two-Layer Storage Methods
+    // ========================================================================
+
+    /// Stores a page and its associated chunks atomically.
+    ///
+    /// This is the primary method for two-layer storage pattern:
+    /// - Pages store full content for RAG context retrieval
+    /// - Chunks store smaller pieces with embeddings for vector search
+    pub async fn store_page_with_chunks(
+        &self,
+        page: &PageRecord,
+        chunks: &[EntryChunk],
+        embeddings: &[Vec<f32>],
+    ) -> Result<(), StoreError> {
+        // Store page first
+        let pages_table = self
+            .pages_table
+            .as_ref()
+            .ok_or_else(|| StoreError::Database("Pages table not initialized".to_string()))?;
+
+        let page_store = PageStore::new(pages_table.clone());
+        page_store.insert_pages(&[page.clone()]).await?;
+
+        // Store chunks with page_id reference
+        self.insert_chunks(chunks, embeddings).await?;
+
+        info!(
+            "Stored page {} with {} chunks",
+            page.page_id,
+            chunks.len()
+        );
+        Ok(())
+    }
+
+    /// Retrieves the full page context for a given chunk.
+    ///
+    /// Used for RAG context retrieval - when a vector search finds a relevant
+    /// chunk, use this to get the full page content for better context.
+    pub async fn get_page_for_chunk(&self, page_id: &str) -> Result<Option<PageRecord>, StoreError> {
+        let pages_table = self
+            .pages_table
+            .as_ref()
+            .ok_or_else(|| StoreError::Database("Pages table not initialized".to_string()))?;
+
+        let page_store = PageStore::new(pages_table.clone());
+        page_store.get_page(page_id).await
+    }
+
+    /// Gets the PageStore for direct page operations.
+    pub fn page_store(&self) -> Result<PageStore, StoreError> {
+        let pages_table = self
+            .pages_table
+            .as_ref()
+            .ok_or_else(|| StoreError::Database("Pages table not initialized".to_string()))?;
+
+        Ok(PageStore::new(pages_table.clone()))
+    }
+
+    /// Gets page count.
+    pub async fn page_count(&self) -> Result<usize, StoreError> {
+        let table = self
+            .pages_table
+            .as_ref()
+            .ok_or_else(|| StoreError::Database("Pages table not initialized".to_string()))?;
+
+        table
+            .count_rows(None)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     // Backward compatibility aliases

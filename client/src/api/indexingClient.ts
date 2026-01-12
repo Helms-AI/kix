@@ -69,6 +69,29 @@ export interface JobLogEntry {
   recoverable?: boolean;
 }
 
+// Page status for the new page tracking system
+export type PageStatus = 'pending' | 'running' | 'completed' | 'error';
+
+// Individual page state for tracking
+export interface PageState {
+  url: string;
+  status: PageStatus;
+  // Discovery metadata
+  discoveredAt: string;
+  parentUrl?: string;
+  depth?: number;
+  // Processing metadata (when running/completed)
+  startedAt?: string;
+  completedAt?: string;
+  // Result metadata (when completed)
+  chunksCreated?: number;
+  embeddingsGenerated?: number;
+  durationMs?: number;
+  // Error metadata (when error)
+  errorMessage?: string;
+  recoverable?: boolean;
+}
+
 export interface EnhancedLiveJobData {
   processed: number;
   total: number;
@@ -76,7 +99,9 @@ export interface EnhancedLiveJobData {
   rate: number;
   currentItem?: string;
   etaSeconds?: number;
-  log: JobLogEntry[];
+  // NEW: Page states keyed by URL for O(1) updates
+  pages: Record<string, PageState>;
+  // Keep errors array for quick error summary
   errors: JobLogEntry[];
   rateHistory: number[];
   totalChunks: number;

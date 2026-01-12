@@ -1,3 +1,4 @@
+import { memo, useMemo } from 'react';
 import {
   Globe,
   FileText,
@@ -34,85 +35,73 @@ function formatETA(seconds: number | undefined): string {
   return `${hours}h ${mins}m`;
 }
 
-function truncateSource(source: string | { url?: string; path?: string } | undefined, maxLength: number = 40): string {
+function truncateSource(
+  source: string | { url?: string; path?: string } | undefined,
+  maxLength: number = 35
+): string {
   if (!source) return 'Unknown source';
 
-  // Handle object source (from backend)
-  let sourceStr: string;
-  if (typeof source === 'object') {
-    sourceStr = source.url || source.path || 'Unknown source';
-  } else {
-    sourceStr = source;
-  }
+  const sourceStr = typeof source === 'object'
+    ? source.url || source.path || 'Unknown'
+    : source;
 
   if (sourceStr.length <= maxLength) return sourceStr;
 
-  // Try to extract domain for URLs
+  // For URLs, show domain + truncated path
   try {
     const url = new URL(sourceStr);
     const domain = url.hostname;
     const path = url.pathname;
-    if (domain.length + path.length <= maxLength) {
-      return domain + path;
+    const available = maxLength - domain.length - 4;
+    if (available > 5) {
+      return `${domain}${path.slice(0, available)}...`;
     }
-    return domain + (path.length > 10 ? path.slice(0, 10) + '...' : path);
+    return `${domain}/...`;
   } catch {
     return sourceStr.slice(0, maxLength - 3) + '...';
   }
 }
 
-function getStatusBadge(status: Job['status']) {
-  const configs: Record<Job['status'], {
-    icon: typeof Clock;
-    label: string;
-    className: string;
-    animate?: boolean;
-  }> = {
-    pending: {
-      icon: Clock,
-      label: 'Pending',
-      className: 'bg-slate-700 text-slate-300',
-    },
-    queued: {
-      icon: Clock,
-      label: 'Queued',
-      className: 'bg-amber-900/50 text-amber-400 border border-amber-800/50',
-    },
-    running: {
-      icon: Loader2,
-      label: 'Running',
-      className: 'bg-cyan-900/50 text-cyan-400 border border-cyan-800/50',
-      animate: true,
-    },
-    completed: {
-      icon: CheckCircle,
-      label: 'Completed',
-      className: 'bg-emerald-900/50 text-emerald-400',
-    },
-    failed: {
-      icon: XCircle,
-      label: 'Failed',
-      className: 'bg-red-900/50 text-red-400',
-    },
-    cancelled: {
-      icon: XCircle,
-      label: 'Cancelled',
-      className: 'bg-slate-700 text-slate-400',
-    },
-  };
+const statusConfig: Record<Job['status'], {
+  icon: typeof Clock;
+  label: string;
+  className: string;
+  animate?: boolean;
+}> = {
+  pending: {
+    icon: Clock,
+    label: 'Pending',
+    className: 'bg-slate-700/60 text-slate-300',
+  },
+  queued: {
+    icon: Clock,
+    label: 'Queued',
+    className: 'bg-amber-900/50 text-amber-400 border border-amber-800/50',
+  },
+  running: {
+    icon: Loader2,
+    label: 'Running',
+    className: 'bg-cyan-900/50 text-cyan-400 border border-cyan-800/50',
+    animate: true,
+  },
+  completed: {
+    icon: CheckCircle,
+    label: 'Completed',
+    className: 'bg-emerald-900/50 text-emerald-400',
+  },
+  failed: {
+    icon: XCircle,
+    label: 'Failed',
+    className: 'bg-red-900/50 text-red-400',
+  },
+  cancelled: {
+    icon: XCircle,
+    label: 'Cancelled',
+    className: 'bg-slate-700/60 text-slate-400',
+  },
+};
 
-  const config = configs[status] || configs.pending;
-  const IconComponent = config.icon;
-
-  return (
-    <div className={`flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${config.className}`}>
-      <IconComponent className={`w-3 h-3 ${config.animate ? 'animate-spin' : ''}`} />
-      {config.label}
-    </div>
-  );
-}
-
-export function CompactJobView({
+export const CompactJobView = memo(function CompactJobView({
   job,
   liveData,
   isExpanded,
@@ -120,19 +109,32 @@ export function CompactJobView({
   onCancel,
 }: CompactJobViewProps) {
   const isActive = job.status === 'running' || job.status === 'queued';
+
+  // Extract values with fallbacks
   const percentage = liveData?.percentage ?? job.progress?.percentage ?? 0;
   const processed = liveData?.processed ?? job.progress?.processed ?? 0;
   const total = liveData?.total ?? job.progress?.total ?? 0;
   const rate = liveData?.rate ?? job.progress?.rate ?? 0;
   const errorCount = liveData?.errors?.length ?? 0;
-  const source = liveData?.source ?? (job.job_type === 'url' ? 'URL' : 'File');
   const etaSeconds = liveData?.etaSeconds;
+  const source = liveData?.source ?? (job.job_type === 'url' ? 'URL' : 'File');
 
   const JobIcon = job.job_type === 'url' ? Globe : FileText;
+  const config = statusConfig[job.status] || statusConfig.pending;
+  const StatusIcon = config.icon;
+
+  const jobTypeLabel = useMemo(() => {
+    switch (job.job_type) {
+      case 'url': return 'URL crawl';
+      case 'file_upload': return 'File upload';
+      case 'reindex': return 'Reindex';
+      default: return job.job_type;
+    }
+  }, [job.job_type]);
 
   return (
     <div
-      className="flex items-center gap-4 p-4 cursor-pointer select-none"
+      className="flex items-center gap-4 p-4 cursor-pointer select-none group"
       onClick={onToggle}
     >
       {/* Progress Ring */}
@@ -145,22 +147,25 @@ export function CompactJobView({
 
       {/* Job Info */}
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-1">
+        <div className="flex items-center gap-2 mb-0.5">
           <JobIcon className="w-4 h-4 text-cyan-500 flex-shrink-0" />
-          <span className="text-sm font-medium text-white truncate" title={source}>
+          <span
+            className="text-sm font-medium text-white truncate"
+            title={typeof source === 'string' ? source : (source as { url?: string; path?: string })?.url || (source as { url?: string; path?: string })?.path || undefined}
+          >
             {truncateSource(source)}
           </span>
         </div>
-        <div className="text-xs text-slate-500">
-          {job.job_type === 'url' ? 'URL crawl' : job.job_type === 'file_upload' ? 'File upload' : 'Reindex'}
+        <div className="text-xs text-slate-500 font-medium">
+          {jobTypeLabel}
         </div>
       </div>
 
-      {/* Stats */}
+      {/* Inline Stats */}
       <div className="flex items-center gap-4 text-sm">
-        {/* Processed count */}
-        <div className="text-slate-400">
-          <span className="text-white font-medium">{processed.toLocaleString()}</span>
+        {/* Processed / Total */}
+        <div className="text-slate-400 font-mono">
+          <span className="text-white font-semibold">{processed.toLocaleString()}</span>
           {total > 0 && (
             <span className="text-slate-500">/{total.toLocaleString()}</span>
           )}
@@ -170,15 +175,15 @@ export function CompactJobView({
         {isActive && rate > 0 && (
           <div className="flex items-center gap-1 text-slate-400">
             <Zap className="w-3.5 h-3.5 text-amber-500" />
-            <span>{rate.toFixed(1)}/s</span>
+            <span className="font-mono">{rate.toFixed(1)}/s</span>
           </div>
         )}
 
         {/* ETA */}
         {isActive && etaSeconds && etaSeconds > 0 && (
-          <div className="flex items-center gap-1 text-slate-400">
+          <div className="hidden sm:flex items-center gap-1 text-slate-400">
             <Clock className="w-3.5 h-3.5" />
-            <span>{formatETA(etaSeconds)}</span>
+            <span className="font-mono">{formatETA(etaSeconds)}</span>
           </div>
         )}
 
@@ -186,13 +191,18 @@ export function CompactJobView({
         {errorCount > 0 && (
           <div className="flex items-center gap-1 text-red-400">
             <AlertTriangle className="w-3.5 h-3.5" />
-            <span>{errorCount}</span>
+            <span className="font-mono">{errorCount}</span>
           </div>
         )}
       </div>
 
       {/* Status Badge */}
-      {getStatusBadge(job.status)}
+      <div
+        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${config.className}`}
+      >
+        <StatusIcon className={`w-3 h-3 ${config.animate ? 'animate-spin' : ''}`} />
+        {config.label}
+      </div>
 
       {/* Cancel Button */}
       {isActive && (
@@ -201,7 +211,7 @@ export function CompactJobView({
             e.stopPropagation();
             onCancel();
           }}
-          className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-900/20 transition-colors"
+          className="p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-900/30 transition-all opacity-0 group-hover:opacity-100"
           title="Cancel job"
         >
           <X className="w-4 h-4" />
@@ -209,7 +219,7 @@ export function CompactJobView({
       )}
 
       {/* Expand/Collapse Chevron */}
-      <div className="text-slate-500">
+      <div className="text-slate-500 group-hover:text-slate-400 transition-colors">
         {isExpanded ? (
           <ChevronUp className="w-5 h-5" />
         ) : (
@@ -218,4 +228,4 @@ export function CompactJobView({
       </div>
     </div>
   );
-}
+});

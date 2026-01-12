@@ -1,7 +1,8 @@
+import { memo } from 'react';
 import type { Job, EnhancedLiveJobData } from '../../../api/indexingClient';
 import { JobMetrics } from './JobMetrics';
 import { ETACountdown } from './ETACountdown';
-import { ProcessingLog } from './ProcessingLog';
+import { PageStatusList } from './PageStatusList';
 
 interface ExpandedJobViewProps {
   job: Job;
@@ -9,11 +10,12 @@ interface ExpandedJobViewProps {
   onClearLog?: () => void;
 }
 
-export function ExpandedJobView({
+export const ExpandedJobView = memo(function ExpandedJobView({
   job,
   liveData,
   onClearLog,
 }: ExpandedJobViewProps) {
+  // Extract values with safe defaults
   const processed = liveData?.processed ?? job.progress?.processed ?? 0;
   const total = liveData?.total ?? job.progress?.total ?? 0;
   const percentage = liveData?.percentage ?? job.progress?.percentage ?? 0;
@@ -22,8 +24,10 @@ export function ExpandedJobView({
   const totalEmbeddings = liveData?.totalEmbeddings ?? 0;
   const errorCount = liveData?.errors?.length ?? 0;
   const rateHistory = liveData?.rateHistory ?? [];
-  const log = liveData?.log ?? [];
+  const pages = liveData?.pages ?? {};
   const etaSeconds = liveData?.etaSeconds;
+
+  const isActive = job.status === 'running' || job.status === 'queued';
 
   return (
     <div className="px-4 pb-4 space-y-4 border-t border-slate-700/50">
@@ -39,22 +43,20 @@ export function ExpandedJobView({
         className="pt-4"
       />
 
-      {/* ETA Progress Bar */}
-      {(job.status === 'running' || job.status === 'queued') && (
+      {/* ETA Progress Bar - only show for active jobs */}
+      {isActive && (
         <ETACountdown
           etaSeconds={etaSeconds}
           percentage={percentage}
         />
       )}
 
-      {/* Processing Log */}
-      <div className="bg-slate-900/50 rounded-lg border border-slate-800 overflow-hidden">
-        <ProcessingLog
-          entries={log}
-          maxHeight={200}
-          onClear={onClearLog}
-        />
-      </div>
+      {/* Page Status List */}
+      <PageStatusList
+        pages={pages}
+        maxHeight={200}
+        onClear={onClearLog}
+      />
     </div>
   );
-}
+});

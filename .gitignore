@@ -1,3 +1,5 @@
+.github/archon/
+
 # ===================
 # Rust / Cargo
 # ===================
@@ -20,7 +22,8 @@ yarn-error.log*
 # Data & Caches
 # ===================
 /data/
-/.fastembed_cache/
+**/.fastembed_cache/
+.playwright-mcp/
 *.db
 *.lance/
 

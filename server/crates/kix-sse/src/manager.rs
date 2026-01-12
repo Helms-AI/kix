@@ -292,3 +292,39 @@ impl Default for ConnectionManager {
 pub fn create_shared_manager(config: ConnectionManagerConfig) -> Arc<ConnectionManager> {
     Arc::new(ConnectionManager::new(config))
 }
+
+/// Spawns a background task that periodically cleans up stale SSE connections.
+///
+/// This should be called once at application startup with the shared connection manager.
+/// The task runs indefinitely, cleaning up stale connections at the configured interval.
+pub fn spawn_cleanup_task(manager: Arc<ConnectionManager>) {
+    let interval = manager.config.cleanup_interval;
+
+    tokio::spawn(async move {
+        let mut interval_timer = tokio::time::interval(interval);
+        interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Skip the immediate first tick
+        interval_timer.tick().await;
+
+        loop {
+            interval_timer.tick().await;
+
+            let connection_count = manager.connection_count();
+            manager.cleanup();
+
+            let new_count = manager.connection_count();
+            if connection_count != new_count {
+                info!(
+                    "SSE cleanup: {} -> {} connections",
+                    connection_count, new_count
+                );
+            }
+        }
+    });
+
+    info!(
+        "SSE cleanup task started (interval: {:?})",
+        interval
+    );
+}

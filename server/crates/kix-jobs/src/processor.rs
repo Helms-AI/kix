@@ -7,8 +7,9 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use kix_embeddings::{ChunkingConfig, DocumentChunker, EmbeddingGenerator, AccelerationMode};
-use kix_parser::{Entry, EntryChunk, EntryType, HtmlParser, PdfParser, SourceType};
-use kix_store::KixStore;
+use kix_parser::{Entry, EntryChunk, EntryType, PdfParser, SourceType};
+use kix_store::{KixStore, PageRecord};
+use kix_crawler::ContentExtractor;
 
 use crate::linker::{LinkingConfig, PatternLink, PatternLinker};
 use crate::JobError;
@@ -161,8 +162,10 @@ pub struct ProcessorConfig {
 impl Default for ProcessorConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 512,
-            chunk_overlap: 50,
+            // Use 2000 chars to stay within embedding model token limits
+            // (nomic-embed-text has 2048 token limit; 2000 chars ≈ 500-1000 tokens)
+            chunk_size: 2000,
+            chunk_overlap: 100,
             embedding_batch_size: 32,
             linking: LinkingConfig::default(),
             enable_linking: true,
@@ -176,8 +179,8 @@ pub struct ContentProcessor {
     embedding_pool: Arc<EmbeddingWorkerPool>,
     linker: PatternLinker,
     chunker: DocumentChunker,
-    html_parser: HtmlParser,
     pdf_parser: PdfParser,
+    content_extractor: ContentExtractor,
     config: ProcessorConfig,
 }
 
@@ -236,26 +239,195 @@ impl ContentProcessor {
             embedding_pool,
             linker,
             chunker,
-            html_parser: HtmlParser::new(),
             pdf_parser: PdfParser::new(),
+            content_extractor: ContentExtractor::default(),
             config,
         })
     }
 
     /// Process HTML content and store it
+    ///
+    /// Uses ContentExtractor for comprehensive content extraction
+    /// with boilerplate removal, code block extraction, and metadata capture.
     pub async fn process_html(
         &self,
         content: &str,
         source_url: &str,
     ) -> Result<ProcessingResult, JobError> {
-        debug!(url = source_url, "Processing HTML content");
+        debug!(url = source_url, "Processing HTML content with ContentExtractor");
 
-        // Parse HTML
-        let document = self.html_parser
-            .parse(content, source_url)
-            .map_err(|e| JobError::Processing(format!("Failed to parse HTML: {}", e)))?;
+        // Parse URL for extractor
+        let url = url::Url::parse(source_url)
+            .unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
 
-        self.process_document(document).await
+        // Use content extraction (never fails)
+        let extracted = self.content_extractor.extract(content, &url);
+
+        debug!(
+            url = source_url,
+            title = %extracted.title,
+            markdown_len = extracted.markdown.len(),
+            header_count = extracted.headers.len(),
+            code_blocks = extracted.code_blocks.len(),
+            word_count = extracted.word_count,
+            "ContentExtractor extraction complete"
+        );
+
+        // Create entry with extracted content
+        let entry = self.create_entry_from_extracted(&extracted, source_url)?;
+
+        // Use markdown-aware chunking
+        self.process_document_with_markdown(entry, &extracted.markdown).await
+    }
+
+    /// Create an entry from ContentExtractor output
+    fn create_entry_from_extracted(
+        &self,
+        extracted: &kix_crawler::ExtractedContent,
+        source_url: &str,
+    ) -> Result<Entry, JobError> {
+        use sha2::{Digest, Sha256};
+
+        // Compute hash for change detection
+        let mut hasher = Sha256::new();
+        hasher.update(extracted.markdown.as_bytes());
+        let source_hash = format!("{:x}", hasher.finalize());
+
+        // Generate slug/ID from URL
+        let slug = source_url.to_string();
+        let id = slug.clone();
+
+        // Use extracted description or derive from markdown
+        let description = extracted.description.clone()
+            .unwrap_or_else(|| extracted.markdown.chars().take(300).collect());
+
+        // Determine entry type
+        let entry_type = if source_url.contains("/blog/") || source_url.contains("/article/") {
+            EntryType::Article
+        } else if source_url.contains("/docs/") || source_url.contains("/documentation/") {
+            EntryType::Document
+        } else {
+            EntryType::Document
+        };
+
+        let entry = Entry::with_id(id, extracted.title.clone(), source_url.to_string(), source_hash)
+            .with_description(description)
+            .with_content(extracted.markdown.clone())
+            .with_tags(vec![])
+            .with_entry_type(entry_type)
+            .with_source_type(SourceType::Html)
+            .with_slug(slug);
+
+        Ok(entry)
+    }
+
+    /// Process a document with smart chunking
+    ///
+    /// Uses the smart chunking algorithm that prioritizes:
+    /// 1. Code block boundaries (never splits code blocks)
+    /// 2. Paragraph boundaries (\n\n)
+    /// 3. Sentence boundaries (. )
+    /// 4. Consolidates small chunks (<200 chars) together
+    async fn process_document_with_markdown(
+        &self,
+        entry: Entry,
+        markdown: &str,
+    ) -> Result<ProcessingResult, JobError> {
+        let doc_id = entry.id.clone();
+        let doc_title = entry.title.clone();
+        let doc_description = entry.description.clone();
+
+        // Use smart chunking that preserves content boundaries
+        let chunks = self.chunker.chunk_smart_text(&entry, markdown);
+
+        if chunks.is_empty() {
+            warn!(doc_id = doc_id, "No chunks generated from markdown document");
+            return Ok(ProcessingResult {
+                document_id: doc_id,
+                chunks_created: 0,
+                embeddings_generated: 0,
+                related_patterns: vec![],
+            });
+        }
+
+        info!(
+            doc_id = doc_id,
+            chunks = chunks.len(),
+            "Generated smart chunks from document"
+        );
+
+        // Generate embeddings via worker pool
+        let embeddings = self
+            .embedding_pool
+            .embed_chunks(chunks.clone())
+            .await
+            .map_err(|e| JobError::Processing(format!("Failed to generate embeddings: {}", e)))?;
+
+        // Store document and chunks
+        {
+            let store = self.store.write().await;
+
+            // Check if document already exists
+            let exists = store.document_exists(&doc_id).await
+                .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
+
+            if exists {
+                // Delete existing document and chunks
+                store.delete_chunks_by_document(&doc_id).await
+                    .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
+                store.delete_document(&doc_id).await
+                    .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
+            }
+
+            // Insert new document
+            store.insert_documents(&[entry]).await
+                .map_err(|e| JobError::Processing(format!("Failed to insert document: {}", e)))?;
+
+            // Insert chunks with embeddings
+            store.insert_chunks(&chunks, &embeddings).await
+                .map_err(|e| JobError::Processing(format!("Failed to insert chunks: {}", e)))?;
+        }
+
+        // Find related patterns
+        let related_patterns = if self.config.enable_linking {
+            match self.linker.find_related_for_document(
+                &doc_title,
+                &doc_description,
+                None,
+                None,
+                Some(&doc_id),
+            ).await {
+                Ok(links) => {
+                    info!(
+                        doc_id = doc_id,
+                        related_count = links.len(),
+                        "Found related patterns"
+                    );
+                    links
+                }
+                Err(e) => {
+                    warn!(doc_id = doc_id, error = %e, "Failed to find related patterns");
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        info!(
+            doc_id = doc_id,
+            title = doc_title,
+            chunks = chunks.len(),
+            related = related_patterns.len(),
+            "Successfully processed document with smart chunking"
+        );
+
+        Ok(ProcessingResult {
+            document_id: doc_id,
+            chunks_created: chunks.len(),
+            embeddings_generated: embeddings.len(),
+            related_patterns,
+        })
     }
 
     /// Process a file and store it
@@ -281,9 +453,11 @@ impl ContentProcessor {
         let document = match extension.as_str() {
             "html" | "htm" => {
                 let text = String::from_utf8_lossy(&content);
-                self.html_parser
-                    .parse(&text, original_name)
-                    .map_err(|e| JobError::Processing(format!("Failed to parse HTML: {}", e)))?
+                // Use ContentExtractor for consistent HTML processing
+                let url = url::Url::parse(&format!("file://{}", original_name))
+                    .unwrap_or_else(|_| url::Url::parse("file:///unknown").unwrap());
+                let extracted = self.content_extractor.extract(&text, &url);
+                self.create_entry_from_extracted(&extracted, original_name)?
             }
             "pdf" => {
                 self.pdf_parser
@@ -480,6 +654,216 @@ impl ContentProcessor {
         store.chunk_count().await
             .map_err(|e| JobError::Processing(format!("Failed to get chunk count: {}", e)))
     }
+
+    /// Get page count (uses read lock for concurrent access)
+    pub async fn page_count(&self) -> Result<usize, JobError> {
+        let store = self.store.read().await;
+        store.page_count().await
+            .map_err(|e| JobError::Processing(format!("Failed to get page count: {}", e)))
+    }
+
+    // ========================================================================
+    // Two-Layer Storage Integration
+    // ========================================================================
+
+    /// Process HTML content using two-layer storage pattern for RAG.
+    ///
+    /// This method:
+    /// 1. Stores the full page content in the pages table (for RAG context)
+    /// 2. Stores chunks with page_id FK (for vector search)
+    /// 3. Generates embeddings with optional page context
+    ///
+    /// Use this for crawled pages where full context is valuable for RAG.
+    /// Uses ContentExtractor (source of truth) for all HTML processing.
+    pub async fn process_html_with_page(
+        &self,
+        content: &str,
+        source_url: &str,
+        crawl_time_ms: Option<u64>,
+    ) -> Result<TwoLayerResult, JobError> {
+        debug!(url = source_url, "Processing HTML with two-layer storage using ContentExtractor");
+
+        // Parse URL for extractor
+        let url = url::Url::parse(source_url)
+            .unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
+
+        // Use content extraction (source of truth, never fails)
+        let extracted = self.content_extractor.extract(content, &url);
+
+        debug!(
+            url = source_url,
+            title = %extracted.title,
+            markdown_len = extracted.markdown.len(),
+            header_count = extracted.headers.len(),
+            code_blocks = extracted.code_blocks.len(),
+            word_count = extracted.word_count,
+            "ContentExtractor extraction complete for two-layer storage"
+        );
+
+        // Create entry with extracted content
+        let entry = self.create_entry_from_extracted(&extracted, source_url)?;
+        let entry_id = entry.id.clone();
+
+        // Create page record for full content storage
+        let page = PageRecord::new(&entry_id, source_url, &extracted.markdown)
+            .with_title(extracted.title.clone());
+
+        let page = if let Some(ms) = crawl_time_ms {
+            page.with_crawl_time(ms)
+        } else {
+            page
+        };
+
+        // Process with two-layer storage
+        self.process_document_with_page(entry, &extracted.markdown, page).await
+    }
+
+    /// Process a document with two-layer storage pattern.
+    ///
+    /// Stores both the full page content and smaller chunks for search.
+    async fn process_document_with_page(
+        &self,
+        entry: Entry,
+        markdown: &str,
+        page: PageRecord,
+    ) -> Result<TwoLayerResult, JobError> {
+        let doc_id = entry.id.clone();
+        let doc_title = entry.title.clone();
+        let doc_description = entry.description.clone();
+        let page_id = page.page_id.clone();
+
+        // Use smart chunking
+        let mut chunks = self.chunker.chunk_smart_text(&entry, markdown);
+
+        if chunks.is_empty() {
+            warn!(doc_id = doc_id, "No chunks generated from document");
+            return Ok(TwoLayerResult {
+                document_id: doc_id,
+                page_id: Some(page_id),
+                chunks_created: 0,
+                embeddings_generated: 0,
+                related_patterns: vec![],
+            });
+        }
+
+        // Add page_id FK to all chunks
+        for chunk in &mut chunks {
+            chunk.page_id = Some(page_id.clone());
+        }
+
+        info!(
+            doc_id = doc_id,
+            page_id = page_id,
+            chunks = chunks.len(),
+            "Generated chunks with page FK reference"
+        );
+
+        // Generate embeddings via worker pool
+        let embeddings = self
+            .embedding_pool
+            .embed_chunks(chunks.clone())
+            .await
+            .map_err(|e| JobError::Processing(format!("Failed to generate embeddings: {}", e)))?;
+
+        // Store using two-layer storage
+        {
+            let store = self.store.write().await;
+
+            // Check if document already exists
+            let exists = store.document_exists(&doc_id).await
+                .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
+
+            if exists {
+                // Delete existing document, chunks, and pages
+                store.delete_chunks_by_document(&doc_id).await
+                    .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
+                store.delete_document(&doc_id).await
+                    .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
+
+                // Delete pages by source_id (entry_id)
+                let page_store = store.page_store()
+                    .map_err(|e| JobError::Processing(format!("Failed to get page store: {}", e)))?;
+                page_store.delete_pages_by_source(&doc_id).await
+                    .map_err(|e| JobError::Processing(format!("Failed to delete old pages: {}", e)))?;
+            }
+
+            // Insert new document
+            store.insert_documents(&[entry]).await
+                .map_err(|e| JobError::Processing(format!("Failed to insert document: {}", e)))?;
+
+            // Insert page and chunks together using two-layer storage
+            store.store_page_with_chunks(&page, &chunks, &embeddings).await
+                .map_err(|e| JobError::Processing(format!("Failed to store page with chunks: {}", e)))?;
+        }
+
+        // Find related patterns
+        let related_patterns = if self.config.enable_linking {
+            match self.linker.find_related_for_document(
+                &doc_title,
+                &doc_description,
+                None,
+                None,
+                Some(&doc_id),
+            ).await {
+                Ok(links) => {
+                    info!(
+                        doc_id = doc_id,
+                        related_count = links.len(),
+                        "Found related patterns"
+                    );
+                    links
+                }
+                Err(e) => {
+                    warn!(doc_id = doc_id, error = %e, "Failed to find related patterns");
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        info!(
+            doc_id = doc_id,
+            page_id = page_id,
+            title = doc_title,
+            chunks = chunks.len(),
+            related = related_patterns.len(),
+            "Successfully processed with two-layer storage"
+        );
+
+        Ok(TwoLayerResult {
+            document_id: doc_id,
+            page_id: Some(page_id),
+            chunks_created: chunks.len(),
+            embeddings_generated: embeddings.len(),
+            related_patterns,
+        })
+    }
+
+    /// Get the full page context for a chunk (for RAG enrichment).
+    ///
+    /// When a search returns chunks, use this to retrieve the full page
+    /// content for better context in RAG applications.
+    pub async fn get_page_context(&self, page_id: &str) -> Result<Option<PageRecord>, JobError> {
+        let store = self.store.read().await;
+        store.get_page_for_chunk(page_id).await
+            .map_err(|e| JobError::Processing(format!("Failed to get page context: {}", e)))
+    }
+}
+
+/// Result of processing with two-layer storage
+#[derive(Debug, Clone)]
+pub struct TwoLayerResult {
+    /// Document ID
+    pub document_id: String,
+    /// Page ID (for context retrieval)
+    pub page_id: Option<String>,
+    /// Number of chunks created
+    pub chunks_created: usize,
+    /// Number of embeddings generated
+    pub embeddings_generated: usize,
+    /// Related patterns found via semantic similarity
+    pub related_patterns: Vec<PatternLink>,
 }
 
 /// Result of processing a document

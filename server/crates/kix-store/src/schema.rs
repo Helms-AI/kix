@@ -3,6 +3,36 @@
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 
+// ============================================================================
+// Pages Table Schema (Two-Layer Storage)
+// ============================================================================
+
+/// Creates the schema for the pages table.
+///
+/// The pages table stores full page content for context retrieval.
+/// This is the first layer of the two-layer storage pattern:
+/// - Pages: Full content for RAG context
+/// - Chunks: Smaller pieces for vector search (with page_id FK)
+pub fn page_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("page_id", DataType::Utf8, false),      // Unique page identifier
+        Field::new("source_id", DataType::Utf8, false),    // FK to sources/entries table
+        Field::new("url", DataType::Utf8, false),          // Original URL
+        Field::new("title", DataType::Utf8, true),         // Page title
+        Field::new("full_content", DataType::Utf8, false), // Complete markdown content
+        Field::new("content_hash", DataType::Utf8, false), // Hash for deduplication
+        Field::new("content_length", DataType::UInt32, false), // Content length
+        Field::new("code_block_count", DataType::UInt32, false), // Number of code blocks
+        Field::new("metadata", DataType::Utf8, true),      // JSON metadata
+        Field::new("crawl_time_ms", DataType::UInt64, true), // Time to crawl
+        Field::new("created_at", DataType::Utf8, false),   // Creation timestamp
+    ]))
+}
+
+// ============================================================================
+// Entries Table Schema
+// ============================================================================
+
 /// Creates the schema for the entries table.
 pub fn entry_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -23,11 +53,19 @@ pub fn entry_schema() -> Arc<Schema> {
     ]))
 }
 
+// ============================================================================
+// Chunks Table Schema
+// ============================================================================
+
 /// Creates the schema for the chunks table with embeddings.
+///
+/// Chunks are the second layer of the two-layer storage pattern.
+/// They include a page_id foreign key for context retrieval.
 pub fn chunk_schema(embedding_dim: i32) -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("chunk_id", DataType::Utf8, false),
         Field::new("entry_id", DataType::Utf8, false),
+        Field::new("page_id", DataType::Utf8, true),       // FK to pages table (two-layer storage)
         Field::new("chunk_index", DataType::UInt32, false),
         Field::new("chunk_type", DataType::Utf8, false),
         Field::new("text", DataType::Utf8, false),

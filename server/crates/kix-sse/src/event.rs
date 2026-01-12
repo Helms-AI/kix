@@ -58,6 +58,24 @@ pub enum EventType {
         reason: String,
     },
 
+    /// Item (URL/file) was discovered and added to processing queue
+    ItemDiscovered {
+        job_id: Uuid,
+        item_path: String,
+        discovered_at: DateTime<Utc>,
+        /// Parent URL that contained this link (for crawls)
+        parent_url: Option<String>,
+        /// Depth in crawl tree (0 for seeds)
+        depth: usize,
+    },
+
+    /// Item processing has started
+    ItemStarted {
+        job_id: Uuid,
+        item_path: String,
+        started_at: DateTime<Utc>,
+    },
+
     /// Heartbeat to keep connection alive
     Heartbeat {
         timestamp: DateTime<Utc>,

@@ -9,6 +9,7 @@ description = "MCP server for Knowledge Indexer"
 kix-store = { path = "../kix-store" }
 kix-embeddings = { path = "../kix-embeddings" }
 kix-parser = { path = "../kix-parser" }
+kix-crawler = { path = "../kix-crawler" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

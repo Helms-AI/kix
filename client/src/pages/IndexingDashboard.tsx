@@ -20,15 +20,13 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { useSSE, SSEEvent } from '../hooks/useSSE';
-import { useJobEvents } from '../hooks/useJobEvents';
+import { useSSEContext } from '../contexts/SSEContext';
 import {
   indexingApi,
   Job,
   fileToBase64,
   formatFileSize,
   FileUpload,
-  EnhancedLiveJobData,
 } from '../api/indexingClient';
 import { ActiveJobCard } from '../components/indexing/ActiveJobCard';
 import { DeleteAllDataModal } from '../components/DeleteAllDataModal';
@@ -98,7 +96,7 @@ function UrlIndexingForm({ onSuccess }: { onSuccess?: () => void }) {
   const [timeoutSecs, setTimeoutSecs] = useState(30);   // Browser rendering timeout
   const [priority, setPriority] = useState(5);
   const [urlError, setUrlError] = useState('');
-  const [maxPages, setMaxPages] = useState(1000);
+  const [maxPages, setMaxPages] = useState(0);  // 0 = unlimited (discovery mode)
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const queryClient = useQueryClient();
@@ -624,12 +622,13 @@ function JobHistoryRow({ job, onCancel }: { job: Job; onCancel: (id: string) => 
 // ============================================================================
 export default function IndexingDashboard() {
   const [activeTab, setActiveTab] = useState<'url' | 'files'>('url');
-  const [liveJobData, setLiveJobData] = useState<Record<string, EnhancedLiveJobData>>({});
   const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
 
   const queryClient = useQueryClient();
-  const { processEvent, clearJob } = useJobEvents();
+
+  // Use global SSE context for real-time updates
+  const { isConnected, reconnect, jobs: liveJobData, clearJobLog } = useSSEContext();
 
   // Fetch jobs
   const { data: jobsData, isLoading, isError } = useQuery({
@@ -647,63 +646,9 @@ export default function IndexingDashboard() {
     },
   });
 
-  // SSE connection for real-time updates
-  // In development, connect directly to backend to avoid Vite proxy SSE issues
-  const sseUrl = import.meta.env.DEV
-    ? 'http://localhost:3001/api/indexing/sse'
-    : '/api/indexing/sse';
-
-  const { isConnected, reconnect } = useSSE({
-    url: sseUrl,
-    onEvent: (event: SSEEvent) => {
-      // Debug: log transformed events
-      if (import.meta.env.DEV) {
-        console.log('[Dashboard] Received event:', event.event_type, event.job_id, event);
-      }
-
-      // Process event through the job events hook
-      const updatedJobData = processEvent(event);
-
-      if (import.meta.env.DEV && updatedJobData) {
-        console.log('[Dashboard] Updated job data:', event.job_id, updatedJobData);
-      }
-
-      if (updatedJobData) {
-        setLiveJobData((prev) => ({
-          ...prev,
-          [event.job_id]: updatedJobData,
-        }));
-      }
-
-      // Handle job completion/cancellation
-      if (event.event_type === 'job_completed' || event.event_type === 'job_cancelled') {
-        queryClient.invalidateQueries({ queryKey: ['jobs'] });
-        clearJob(event.job_id);
-        setLiveJobData((prev) => {
-          const { [event.job_id]: _, ...rest } = prev;
-          return rest;
-        });
-      }
-    },
-  });
-
   // Toggle expansion (accordion behavior - only one expanded at a time)
   const handleToggleExpand = useCallback((jobId: string) => {
     setExpandedJobId((prev) => (prev === jobId ? null : jobId));
-  }, []);
-
-  // Clear log for a job
-  const handleClearLog = useCallback((jobId: string) => {
-    setLiveJobData((prev) => {
-      if (!prev[jobId]) return prev;
-      return {
-        ...prev,
-        [jobId]: {
-          ...prev[jobId],
-          log: [],
-        },
-      };
-    });
   }, []);
 
   // Handle delete all indexed data
@@ -852,7 +797,7 @@ export default function IndexingDashboard() {
                     isExpanded={expandedJobId === job.id}
                     onToggleExpand={() => handleToggleExpand(job.id)}
                     onCancel={(id) => cancelMutation.mutate(id)}
-                    onClearLog={handleClearLog}
+                    onClearLog={clearJobLog}
                   />
                 ))}
               </div>

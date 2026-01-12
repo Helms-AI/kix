@@ -6,7 +6,7 @@ pub mod manager;
 
 pub use event::{Event, EventType};
 pub use stream::{SseConnection, SseStream};
-pub use manager::{ConnectionManager, ConnectionError};
+pub use manager::{ConnectionManager, ConnectionError, spawn_cleanup_task};
 
 use thiserror::Error;
 

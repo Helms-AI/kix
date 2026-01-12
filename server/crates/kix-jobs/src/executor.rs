@@ -1,7 +1,8 @@
 //! Job executor for running jobs
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::stream::{self, StreamExt};
 use tokio::sync::Semaphore;
@@ -9,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use url::Url;
 
 use kix_crawler::crawler::{CrawlResult, Crawler, CrawlerConfig};
 use kix_sse::event::{Event, EventType, SourceType};
@@ -19,6 +21,33 @@ use crate::processor::{ContentProcessor, ProcessorConfig};
 use crate::progress::ProgressTracker;
 use crate::queue::JobQueue;
 use crate::JobError;
+
+/// Normalize URL for display deduplication (strips query params and fragments)
+/// This ensures URLs like /login?redirect=/docs and /login?redirect=/api
+/// are treated as the same page for UI display purposes.
+fn normalize_url_for_display(url: &Url) -> String {
+    let mut result = String::new();
+
+    // Scheme
+    result.push_str(url.scheme());
+    result.push_str("://");
+
+    // Host (lowercase)
+    if let Some(host) = url.host_str() {
+        result.push_str(&host.to_lowercase());
+    }
+
+    // Path only (no query params, no fragment)
+    // Remove trailing slash unless root
+    let path = url.path();
+    if path == "/" {
+        result.push('/');
+    } else {
+        result.push_str(path.trim_end_matches('/'));
+    }
+
+    result
+}
 
 /// Configuration for job executor
 #[derive(Clone, Debug)]
@@ -288,9 +317,24 @@ impl JobExecutor {
             ..Default::default()
         };
 
-        let crawler = Crawler::new(crawler_config)
-            .await
-            .map_err(|e| JobError::Processing(format!("Failed to create crawler: {}", e)))?;
+        let crawler = Arc::new(
+            Crawler::new(crawler_config)
+                .await
+                .map_err(|e| JobError::Processing(format!("Failed to create crawler: {}", e)))?
+        );
+
+        // Emit ItemDiscovered for seed URL (path-only normalization to prevent duplicates)
+        let normalized_seed = normalize_url_for_display(&seed_url);
+        let _ = sse_manager.broadcast_to_job(
+            job.id,
+            Event::new(EventType::ItemDiscovered {
+                job_id: job.id,
+                item_path: normalized_seed.clone(),
+                discovered_at: chrono::Utc::now(),
+                parent_url: None,
+                depth: 0,
+            }),
+        );
 
         // Stats for streaming processing (using atomics for thread-safe access)
         let processed_count = Arc::new(AtomicUsize::new(0));
@@ -300,6 +344,11 @@ impl JobExecutor {
         let job_id = job.id;
         let start = std::time::Instant::now();
         let concurrency = 8; // Process up to 8 pages concurrently
+
+        // Track URLs we've already emitted ItemDiscovered for to prevent duplicates
+        // The seed URL is already emitted above, so add it (using normalized form)
+        let emitted_urls: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        emitted_urls.lock().unwrap().insert(normalized_seed.clone());
 
         // Use UNBOUNDED channel - send() is synchronous and never drops messages
         // This ensures all crawled pages are processed, even if processing is slower than crawling
@@ -328,11 +377,16 @@ impl JobExecutor {
             chunks: usize,
             embeddings: usize,
             error: Option<String>,
+            /// Links discovered from this page (for ItemDiscovered events)
+            discovered_links: Vec<(String, usize)>, // (url, depth)
         }
 
         // Convert receiver to stream for parallel processing
         let result_stream = UnboundedReceiverStream::new(rx);
         let processed_count_clone = processed_count.clone();
+
+        // Reference SSE manager for use in processing closure
+        let sse_for_processing = sse_manager;
 
         // Process pages in PARALLEL using buffer_unordered (like file uploads)
         info!(url = url, max_pages = effective_max_pages, concurrency = concurrency, "Starting parallel crawl and process");
@@ -345,33 +399,64 @@ impl JobExecutor {
             })
             .map(|result| {
                 let proc = processor.cloned();
+                let sse = sse_for_processing;
+                let jid = job_id;
                 async move {
-                    let page_url = result.url.to_string();
+                    // Keep raw URL for content processing (storage needs original URL)
+                    let raw_url = result.url.to_string();
+                    // Normalize URL for SSE events (must match ItemDiscovered format)
+                    let display_url = normalize_url_for_display(&result.url);
+
+                    // Emit ItemStarted when processing begins
+                    let _ = sse.broadcast_to_job(
+                        jid,
+                        Event::new(EventType::ItemStarted {
+                            job_id: jid,
+                            item_path: display_url.clone(),
+                            started_at: chrono::Utc::now(),
+                        }),
+                    );
+
+                    // Collect discovered links for ItemDiscovered events
+                    // Filter to same-domain links only (crawler does this too)
+                    // Use normalize_url_for_display to strip query params for deduplication
+                    let seed_domain = result.url.domain().map(|d| d.to_string());
+                    let discovered_links: Vec<(String, usize)> = result.links.iter()
+                        .filter(|link| {
+                            link.domain().map(|d| d.to_string()) == seed_domain
+                        })
+                        .map(|link| (normalize_url_for_display(link), 1))
+                        .collect();
+
                     if let Some(ref p) = proc {
-                        match p.process_html(&result.content, &page_url).await {
+                        // Use raw URL for content processing
+                        match p.process_html(&result.content, &raw_url).await {
                             Ok(res) => PageResult {
-                                url: page_url,
+                                url: display_url,
                                 chunks: res.chunks_created,
                                 embeddings: res.embeddings_generated,
                                 error: None,
+                                discovered_links,
                             },
                             Err(e) => {
-                                let error_msg = format!("Failed to process {}: {}", page_url, e);
+                                let error_msg = format!("Failed to process {}: {}", raw_url, e);
                                 warn!("{}", error_msg);
                                 PageResult {
-                                    url: page_url,
+                                    url: display_url,
                                     chunks: 0,
                                     embeddings: 0,
                                     error: Some(error_msg),
+                                    discovered_links,
                                 }
                             }
                         }
                     } else {
                         PageResult {
-                            url: page_url,
+                            url: display_url,
                             chunks: 0,
                             embeddings: 0,
                             error: None,
+                            discovered_links,
                         }
                     }
                 }
@@ -387,6 +472,7 @@ impl JobExecutor {
             total_chunks += result.chunks;
             total_embeddings += result.embeddings;
 
+            // Emit ItemProcessed or Error for this page
             if let Some(ref err) = result.error {
                 errors.push(err.clone());
                 let _ = sse_manager.broadcast_to_job(
@@ -399,7 +485,6 @@ impl JobExecutor {
                     }),
                 );
             } else {
-                // Send SSE update immediately
                 let _ = sse_manager.broadcast_to_job(
                     job_id,
                     Event::new(EventType::ItemProcessed {
@@ -412,30 +497,57 @@ impl JobExecutor {
                 );
             }
 
+            // Emit ItemDiscovered for new URLs found on this page (deduplicated)
+            for (link_url, depth) in &result.discovered_links {
+                // Only emit if this URL hasn't been emitted before
+                let is_new = {
+                    let mut emitted = emitted_urls.lock().unwrap();
+                    emitted.insert(link_url.clone())
+                };
+
+                if is_new {
+                    let _ = sse_manager.broadcast_to_job(
+                        job_id,
+                        Event::new(EventType::ItemDiscovered {
+                            job_id,
+                            item_path: link_url.clone(),
+                            discovered_at: chrono::Utc::now(),
+                            parent_url: Some(result.url.clone()),
+                            depth: *depth,
+                        }),
+                    );
+                }
+            }
+
+            // Get discovered count from our tracking (this is the real-time total)
+            let discovered = emitted_urls.lock().unwrap().len();
+
             // Update tracker
             tracker.increment(1).await;
             tracker
                 .update_metrics(|m| {
                     m.chunks_created = total_chunks;
-                    m.items_discovered = count;
+                    m.items_discovered = discovered;
                 })
                 .await;
 
-            // Send progress event immediately
+            // Send progress event - total is simply the discovered URLs count
             let progress = tracker.get_progress().await;
+            let percentage = if discovered > 0 {
+                (count as f32 / discovered as f32) * 100.0
+            } else {
+                0.0
+            };
+
             let _ = sse_manager.broadcast_to_job(
                 job_id,
                 Event::new(EventType::Progress {
                     job_id,
                     processed: count,
-                    total: effective_max_pages.min(count + 100), // Estimate since we don't know total
+                    total: discovered,
                     current_item: Some(result.url),
                     rate: progress.rate,
-                    percentage: if effective_max_pages < usize::MAX {
-                        (count as f32 / effective_max_pages as f32) * 100.0
-                    } else {
-                        progress.percentage
-                    },
+                    percentage,
                 }),
             );
         }

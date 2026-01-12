@@ -1,6 +1,6 @@
 //! Search operations for the Knowledge Indexer store.
 
-use arrow_array::{Array, RecordBatch, StringArray, Float32Array, Int32Array};
+use arrow_array::{Array, RecordBatch, StringArray, Float32Array, UInt32Array};
 use futures::TryStreamExt;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -679,17 +679,18 @@ impl KixStore {
     }
 
     /// Helper to get an optional int column from a RecordBatch.
+    /// Note: chunk_index is stored as UInt32, so we read UInt32Array and convert to i32.
     fn get_optional_int_column(batch: &RecordBatch, name: &str) -> Vec<Option<i32>> {
         batch
             .column_by_name(name)
-            .and_then(|col| col.as_any().downcast_ref::<Int32Array>())
+            .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
             .map(|array| {
                 (0..array.len())
                     .map(|i| {
                         if array.is_null(i) {
                             None
                         } else {
-                            Some(array.value(i))
+                            Some(array.value(i) as i32)
                         }
                     })
                     .collect()

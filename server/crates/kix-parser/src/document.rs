@@ -168,6 +168,9 @@ pub struct EntryChunk {
     /// Parent entry ID
     pub entry_id: String,
 
+    /// FK to pages table for two-layer storage (context retrieval)
+    pub page_id: Option<String>,
+
     /// Index of this chunk within the entry
     pub chunk_index: u32,
 
@@ -569,11 +572,18 @@ impl EntryChunk {
         Self {
             chunk_id,
             entry_id,
+            page_id: None,
             chunk_index,
             chunk_type,
             text,
             metadata,
         }
+    }
+
+    /// Creates a new EntryChunk with a page_id (two-layer storage).
+    pub fn with_page_id(mut self, page_id: String) -> Self {
+        self.page_id = Some(page_id);
+        self
     }
 }
 

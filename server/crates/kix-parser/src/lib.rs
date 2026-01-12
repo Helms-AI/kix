@@ -1,17 +1,27 @@
 //! Knowledge Indexer Parser - Content parsing for the Knowledge Indexer.
 //!
-//! This crate provides parsers for various content types including HTML, PDF, DOCX,
+//! This crate provides parsers for various content types including PDF, DOCX,
 //! Excel, CSV, Markdown, and source code files.
+//!
+//! # HTML Content Extraction
+//!
+//! For HTML content extraction, use `kix_crawler::ContentExtractor` which provides:
+//! - Mozilla Readability algorithm for main content detection
+//! - Boilerplate removal (navigation, footer, sidebar, ads)
+//! - Code block preservation
+//! - Markdown conversion
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use kix_parser::{HtmlParser, PdfParser, MarkdownParser, Entry};
+//! use kix_parser::{PdfParser, MarkdownParser, Entry};
+//! use kix_crawler::ContentExtractor;
 //!
-//! // Parse an HTML page
-//! let html_parser = HtmlParser::new();
+//! // Parse an HTML page using ContentExtractor
+//! let extractor = ContentExtractor::default();
 //! let html_content = std::fs::read_to_string("page.html")?;
-//! let entry = html_parser.parse(&html_content, "https://example.com/page.html")?;
+//! let url = url::Url::parse("https://example.com/page.html")?;
+//! let extracted = extractor.extract(&html_content, &url);
 //!
 //! // Parse a Markdown document
 //! let md_parser = MarkdownParser::new();
@@ -23,15 +33,16 @@
 //! let entry = pdf_parser.parse("docs/manual.pdf")?;
 //! ```
 
+pub mod chunker;
 pub mod csv_parser;
 pub mod docx;
 pub mod document;
 pub mod error;
 pub mod excel;
-pub mod html;
 pub mod markdown;
 pub mod pdf;
 pub mod text;
+pub mod validator;
 
 // Re-export main types (new names)
 pub use document::{
@@ -68,7 +79,17 @@ pub use error::ParseError;
 pub use csv_parser::CsvParser;
 pub use docx::DocxParser;
 pub use excel::ExcelParser;
-pub use html::HtmlParser;
+// NOTE: For HTML content extraction, use kix_crawler::ContentExtractor
+// which provides Mozilla Readability algorithm, boilerplate removal, and markdown conversion.
 pub use markdown::MarkdownParser;
 pub use pdf::PdfParser;
 pub use text::TextParser;
+
+// Re-export validator (multi-stage code validation)
+pub use validator::{CodeValidator, ValidationResult, ValidatorConfig};
+
+// Re-export chunker (smart chunking with boundary preservation)
+pub use chunker::{
+    ChunkerConfig, SmartChunk, SmartChunkType, SmartChunker,
+    chunk_text, chunk_text_with_size, chunk_for_embeddings,
+};

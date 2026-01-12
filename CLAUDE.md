@@ -65,14 +65,53 @@ cargo build --release --features onnx-coreml --manifest-path server/Cargo.toml
 ```
 server/crates/
 ├── kix-cli/         # Main CLI binary - orchestrates all other crates
-├── kix-parser/      # Document parsing (HTML, PDF, DOCX, Excel, CSV, Markdown, text)
-├── kix-embeddings/  # Embedding generation (fastembed) and document chunking
-├── kix-store/       # LanceDB vector storage, indexing, and search operations
+├── kix-parser/      # Document parsing, smart chunking, code validation
+├── kix-embeddings/  # Embedding generation (fastembed) with contextual support
+├── kix-store/       # LanceDB two-layer storage (pages + chunks)
 ├── kix-mcp-server/  # MCP server with search/indexing tools (rmcp crate)
 ├── kix-api/         # Axum REST API for dashboard
-├── kix-crawler/     # URL crawling, file upload handling, rate limiting
-├── kix-jobs/        # Job queue and executor for async indexing tasks
+├── kix-crawler/     # URL discovery, crawling strategies, code extraction
+├── kix-jobs/        # Job queue, executor, and content processor
 └── kix-sse/         # Server-Sent Events for real-time progress updates
+```
+
+### kix-crawler Submodules
+
+```
+kix-crawler/
+├── discovery.rs      # URL discovery (llms.txt → sitemap → robots priority)
+├── ssrf.rs           # SSRF protection and URL validation
+├── progress.rs       # 9-stage progress tracking with monotonicity
+├── cancellation.rs   # Global cancellation registry for job control
+├── extractor.rs      # Markdown generation from HTML with code preservation
+├── code.rs           # 30+ code extraction patterns (Docusaurus, MkDocs, etc.)
+├── service.rs        # CrawlerService orchestration
+└── strategies/
+    ├── single_page.rs  # Single page with retry and framework detection
+    ├── batch.rs        # Parallel batch crawling with semaphore
+    ├── recursive.rs    # Depth-first recursive crawling
+    └── sitemap.rs      # XML sitemap parsing and crawling
+```
+
+### kix-parser Submodules
+
+```
+kix-parser/
+├── chunker.rs        # Smart chunking (code → paragraphs → sentences)
+├── validator.rs      # Multi-stage code validation (length, structure, prose ratio)
+├── html.rs           # HTML parsing with readability extraction
+├── document.rs       # Entry and EntryChunk types with page_id FK
+└── ...               # PDF, DOCX, Excel, CSV, Markdown parsers
+```
+
+### kix-store Two-Layer Storage
+
+```
+kix-store/
+├── store.rs          # KixStore with init_tables(), store_page_with_chunks()
+├── pages.rs          # PageStore for full page content (RAG context)
+├── search.rs         # Hybrid search (vector + full-text)
+└── schema.rs         # LanceDB schemas for entries, chunks, pages
 ```
 
 ### Key Dependencies
@@ -83,22 +122,70 @@ server/crates/
 - **tokio**: Async runtime
 
 ### Data Flow
-1. Content is parsed by `kix-parser` into `Document` structs
-2. `kix-embeddings` chunks documents and generates vector embeddings
-3. `kix-store` stores documents and chunks in LanceDB tables
-4. Search queries use hybrid search (vector + full-text) via `kix-store`
-5. `kix-mcp-server` exposes tools for AI assistants to search/index
-6. `kix-api` provides REST endpoints for the client dashboard
-7. `kix-jobs` + `kix-crawler` handle async indexing from URLs/files
-8. `kix-sse` streams progress updates to the dashboard
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    KIX Processing Pipeline                       │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Discovery      → URL discovery (llms.txt → sitemap → robots)│
+│  2. Crawling       → Playwright browser with strategy selection │
+│  3. Processing     → Readability extraction → Markdown          │
+│  4. Code Extract   → 30+ patterns with multi-stage validation   │
+│  5. Smart Chunking → Code blocks → paragraphs → sentences       │
+│  6. Embeddings     → fastembed with optional page context       │
+│  7. Two-Layer Store→ Pages (full) + Chunks (searchable) in Lance│
+│  8. Search         → Hybrid (vector + FTS) with RAG context     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Detailed Flow:**
+1. `kix-crawler/discovery` discovers URLs via llms.txt → sitemap → robots priority
+2. `kix-crawler/strategies` crawls using single_page, batch, recursive, or sitemap strategy
+3. `kix-parser/html` extracts content using Mozilla Readability → Markdown conversion
+4. `kix-crawler/code` extracts code blocks using 30+ patterns (Docusaurus, MkDocs, etc.)
+5. `kix-parser/chunker` uses smart algorithm: code blocks (never split) → paragraphs → sentences
+6. `kix-embeddings` generates vector embeddings with worker pool (auto-scales CPU/GPU)
+7. `kix-store` stores pages (full content for RAG) + chunks (with page_id FK for context)
+8. Search returns chunks; `get_page_context()` retrieves full page for RAG enrichment
 
 ### Core Types
 
-- `Document` (kix-parser): Parsed document with title, content, categories, pattern_type
-- `DocumentChunk` (kix-parser): Text chunks with metadata for embedding
-- `KixStore` (kix-store): Main store interface with `hybrid_search`, `vector_search`, `text_search`
-- `EmbeddingGenerator` (kix-embeddings): Generates embeddings for queries and documents
-- `KixMcpServer` (kix-mcp-server): MCP server with 14 tools for search/indexing
+- `Entry` (kix-parser): Parsed document with title, content, source_type, entry_type
+- `EntryChunk` (kix-parser): Text chunks with chunk_index, page_id FK, and metadata
+- `PageRecord` (kix-store): Full page content for RAG context retrieval
+- `KixStore` (kix-store): Main store with `hybrid_search`, `store_page_with_chunks`, `get_page_for_chunk`
+- `ContentProcessor` (kix-jobs): Orchestrates parsing, chunking, embedding, storage
+- `CrawlerService` (kix-crawler): 9-stage crawl pipeline with progress and cancellation
+- `SmartChunker` (kix-parser): Smart chunking with consolidation
+- `CodeValidator` (kix-parser): Multi-stage validation (length, structure, prose ratio)
+
+## Smart Chunking
+
+KIX uses intelligent chunking optimized for documentation and code content:
+
+### Chunking Algorithm (kix-parser/src/chunker.rs)
+- Priority: Code blocks → Paragraphs → Sentences → Hard cut
+- Break threshold: 30% minimum position (`SMART_BREAK_THRESHOLD`)
+- Consolidation: Chunks < 200 chars merged (`SMART_CONSOLIDATION_THRESHOLD`)
+
+### Content Extraction (kix-crawler/src/extractor.rs)
+- Content source: Raw HTML (NOT cleaned) - preserves code blocks
+- Code preservation: Priority 1
+- Markdown generation: htmd library
+
+### Progress Tracking (9 Stages)
+
+| Stage | Range | Description |
+|-------|-------|-------------|
+| starting | 0-5% | Initialization |
+| discovery | 5-15% | URL discovery |
+| analyzing | 15-25% | Content analysis |
+| crawling | 25-60% | Page fetching |
+| processing | 60-75% | HTML → Markdown |
+| source_creation | 75-80% | Entry creation |
+| document_storage | 80-90% | LanceDB storage |
+| code_extraction | 90-95% | Code block extraction |
+| finalization | 95-100% | Cleanup and completion |
 
 ### MCP Tools (exposed to AI assistants)
 Search: `search_patterns`, `get_pattern`, `list_patterns`, `find_related`, `search_by_problem`, `search_by_technology`
@@ -133,8 +220,25 @@ Vite proxy configuration:
 
 ## Testing
 
-Tests are colocated with source files using `#[cfg(test)]` modules. Key test files:
-- `server/crates/kix-parser/src/*.rs` - Parser tests for each format
-- `server/crates/kix-store/src/search.rs` - Search functionality tests
-- `server/crates/kix-embeddings/src/chunker.rs` - Chunking logic tests
-- `server/crates/kix-api/src/routes.rs` - API endpoint tests
+Tests are colocated with source files using `#[cfg(test)]` modules. **95+ tests across core crates.**
+
+### Unit Tests
+```bash
+cargo test --release -p kix-crawler    # 45 tests (discovery, code, strategies, etc.)
+cargo test --release -p kix-parser     # 40 tests (chunker, validator, parsers)
+cargo test --release -p kix-store      # 10 tests (pages, search, schema)
+```
+
+### Integration Tests
+```bash
+cargo test --release -p kix-jobs --test pipeline_integration  # Full pipeline tests
+```
+
+### Key Test Modules
+- `kix-crawler/src/discovery.rs` - URL discovery (llms.txt, sitemap, robots)
+- `kix-crawler/src/code.rs` - 30+ code extraction patterns
+- `kix-parser/src/chunker.rs` - Smart chunking algorithm
+- `kix-parser/src/validator.rs` - Multi-stage code validation
+- `kix-store/src/pages.rs` - Two-layer storage
+- `kix-store/src/search.rs` - Hybrid search functionality
+- `kix-jobs/tests/pipeline_integration.rs` - End-to-end pipeline tests

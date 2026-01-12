@@ -1,8 +1,7 @@
 import { useCallback, useRef } from 'react';
-import type { JobLogEntry, EnhancedLiveJobData } from '../api/indexingClient';
+import type { JobLogEntry, EnhancedLiveJobData, PageState } from '../api/indexingClient';
 import type { SSEEvent } from './useSSE';
 
-const MAX_LOG_ENTRIES = 500;
 const MAX_RATE_SAMPLES = 20;
 
 export interface JobEventsState {
@@ -26,7 +25,7 @@ export function useJobEvents() {
         total: 0,
         percentage: 0,
         rate: 0,
-        log: [],
+        pages: {},
         errors: [],
         rateHistory: [],
         totalChunks: 0,
@@ -81,19 +80,53 @@ export function useJobEvents() {
         break;
       }
 
-      case 'item_processed': {
-        const logEntry: JobLogEntry = {
-          id: generateLogEntryId(),
-          type: 'item',
-          timestamp: event.timestamp,
-          item_path: event.data.item_path || event.data.current_item || 'Unknown',
-          chunks_created: event.data.chunks_created,
-          embeddings_generated: event.data.embeddings_generated,
-          duration_ms: event.data.duration_ms,
-        };
+      case 'item_discovered': {
+        const itemPath = event.data.item_path || 'Unknown';
+        // Only add if not already tracked
+        if (!jobState.pages[itemPath]) {
+          const pageState: PageState = {
+            url: itemPath,
+            status: 'pending',
+            discoveredAt: event.data.discovered_at || event.timestamp,
+            parentUrl: event.data.parent_url,
+            depth: event.data.depth,
+          };
+          jobState.pages = { ...jobState.pages, [itemPath]: pageState };
+        }
+        break;
+      }
 
-        // Add to log (ring buffer)
-        jobState.log = [...jobState.log.slice(-MAX_LOG_ENTRIES + 1), logEntry];
+      case 'item_started': {
+        const itemPath = event.data.item_path || 'Unknown';
+        const existingPage = jobState.pages[itemPath];
+        const pageState: PageState = {
+          url: itemPath,
+          status: 'running',
+          discoveredAt: existingPage?.discoveredAt || event.timestamp,
+          parentUrl: existingPage?.parentUrl,
+          depth: existingPage?.depth,
+          startedAt: event.data.started_at || event.timestamp,
+        };
+        jobState.pages = { ...jobState.pages, [itemPath]: pageState };
+        break;
+      }
+
+      case 'item_processed': {
+        const itemPath = event.data.item_path || event.data.current_item || 'Unknown';
+        const existingPage = jobState.pages[itemPath];
+        const pageState: PageState = {
+          url: itemPath,
+          status: 'completed',
+          discoveredAt: existingPage?.discoveredAt || event.timestamp,
+          parentUrl: existingPage?.parentUrl,
+          depth: existingPage?.depth,
+          startedAt: existingPage?.startedAt,
+          completedAt: event.timestamp,
+          chunksCreated: event.data.chunks_created,
+          embeddingsGenerated: event.data.embeddings_generated,
+          durationMs: event.data.duration_ms,
+        };
+        jobState.pages = { ...jobState.pages, [itemPath]: pageState };
 
         // Update totals
         if (event.data.chunks_created) {
@@ -106,19 +139,32 @@ export function useJobEvents() {
       }
 
       case 'error': {
+        const itemPath = event.data.item_path || event.data.current_item || 'Unknown';
+        const existingPage = jobState.pages[itemPath];
+
+        // Update page state to error
+        const pageState: PageState = {
+          url: itemPath,
+          status: 'error',
+          discoveredAt: existingPage?.discoveredAt || event.timestamp,
+          parentUrl: existingPage?.parentUrl,
+          depth: existingPage?.depth,
+          startedAt: existingPage?.startedAt,
+          completedAt: event.timestamp,
+          errorMessage: event.data.error_message || event.data.error || 'Unknown error',
+          recoverable: event.data.recoverable,
+        };
+        jobState.pages = { ...jobState.pages, [itemPath]: pageState };
+
+        // Also keep in errors array for quick summary
         const errorEntry: JobLogEntry = {
           id: generateLogEntryId(),
           type: 'error',
           timestamp: event.timestamp,
-          item_path: event.data.item_path || event.data.current_item || 'Unknown',
+          item_path: itemPath,
           error_message: event.data.error_message || event.data.error || 'Unknown error',
           recoverable: event.data.recoverable,
         };
-
-        // Add to log
-        jobState.log = [...jobState.log.slice(-MAX_LOG_ENTRIES + 1), errorEntry];
-
-        // Track errors separately
         jobState.errors = [...jobState.errors, errorEntry];
         break;
       }

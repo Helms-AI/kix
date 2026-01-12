@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { memo, useMemo, useId } from 'react';
 
 interface RateSparklineProps {
   data: number[];
@@ -8,56 +8,64 @@ interface RateSparklineProps {
   className?: string;
 }
 
-export function RateSparkline({
+export const RateSparkline = memo(function RateSparkline({
   data,
-  width = 120,
-  height = 32,
+  width = 200,
+  height = 40,
   color = '#22d3ee',
   className = '',
 }: RateSparklineProps) {
-  const pathData = useMemo(() => {
-    if (data.length === 0) return null;
+  const gradientId = useId();
 
-    const padding = 2;
+  const pathData = useMemo(() => {
+    if (data.length < 2) return null;
+
+    const padding = 4;
     const chartWidth = width - padding * 2;
     const chartHeight = height - padding * 2;
 
-    // Normalize data
-    const maxValue = Math.max(...data, 1); // Avoid division by zero
+    // Normalize data with some padding for visual appeal
+    const maxValue = Math.max(...data, 0.1);
     const minValue = Math.min(...data, 0);
-    const range = maxValue - minValue || 1;
+    const valueRange = maxValue - minValue || 1;
 
-    // Calculate points
+    // Calculate point positions
     const points = data.map((value, index) => {
-      const x = padding + (index / (data.length - 1 || 1)) * chartWidth;
-      const y = padding + chartHeight - ((value - minValue) / range) * chartHeight;
-      return { x, y };
+      const x = padding + (index / (data.length - 1)) * chartWidth;
+      const y = padding + chartHeight - ((value - minValue) / valueRange) * chartHeight;
+      return { x, y, value };
     });
 
-    // Build path for the line
-    const linePath = points
-      .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
-      .join(' ');
+    // Create smooth bezier curve path
+    let linePath = `M ${points[0].x} ${points[0].y}`;
+    for (let i = 1; i < points.length; i++) {
+      const prev = points[i - 1];
+      const curr = points[i];
+      const cpx = (prev.x + curr.x) / 2;
+      linePath += ` Q ${cpx} ${prev.y} ${(cpx + curr.x) / 2} ${(prev.y + curr.y) / 2}`;
+    }
+    // Final point
+    const last = points[points.length - 1];
+    linePath += ` L ${last.x} ${last.y}`;
 
-    // Build path for the fill (area under the line)
+    // Area fill path (same as line but closed at bottom)
     const fillPath = `
-      M ${padding} ${height - padding}
-      ${points.map((point) => `L ${point.x} ${point.y}`).join(' ')}
-      L ${width - padding} ${height - padding}
+      ${linePath}
+      L ${last.x} ${height - padding}
+      L ${padding} ${height - padding}
       Z
     `;
 
-    return { linePath, fillPath, points };
+    return { linePath, fillPath, points, lastPoint: last };
   }, [data, width, height]);
 
-  if (!pathData || data.length < 2) {
-    // Show placeholder when no data
+  if (!pathData) {
     return (
       <div
-        className={`flex items-center justify-center text-slate-600 text-xs ${className}`}
+        className={`flex items-center justify-center text-slate-600 text-xs font-mono ${className}`}
         style={{ width, height }}
       >
-        No data
+        <span className="opacity-60">No data</span>
       </div>
     );
   }
@@ -67,23 +75,25 @@ export function RateSparkline({
       width={width}
       height={height}
       viewBox={`0 0 ${width} ${height}`}
-      className={className}
+      className={`overflow-visible ${className}`}
+      preserveAspectRatio="none"
     >
       <defs>
-        <linearGradient id="sparklineFill" x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stopColor={color} stopOpacity="0.3" />
+        {/* Gradient fill for area under curve */}
+        <linearGradient id={gradientId} x1="0%" y1="0%" x2="0%" y2="100%">
+          <stop offset="0%" stopColor={color} stopOpacity="0.25" />
           <stop offset="100%" stopColor={color} stopOpacity="0" />
         </linearGradient>
       </defs>
 
-      {/* Fill area */}
+      {/* Area fill */}
       <path
         d={pathData.fillPath}
-        fill="url(#sparklineFill)"
+        fill={`url(#${gradientId})`}
         className="transition-all duration-300"
       />
 
-      {/* Line */}
+      {/* Line stroke */}
       <path
         d={pathData.linePath}
         fill="none"
@@ -94,16 +104,25 @@ export function RateSparkline({
         className="transition-all duration-300"
       />
 
-      {/* Latest point highlight */}
-      {pathData.points.length > 0 && (
+      {/* Latest point with pulse effect */}
+      <g>
+        {/* Outer pulse ring */}
         <circle
-          cx={pathData.points[pathData.points.length - 1].x}
-          cy={pathData.points[pathData.points.length - 1].y}
-          r={2.5}
+          cx={pathData.lastPoint.x}
+          cy={pathData.lastPoint.y}
+          r={6}
           fill={color}
-          className="animate-pulse"
+          className="animate-ping opacity-30"
         />
-      )}
+        {/* Inner dot */}
+        <circle
+          cx={pathData.lastPoint.x}
+          cy={pathData.lastPoint.y}
+          r={3}
+          fill={color}
+          className="drop-shadow-[0_0_4px_rgba(34,211,238,0.5)]"
+        />
+      </g>
     </svg>
   );
-}
+});

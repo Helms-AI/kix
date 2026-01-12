@@ -4,6 +4,8 @@ export type SSEEventType =
   | 'job_started'
   | 'progress'
   | 'item_processed'
+  | 'item_discovered'
+  | 'item_started'
   | 'error'
   | 'job_completed'
   | 'job_cancelled'
@@ -39,6 +41,12 @@ interface BackendSSEEvent {
     errors?: string[];
     // Job cancelled fields
     reason?: string;
+    // Item discovered fields
+    discovered_at?: string;
+    parent_url?: string;
+    depth?: number;
+    // Item started fields
+    started_at?: string;
   };
 }
 
@@ -82,6 +90,14 @@ export interface SSEEvent {
       duration_secs: number;
       total_chunks?: number;
     };
+
+    // Item discovered fields
+    discovered_at?: string;
+    parent_url?: string;
+    depth?: number;
+
+    // Item started fields
+    started_at?: string;
   };
 }
 
@@ -138,6 +154,12 @@ function transformBackendEvent(raw: BackendSSEEvent): SSEEvent | null {
         duration_secs: (data.duration_ms || 0) / 1000,
         total_chunks: data.total_chunks,
       } : undefined,
+      // Item discovered fields
+      discovered_at: data.discovered_at,
+      parent_url: data.parent_url,
+      depth: data.depth,
+      // Item started fields
+      started_at: data.started_at,
     },
   };
 }
@@ -233,6 +255,8 @@ export function useSSE({
       'job_started',
       'progress',
       'item_processed',
+      'item_discovered',
+      'item_started',
       'error',
       'job_completed',
       'job_cancelled',

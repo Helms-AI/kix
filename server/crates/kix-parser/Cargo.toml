@@ -13,6 +13,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 regex.workspace = true
 sha2.workspace = true
+tracing.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { workspace = true, features = ["v4"] }
 url = { workspace = true }
@@ -23,5 +24,14 @@ csv = "1.3"              # CSV parsing
 pulldown-cmark = "0.12"  # Markdown parsing
 dotext = "0.1"           # DOCX text extraction
 
+# HTML content extraction
+readability = "0.3"      # Mozilla Readability algorithm (extract main content)
+htmd = "0.2"             # HTML to Markdown conversion
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+criterion = "0.5"
+
+[[bench]]
+name = "chunking_bench"
+harness = false

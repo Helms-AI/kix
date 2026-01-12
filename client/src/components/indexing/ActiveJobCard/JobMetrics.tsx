@@ -1,4 +1,4 @@
-import React from 'react';
+import { memo, type ReactNode } from 'react';
 import { FileText, Layers, Brain, AlertTriangle, Zap } from 'lucide-react';
 import { RateSparkline } from './RateSparkline';
 
@@ -14,49 +14,61 @@ interface JobMetricsProps {
 }
 
 function formatNumber(num: number): string {
-  if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
-  if (num >= 1000) return `${(num / 1000).toFixed(1)}K`;
+  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(1)}M`;
+  if (num >= 1_000) return `${(num / 1_000).toFixed(1)}K`;
   return num.toLocaleString();
 }
 
 interface MetricCardProps {
-  icon: React.ReactNode;
+  icon: ReactNode;
   label: string;
   value: string | number;
   subValue?: string;
   variant?: 'default' | 'error' | 'success';
+  className?: string;
 }
 
-function MetricCard({ icon, label, value, subValue, variant = 'default' }: MetricCardProps) {
-  const bgColor = {
+const MetricCard = memo(function MetricCard({
+  icon,
+  label,
+  value,
+  subValue,
+  variant = 'default',
+  className = '',
+}: MetricCardProps) {
+  const bgStyles = {
     default: 'bg-slate-800/50',
-    error: 'bg-red-900/20',
-    success: 'bg-emerald-900/20',
+    error: 'bg-red-950/40',
+    success: 'bg-emerald-950/30',
   }[variant];
 
-  const textColor = {
+  const textStyles = {
     default: 'text-white',
     error: 'text-red-400',
     success: 'text-emerald-400',
   }[variant];
 
   return (
-    <div className={`${bgColor} rounded-lg p-3`}>
-      <div className="flex items-center gap-2 mb-1">
+    <div className={`rounded-lg p-3 ${bgStyles} ${className}`}>
+      <div className="flex items-center gap-2 mb-1.5">
         {icon}
-        <span className="text-xs text-slate-400 uppercase tracking-wide">{label}</span>
+        <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
+          {label}
+        </span>
       </div>
-      <div className={`text-lg font-semibold ${textColor}`}>
+      <div className={`text-lg font-bold font-mono tracking-tight ${textStyles}`}>
         {typeof value === 'number' ? formatNumber(value) : value}
       </div>
       {subValue && (
-        <div className="text-xs text-slate-500 mt-0.5">{subValue}</div>
+        <div className="text-[11px] text-slate-500 mt-0.5 font-medium">
+          {subValue}
+        </div>
       )}
     </div>
   );
-}
+});
 
-export function JobMetrics({
+export const JobMetrics = memo(function JobMetrics({
   processed,
   total,
   totalChunks,
@@ -66,14 +78,21 @@ export function JobMetrics({
   rateHistory,
   className = '',
 }: JobMetricsProps) {
+  // Calculate derived values
+  const percentage = total > 0 ? ((processed / total) * 100).toFixed(1) : '0.0';
+  const avgChunksPerItem = processed > 0 ? (totalChunks / processed).toFixed(1) : '0.0';
+  const failRate = processed > 0 && errorCount > 0
+    ? `${((errorCount / processed) * 100).toFixed(1)}% fail rate`
+    : undefined;
+
   return (
-    <div className={`grid grid-cols-2 md:grid-cols-3 gap-3 ${className}`}>
+    <div className={`grid grid-cols-2 md:grid-cols-3 gap-2.5 ${className}`}>
       {/* Items processed */}
       <MetricCard
         icon={<FileText className="w-4 h-4 text-cyan-500" />}
         label="Items"
         value={`${formatNumber(processed)}${total > 0 ? ` / ${formatNumber(total)}` : ''}`}
-        subValue={total > 0 ? `${((processed / total) * 100).toFixed(1)}% complete` : undefined}
+        subValue={total > 0 ? `${percentage}% complete` : undefined}
       />
 
       {/* Chunks created */}
@@ -81,10 +100,10 @@ export function JobMetrics({
         icon={<Layers className="w-4 h-4 text-teal-500" />}
         label="Chunks"
         value={totalChunks}
-        subValue={processed > 0 ? `${(totalChunks / processed).toFixed(1)} avg/item` : undefined}
+        subValue={processed > 0 ? `${avgChunksPerItem} avg/item` : undefined}
       />
 
-      {/* Embeddings */}
+      {/* Embeddings generated */}
       <MetricCard
         icon={<Brain className="w-4 h-4 text-purple-500" />}
         label="Embeddings"
@@ -97,27 +116,30 @@ export function JobMetrics({
         label="Errors"
         value={errorCount}
         variant={errorCount > 0 ? 'error' : 'default'}
-        subValue={processed > 0 && errorCount > 0 ? `${((errorCount / processed) * 100).toFixed(1)}% fail rate` : undefined}
+        subValue={failRate}
       />
 
-      {/* Processing rate with sparkline */}
+      {/* Rate with sparkline - spans 2 columns */}
       <div className="col-span-2 bg-slate-800/50 rounded-lg p-3">
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
             <Zap className="w-4 h-4 text-amber-500" />
-            <span className="text-xs text-slate-400 uppercase tracking-wide">Rate</span>
+            <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
+              Rate
+            </span>
           </div>
-          <span className="text-lg font-semibold text-white">
-            {rate.toFixed(1)}<span className="text-sm text-slate-400 ml-1">/sec</span>
-          </span>
+          <div className="text-lg font-bold font-mono tracking-tight text-white">
+            {rate.toFixed(1)}
+            <span className="text-sm text-slate-400 ml-0.5 font-normal">/sec</span>
+          </div>
         </div>
         <RateSparkline
           data={rateHistory}
           width={260}
-          height={40}
+          height={36}
           className="w-full"
         />
       </div>
     </div>
   );
-}
+});

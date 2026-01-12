@@ -193,14 +193,14 @@ export default function EntryDetail() {
                       key={chunk.id}
                       className="relative"
                     >
-                      {chunk.chunk_type && (
-                        <span className="absolute -left-4 top-0 text-xs text-slate-600 font-mono">
-                          {chunk.chunk_type}
+                      <div className="flex items-start gap-3">
+                        <span className="flex-shrink-0 px-2 py-0.5 text-xs font-mono bg-slate-700 text-slate-400 rounded-full">
+                          {chunk.chunk_index ?? index}
                         </span>
-                      )}
-                      <p className="text-slate-300 leading-relaxed whitespace-pre-wrap">
-                        {chunk.text}
-                      </p>
+                        <p className="text-slate-300 leading-relaxed whitespace-pre-wrap flex-1">
+                          {chunk.text}
+                        </p>
+                      </div>
                       {index < chunks.length - 1 && (
                         <hr className="border-slate-700/50 mt-4" />
                       )}

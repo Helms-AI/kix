@@ -17,7 +17,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use kix_embeddings::{DocumentChunker, EmbeddingGenerator};
-use kix_parser::{Entry, EntryType, HtmlParser, PdfParser, SourceType};
+use kix_parser::{Entry, EntryType, PdfParser, SourceType};
+use kix_crawler::ContentExtractor;
 use kix_store::search::{EntrySummary, SearchFilters, SearchResult};
 use kix_store::KixStore;
 
@@ -1222,10 +1223,12 @@ impl KixMcpServer {
                     .await
                     .map_err(|e| McpError::internal_error(format!("Failed to read file: {}", e), None))?;
 
-                let parser = HtmlParser::new();
-                let mut entry = parser
-                    .parse(&content, path)
-                    .map_err(|e| McpError::internal_error(format!("Parse error: {}", e), None))?;
+                // Use ContentExtractor for consistent HTML processing
+                let extractor = ContentExtractor::default();
+                let url = url::Url::parse(&format!("file://{}", path))
+                    .unwrap_or_else(|_| url::Url::parse("file:///unknown").unwrap());
+                let extracted = extractor.extract(&content, &url);
+                let mut entry = self.create_entry_from_extracted(&extracted, path);
 
                 self.apply_schema_overrides(&mut entry, schema);
                 Ok(entry)
@@ -1292,14 +1295,55 @@ impl KixMcpServer {
             warn!("PDF URLs not fully supported, treating as HTML");
         }
 
-        // Parse as HTML
-        let parser = HtmlParser::new();
-        let mut entry = parser
-            .parse(&content, url_str)
-            .map_err(|e| McpError::internal_error(format!("Parse error: {}", e), None))?;
+        // Parse as HTML using ContentExtractor
+        let extractor = ContentExtractor::default();
+        let extracted = extractor.extract(&content, &parsed_url);
+        let mut entry = self.create_entry_from_extracted(&extracted, url_str);
 
         self.apply_schema_overrides(&mut entry, schema);
         Ok(entry)
+    }
+
+    /// Create an Entry from ContentExtractor output.
+    ///
+    /// This helper function converts extracted content to an Entry
+    /// for consistent indexing.
+    fn create_entry_from_extracted(
+        &self,
+        extracted: &kix_crawler::ExtractedContent,
+        source_path: &str,
+    ) -> Entry {
+        // Generate slug/ID from path
+        let slug = source_path.to_string();
+        let id = Entry::generate_id_from_path(source_path);
+
+        // Use extracted description or derive from markdown
+        let description = extracted
+            .description
+            .clone()
+            .unwrap_or_else(|| extracted.markdown.chars().take(300).collect());
+
+        // Determine entry type from path
+        let entry_type = if source_path.contains("/blog/") || source_path.contains("/article/") {
+            EntryType::Article
+        } else if source_path.contains("/docs/") || source_path.contains("/documentation/") {
+            EntryType::Document
+        } else {
+            EntryType::Document
+        };
+
+        Entry::with_id(
+            id,
+            extracted.title.clone(),
+            source_path.to_string(),
+            extracted.content_hash.clone(),
+        )
+        .with_description(description)
+        .with_content(extracted.markdown.clone())
+        .with_tags(vec![])
+        .with_entry_type(entry_type)
+        .with_source_type(SourceType::Html)
+        .with_slug(slug)
     }
 
     /// Create an Entry from schema metadata.

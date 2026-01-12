@@ -12,7 +12,7 @@ pub use job::{Job, JobConfig, JobState, JobType};
 pub use queue::{JobQueue, QueueConfig};
 pub use executor::{JobExecutor, ExecutorConfig};
 pub use progress::{Progress, ProgressTracker};
-pub use processor::{ContentProcessor, ProcessorConfig, ProcessingResult};
+pub use processor::{ContentProcessor, ProcessorConfig, ProcessingResult, TwoLayerResult};
 pub use linker::{PatternLinker, PatternLink, LinkStrength, LinkingConfig, LinkSuggestions};
 
 use thiserror::Error;

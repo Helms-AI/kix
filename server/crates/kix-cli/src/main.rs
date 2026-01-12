@@ -22,8 +22,10 @@ use kix_crawler::file_handler::FileHandler;
 use kix_embeddings::{DocumentChunker, EmbeddingGenerator, ensure_setup, is_setup, model_cache_dir};
 use kix_jobs::{JobExecutor, ExecutorConfig, JobQueue, QueueConfig};
 use kix_mcp::KixMcpServer;
-use kix_parser::{HtmlParser, PdfParser};
-use kix_sse::ConnectionManager;
+use kix_parser::{Entry, EntryType, PdfParser, SourceType};
+use kix_crawler::ContentExtractor;
+use url::Url;
+use kix_sse::{ConnectionManager, spawn_cleanup_task};
 use kix_store::search::SearchFilters;
 use kix_store::KixStore;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -239,7 +241,7 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
                 .progress_chars("#>-"),
         );
 
-        let html_parser = HtmlParser::new();
+        let content_extractor = ContentExtractor::default();
 
         for file_path in &html_files {
             pb.set_message(
@@ -262,34 +264,35 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
 
             let file_path_str = file_path.to_string_lossy().to_string();
 
-            match html_parser.parse(&content, &file_path_str) {
-                Ok(document) => {
-                    // Generate chunks
-                    let chunks = chunker.chunk(&document);
+            // Use ContentExtractor for consistent HTML processing
+            let url = Url::parse(&format!("file://{}", file_path_str))
+                .unwrap_or_else(|_| Url::parse("file:///unknown").unwrap());
+            let extracted = content_extractor.extract(&content, &url);
 
-                    if !chunks.is_empty() {
-                        // Generate embeddings for chunks
-                        let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-                        match embedder.embed_texts(&chunk_texts) {
-                            Ok(embeddings) => {
-                                if let Err(e) = store.insert_chunks(&chunks, &embeddings).await {
-                                    error!("Failed to store chunks: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to embed chunks: {}", e);
-                            }
+            // Create Entry from extracted content
+            let document = create_entry_from_extracted(&extracted, &file_path_str);
+
+            // Generate chunks
+            let chunks = chunker.chunk(&document);
+
+            if !chunks.is_empty() {
+                // Generate embeddings for chunks
+                let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+                match embedder.embed_texts(&chunk_texts) {
+                    Ok(embeddings) => {
+                        if let Err(e) = store.insert_chunks(&chunks, &embeddings).await {
+                            error!("Failed to store chunks: {}", e);
                         }
                     }
-
-                    // Store document
-                    if let Err(e) = store.insert_documents(&[document]).await {
-                        error!("Failed to store document: {}", e);
+                    Err(e) => {
+                        error!("Failed to embed chunks: {}", e);
                     }
                 }
-                Err(e) => {
-                    error!("Failed to parse {:?}: {}", file_path, e);
-                }
+            }
+
+            // Store document
+            if let Err(e) = store.insert_documents(&[document]).await {
+                error!("Failed to store document: {}", e);
             }
 
             pb.inc(1);
@@ -482,6 +485,10 @@ async fn run_api(db_path: &str, port: u16) -> Result<()> {
     // Create indexing components
     let job_queue = Arc::new(JobQueue::new(QueueConfig::default()));
     let sse_manager = Arc::new(ConnectionManager::new(Default::default()));
+
+    // Start SSE cleanup background task to prevent stale connections
+    spawn_cleanup_task(sse_manager.clone());
+
     let file_handler = Arc::new(FileHandler::with_defaults());
 
     // Initialize file handler upload directory
@@ -764,4 +771,45 @@ fn truncate(text: &str, max_len: usize) -> String {
     } else {
         format!("{}...", &text[..max_len])
     }
+}
+
+/// Create an Entry from ContentExtractor output.
+///
+/// This helper function converts extracted content to an Entry
+/// for consistent indexing.
+fn create_entry_from_extracted(
+    extracted: &kix_crawler::ExtractedContent,
+    source_path: &str,
+) -> Entry {
+    // Generate slug/ID from path
+    let slug = source_path.to_string();
+    let id = Entry::generate_id_from_path(source_path);
+
+    // Use extracted description or derive from markdown
+    let description = extracted
+        .description
+        .clone()
+        .unwrap_or_else(|| extracted.markdown.chars().take(300).collect());
+
+    // Determine entry type from path
+    let entry_type = if source_path.contains("/blog/") || source_path.contains("/article/") {
+        EntryType::Article
+    } else if source_path.contains("/docs/") || source_path.contains("/documentation/") {
+        EntryType::Document
+    } else {
+        EntryType::Document
+    };
+
+    Entry::with_id(
+        id,
+        extracted.title.clone(),
+        source_path.to_string(),
+        extracted.content_hash.clone(),
+    )
+    .with_description(description)
+    .with_content(extracted.markdown.clone())
+    .with_tags(vec![])
+    .with_entry_type(entry_type)
+    .with_source_type(SourceType::Html)
+    .with_slug(slug)
 }

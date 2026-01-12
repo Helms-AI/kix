@@ -110,7 +110,7 @@ pub struct StartUrlIndexingRequest {
     /// Optional job priority (1-10, default 5)
     #[serde(default = "default_priority")]
     pub priority: u8,
-    /// Maximum pages to process (default: 1000, 0 = unlimited)
+    /// Maximum pages to process (default: 0 = unlimited/discovery mode)
     #[serde(default = "default_max_pages")]
     pub max_pages: usize,
 }
@@ -132,7 +132,7 @@ fn default_timeout_secs() -> u64 {
 }
 
 fn default_max_pages() -> usize {
-    1000
+    0  // Default to unlimited (discovery mode) - crawler will discover actual count
 }
 
 /// Response when starting an indexing job
