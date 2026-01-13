@@ -1,5 +1,6 @@
-import { Github, BookOpen, RefreshCw, Wifi, WifiOff, Loader2 } from 'lucide-react';
+import { Github, BookOpen, RefreshCw, Wifi, WifiOff, Loader2, Minus, Plus } from 'lucide-react';
 import { useSSEContext } from '../contexts/SSEContext';
+import { useZoom, MIN_ZOOM, MAX_ZOOM } from '../hooks/useZoom';
 import clsx from 'clsx';
 
 /**
@@ -47,7 +48,65 @@ function ConnectionIndicator({
 }
 
 /**
- * Application footer component with quick links and SSE connection status.
+ * Zoom control component for adjusting UI scale.
+ * Compact button group with +/- and percentage display.
+ */
+function ZoomControl() {
+  const { level, isDefault, increase, decrease, reset } = useZoom();
+
+  return (
+    <div className="flex items-center gap-0.5">
+      {/* Decrease Button */}
+      <button
+        onClick={decrease}
+        disabled={level <= MIN_ZOOM}
+        className={clsx(
+          'p-1.5 rounded-l-md text-slate-400 transition-all duration-200',
+          'bg-slate-800/50 border border-r-0 border-slate-700/50',
+          'hover:bg-slate-700/50 hover:text-cyan-400',
+          'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-slate-400'
+        )}
+        title="Decrease zoom"
+      >
+        <Minus className="w-3 h-3" />
+      </button>
+
+      {/* Zoom Level Display - Click to Reset */}
+      <button
+        onClick={reset}
+        disabled={isDefault}
+        className={clsx(
+          'px-2 py-1 text-xs font-mono tabular-nums min-w-[44px] text-center transition-all duration-200',
+          'bg-slate-800/50 border-y border-slate-700/50',
+          isDefault
+            ? 'text-slate-500 cursor-default'
+            : 'text-cyan-400 hover:bg-cyan-950/30 hover:border-cyan-700/40 cursor-pointer'
+        )}
+        title={isDefault ? 'Default zoom' : 'Reset to 100%'}
+      >
+        {level}%
+      </button>
+
+      {/* Increase Button */}
+      <button
+        onClick={increase}
+        disabled={level >= MAX_ZOOM}
+        className={clsx(
+          'p-1.5 rounded-r-md text-slate-400 transition-all duration-200',
+          'bg-slate-800/50 border border-l-0 border-slate-700/50',
+          'hover:bg-slate-700/50 hover:text-cyan-400',
+          'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-slate-400'
+        )}
+        title="Increase zoom"
+      >
+        <Plus className="w-3 h-3" />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Application footer component with quick links, zoom control, and SSE connection status.
  * Fixed position at bottom, spans full width.
  */
 export function Footer() {
@@ -85,8 +144,14 @@ export function Footer() {
           </a>
         </div>
 
-        {/* Right: SSE Connection Status */}
-        <div className="flex items-center gap-2">
+        {/* Right: Zoom Control + SSE Connection Status */}
+        <div className="flex items-center gap-3">
+          {/* Zoom Control */}
+          <ZoomControl />
+
+          {/* Divider */}
+          <div className="hidden sm:block w-px h-5 bg-slate-700/50" />
+
           {/* Status Badge */}
           <div
             className={clsx(
