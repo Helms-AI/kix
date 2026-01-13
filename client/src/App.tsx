@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation, Navigate, useParams } from 'react-router-dom';
-import { LayoutDashboard, Grid, Network, Menu, X, Zap, Settings, Plug2 } from 'lucide-react';
+import { LayoutDashboard, Grid, Network, Menu, X, Zap, Settings, Plug2, BookOpen, Sparkles, FolderKanban } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
 
@@ -19,12 +19,30 @@ function PatternRedirect() {
   return <Navigate to={`/entries/${id}`} replace />;
 }
 
-const navigation = [
-  { name: 'Dashboard', href: '/', icon: LayoutDashboard },
-  { name: 'Indexing', href: '/indexing', icon: Zap },
-  { name: 'Entries', href: '/entries', icon: Grid },
-  { name: 'Graph', href: '/graph', icon: Network },
-  { name: 'MCP', href: '/config/mcp', icon: Plug2 },
+// Navigation organized by sections
+const navSections = [
+  {
+    name: 'Projects',
+    icon: FolderKanban,
+    items: [],
+  },
+  {
+    name: 'Knowledge',
+    icon: BookOpen,
+    items: [
+      { name: 'Dashboard', href: '/', icon: LayoutDashboard },
+      { name: 'Indexing', href: '/indexing', icon: Zap },
+      { name: 'Entries', href: '/entries', icon: Grid },
+      { name: 'Graph', href: '/graph', icon: Network },
+    ],
+  },
+  {
+    name: 'AI',
+    icon: Sparkles,
+    items: [
+      { name: 'MCP', href: '/config/mcp', icon: Plug2 },
+    ],
+  },
 ];
 
 function Sidebar() {
@@ -49,26 +67,47 @@ function Sidebar() {
         )}
       >
         <div className="flex flex-col h-full">
-          {/* Navigation */}
-          <nav className="flex-1 px-4 py-6 space-y-1">
-            {navigation.map((item) => {
-              const isActive = location.pathname === item.href ||
-                (item.href !== '/' && location.pathname.startsWith(item.href));
-              return (
-                <NavLink
-                  key={item.name}
-                  to={item.href}
-                  onClick={() => setMobileOpen(false)}
-                  className={clsx(
-                    'nav-link',
-                    isActive && 'nav-link-active'
+          {/* Sectioned Navigation */}
+          <nav className="flex-1 px-3 py-4 space-y-6 overflow-y-auto scrollbar-thin">
+            {navSections.map((section) => (
+              <div key={section.name}>
+                {/* Section Header */}
+                <div className="flex items-center gap-2 px-2 mb-2">
+                  <section.icon className="w-3.5 h-3.5 text-slate-500" />
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                    {section.name}
+                  </span>
+                  <div className="flex-1 h-px bg-gradient-to-r from-slate-700/50 to-transparent ml-2" />
+                </div>
+                {/* Section Items */}
+                <div className="space-y-0.5">
+                  {section.items.length > 0 ? (
+                    section.items.map((item) => {
+                      const isActive = location.pathname === item.href ||
+                        (item.href !== '/' && location.pathname.startsWith(item.href));
+                      return (
+                        <NavLink
+                          key={item.name}
+                          to={item.href}
+                          onClick={() => setMobileOpen(false)}
+                          className={clsx(
+                            'nav-link',
+                            isActive && 'nav-link-active'
+                          )}
+                        >
+                          <item.icon className="w-5 h-5" />
+                          <span className="font-medium">{item.name}</span>
+                        </NavLink>
+                      );
+                    })
+                  ) : (
+                    <div className="px-4 py-2 text-xs text-slate-600 italic">
+                      No items yet
+                    </div>
                   )}
-                >
-                  <item.icon className="w-5 h-5" />
-                  <span className="font-medium">{item.name}</span>
-                </NavLink>
-              );
-            })}
+                </div>
+              </div>
+            ))}
           </nav>
 
           {/* Administration Link */}
