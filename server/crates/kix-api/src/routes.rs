@@ -609,10 +609,11 @@ async fn search_entries(
 }
 
 /// GET /api/graph - Get entry graph for visualization.
+/// Creates edges based on semantic similarity using vector search.
 async fn get_entry_graph(
     State(state): State<AppState>,
 ) -> Result<Json<PatternGraphResponse>, StatusCode> {
-    info!("Getting pattern graph");
+    info!("Getting pattern graph with semantic relationships");
 
     let store = state.store.read().await;
     let all_patterns = store
@@ -631,39 +632,85 @@ async fn get_entry_graph(
         })
         .collect();
 
-    // Create edges based on category relationships
-    // Patterns in the same category are connected
+    // Build a set of all entry IDs for quick lookup
+    let entry_ids: std::collections::HashSet<String> =
+        all_patterns.iter().map(|p| p.id.clone()).collect();
+
+    drop(store); // Release read lock before embedding
+
+    // Create edges based on semantic similarity
+    // For each entry, find related entries via vector search
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut seen_edges: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
 
-    for (i, p1) in all_patterns.iter().enumerate() {
-        for p2 in all_patterns.iter().skip(i + 1) {
-            // Check if patterns share a category
-            let shared_categories: Vec<_> = p1
-                .tags
-                .iter()
-                .filter(|c| p2.tags.contains(c))
-                .collect();
+    // Limit to avoid excessive API calls for large datasets
+    let max_entries_to_process = 100.min(all_patterns.len());
+    let neighbors_per_entry = 5;
 
-            if !shared_categories.is_empty() {
-                let edge_key = if p1.id < p2.id {
-                    (p1.id.clone(), p2.id.clone())
-                } else {
-                    (p2.id.clone(), p1.id.clone())
-                };
+    for pattern in all_patterns.iter().take(max_entries_to_process) {
+        // Create a query from the entry's title and description
+        let query = format!("{} {}", pattern.title, pattern.description);
 
-                if !seen_edges.contains(&edge_key) {
-                    seen_edges.insert(edge_key);
-                    edges.push(GraphEdge {
-                        source: p1.id.clone(),
-                        target: p2.id.clone(),
-                        weight: shared_categories.len() as f32,
-                    });
+        // Generate embedding for this entry
+        let embedding = {
+            let mut embedder = state.embedder.write().await;
+            match embedder.embed_query(&query) {
+                Ok(emb) => emb,
+                Err(e) => {
+                    error!("Failed to embed entry '{}': {}", pattern.id, e);
+                    continue;
                 }
+            }
+        };
+
+        // Find related entries via vector search
+        let store = state.store.read().await;
+        let filters = kix_store::search::SearchFilters::default();
+        let results = match store
+            .vector_search(&embedding, neighbors_per_entry + 1, &filters)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Vector search failed for '{}': {}", pattern.id, e);
+                continue;
+            }
+        };
+        drop(store);
+
+        // Create edges to related entries
+        for result in results {
+            // Skip self-connections and entries not in our node set
+            if result.entry_id == pattern.id || !entry_ids.contains(&result.entry_id) {
+                continue;
+            }
+
+            // Create unique edge key (smaller ID first)
+            let edge_key = if pattern.id < result.entry_id {
+                (pattern.id.clone(), result.entry_id.clone())
+            } else {
+                (result.entry_id.clone(), pattern.id.clone())
+            };
+
+            // Only add edge if not already seen
+            if !seen_edges.contains(&edge_key) {
+                seen_edges.insert(edge_key);
+                edges.push(GraphEdge {
+                    source: pattern.id.clone(),
+                    target: result.entry_id,
+                    // Use similarity score as weight (higher = more related)
+                    weight: result.score,
+                });
             }
         }
     }
+
+    info!(
+        "Graph generated: {} nodes, {} semantic edges",
+        nodes.len(),
+        edges.len()
+    );
 
     Ok(Json(PatternGraphResponse { nodes, edges }))
 }

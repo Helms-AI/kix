@@ -6,7 +6,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use kix_embeddings::{ChunkingConfig, DocumentChunker, EmbeddingGenerator, AccelerationMode};
+use kix_embeddings::{
+    ChunkingConfig, CodeBlockInput, DocumentChunker, EmbeddingGenerator,
+    AccelerationMode, HeaderInput, SmartChunkingInput,
+};
 use kix_parser::{Entry, EntryChunk, EntryType, PdfParser, SourceType};
 use kix_store::{KixStore, PageRecord};
 use kix_crawler::ContentExtractor;
@@ -294,8 +297,13 @@ impl ContentProcessor {
         // Create entry with extracted content
         let entry = self.create_entry_from_extracted(&extracted, source_url)?;
 
-        // Use markdown-aware chunking
-        self.process_document_with_markdown(entry, &extracted.markdown).await
+        // Use smart chunking with code blocks indexed separately
+        self.process_document_with_markdown(
+            entry,
+            &extracted.markdown,
+            &extracted.code_blocks,
+            &extracted.headers,
+        ).await
     }
 
     /// Create an entry from ContentExtractor output
@@ -346,17 +354,44 @@ impl ContentProcessor {
     /// 2. Paragraph boundaries (\n\n)
     /// 3. Sentence boundaries (. )
     /// 4. Consolidates small chunks (<200 chars) together
+    ///
+    /// When code_blocks and headers are provided, uses `chunk_smart()` to
+    /// create separate indexed chunks for each code block. This enables
+    /// code-specific searches and preserves language metadata.
     async fn process_document_with_markdown(
         &self,
         entry: Entry,
         markdown: &str,
+        code_blocks: &[kix_crawler::ExtractedCodeBlock],
+        headers: &[kix_crawler::ExtractedHeader],
     ) -> Result<ProcessingResult, JobError> {
         let doc_id = entry.id.clone();
         let doc_title = entry.title.clone();
         let doc_description = entry.description.clone();
 
-        // Use smart chunking that preserves content boundaries
-        let chunks = self.chunker.chunk_smart_text(&entry, markdown);
+        // Build SmartChunkingInput with code blocks for separate indexing
+        let smart_input = SmartChunkingInput {
+            markdown: markdown.to_string(),
+            code_blocks: code_blocks
+                .iter()
+                .filter(|cb| !cb.is_inline) // Only index block code, not inline
+                .map(|cb| CodeBlockInput {
+                    language: cb.language.clone(),
+                    content: cb.content.clone(),
+                })
+                .collect(),
+            headers: headers
+                .iter()
+                .map(|h| HeaderInput {
+                    level: h.level,
+                    text: h.text.clone(),
+                })
+                .collect(),
+            plain_text: String::new(),
+        };
+
+        // Use smart chunking that creates separate chunks for code blocks
+        let chunks = self.chunker.chunk_smart(&entry, &smart_input);
 
         if chunks.is_empty() {
             warn!(doc_id = doc_id, "No chunks generated from markdown document");
@@ -531,38 +566,40 @@ impl ContentProcessor {
             .await
             .map_err(|e| JobError::Processing(format!("Failed to read file: {}", e)))?;
 
-        // Process based on file type and get both entry and markdown content
-        let (document, markdown_content) = match extension.as_str() {
+        // Process based on file type and get entry, markdown, code blocks, and headers
+        let (document, markdown_content, code_blocks, headers) = match extension.as_str() {
             "html" | "htm" => {
                 let text = String::from_utf8_lossy(&content);
                 let url = url::Url::parse(&format!("file://{}", original_name))
                     .unwrap_or_else(|_| url::Url::parse("file:///unknown").unwrap());
                 let extracted = self.content_extractor.extract(&text, &url);
                 let entry = self.create_entry_from_extracted(&extracted, original_name)?;
-                (entry, extracted.markdown)
+                (entry, extracted.markdown, extracted.code_blocks, extracted.headers)
             }
             "pdf" => {
                 let entry = self.pdf_parser
                     .parse(file_path.to_str().unwrap_or(""))
                     .map_err(|e| JobError::Processing(format!("Failed to parse PDF: {}", e)))?;
                 let markdown = entry.content.clone();
-                (entry, markdown)
+                // PDFs don't have structured code blocks
+                (entry, markdown, vec![], vec![])
             }
             "txt" | "md" | "markdown" => {
                 let text = String::from_utf8_lossy(&content).to_string();
                 let entry = self.create_text_document(&text, original_name, file_path)?;
-                (entry, text)
+                // Plain text/markdown files don't have HTML-extracted code blocks
+                (entry, text, vec![], vec![])
             }
             "json" => {
                 let text = String::from_utf8_lossy(&content).to_string();
                 let entry = self.create_text_document(&text, original_name, file_path)?;
-                (entry, text)
+                (entry, text, vec![], vec![])
             }
             _ => {
                 // Try to process as text
                 if let Ok(text) = String::from_utf8(content.clone()) {
                     let entry = self.create_text_document(&text, original_name, file_path)?;
-                    (entry, text)
+                    (entry, text, vec![], vec![])
                 } else {
                     return Err(JobError::Processing(format!(
                         "Unsupported file type: {}",
@@ -579,8 +616,14 @@ impl ContentProcessor {
         let page = PageRecord::new(&entry_id, &source_url, &markdown_content)
             .with_title(document.title.clone());
 
-        // Process with two-layer storage
-        self.process_document_with_page(document, &markdown_content, page).await
+        // Process with two-layer storage, including code blocks for indexing
+        self.process_document_with_page(
+            document,
+            &markdown_content,
+            page,
+            &code_blocks,
+            &headers,
+        ).await
     }
 
     /// Create a simple text document
@@ -820,26 +863,56 @@ impl ContentProcessor {
             page
         };
 
-        // Process with two-layer storage
-        self.process_document_with_page(entry, &extracted.markdown, page).await
+        // Process with two-layer storage, including code blocks for indexing
+        self.process_document_with_page(
+            entry,
+            &extracted.markdown,
+            page,
+            &extracted.code_blocks,
+            &extracted.headers,
+        ).await
     }
 
     /// Process a document with two-layer storage pattern.
     ///
     /// Stores both the full page content and smaller chunks for search.
+    /// Code blocks are indexed as separate searchable chunks with language metadata.
     async fn process_document_with_page(
         &self,
         entry: Entry,
         markdown: &str,
         page: PageRecord,
+        code_blocks: &[kix_crawler::ExtractedCodeBlock],
+        headers: &[kix_crawler::ExtractedHeader],
     ) -> Result<TwoLayerResult, JobError> {
         let doc_id = entry.id.clone();
         let doc_title = entry.title.clone();
         let doc_description = entry.description.clone();
         let page_id = page.page_id.clone();
 
-        // Use smart chunking
-        let mut chunks = self.chunker.chunk_smart_text(&entry, markdown);
+        // Build SmartChunkingInput with code blocks for separate indexing
+        let smart_input = SmartChunkingInput {
+            markdown: markdown.to_string(),
+            code_blocks: code_blocks
+                .iter()
+                .filter(|cb| !cb.is_inline) // Only index block code, not inline
+                .map(|cb| CodeBlockInput {
+                    language: cb.language.clone(),
+                    content: cb.content.clone(),
+                })
+                .collect(),
+            headers: headers
+                .iter()
+                .map(|h| HeaderInput {
+                    level: h.level,
+                    text: h.text.clone(),
+                })
+                .collect(),
+            plain_text: String::new(),
+        };
+
+        // Use smart chunking that creates separate chunks for code blocks
+        let mut chunks = self.chunker.chunk_smart(&entry, &smart_input);
 
         if chunks.is_empty() {
             warn!(doc_id = doc_id, "No chunks generated from document");
