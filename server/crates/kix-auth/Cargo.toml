@@ -1,0 +1,26 @@
+[package]
+name = "kix-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OAuth 2.1 authentication and authorization for KIX MCP server"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+axum.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+rand.workspace = true
+chrono.workspace = true
+base64.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros"] }

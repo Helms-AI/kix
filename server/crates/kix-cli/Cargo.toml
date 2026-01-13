@@ -18,6 +18,7 @@ kix-api = { path = "../kix-api" }
 kix-jobs = { path = "../kix-jobs" }
 kix-sse = { path = "../kix-sse" }
 kix-crawler = { path = "../kix-crawler" }
+kix-auth = { path = "../kix-auth" }
 url.workspace = true
 rmcp.workspace = true
 axum.workspace = true
