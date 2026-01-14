@@ -28,6 +28,23 @@ dotext = "0.1"           # DOCX text extraction
 readability = "0.3"      # Mozilla Readability algorithm (extract main content)
 htmd = "0.2"             # HTML to Markdown conversion
 
+# Tree-sitter for AST-aware code chunking
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-ruby = { workspace = true }
+tree-sitter-bash = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-html = { workspace = true }
+tree-sitter-css = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 criterion = "0.5"

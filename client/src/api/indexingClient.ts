@@ -108,6 +108,8 @@ export interface EnhancedLiveJobData {
   totalEmbeddings: number;
   source?: string;
   sourceType?: 'url' | 'file' | 'directory';
+  // Code extraction stats aggregated across all pages
+  codeExtraction?: CodeExtractionStats;
 }
 
 export interface Job {
@@ -151,6 +153,22 @@ export interface PersistedJobStats {
   rate: number;
 }
 
+// Code extraction stats as stored in job history (matches backend format)
+export interface PersistedCodeExtractionStats {
+  total_code_blocks: number;
+  pages_with_code: number;
+  languages: { language: string; count: number }[];
+  patterns_matched: string[];
+  validation: {
+    total_extracted: number;
+    passed_validation: number;
+    rejected_too_short: number;
+    rejected_placeholder: number;
+    rejected_no_structure: number;
+    rejected_high_prose: number;
+  };
+}
+
 // Persisted job from history API (matches backend JobHistoryItem)
 export interface PersistedJob {
   job_id: string;
@@ -162,6 +180,7 @@ export interface PersistedJob {
   started_at: string | null;
   completed_at: string;
   stats: PersistedJobStats;
+  code_extraction?: PersistedCodeExtractionStats;
 }
 
 // Individual item from a persisted job (matches backend JobHistoryItemDetail)
@@ -197,6 +216,84 @@ export interface JobDetailResponse {
 export interface ListJobHistoryParams {
   limit?: number;
   offset?: number;
+}
+
+// ============================================================================
+// Code Extraction Types (Phase 5/6)
+// ============================================================================
+
+/** Code extraction statistics */
+export interface CodeExtractionStats {
+  job_id: string;
+  total_pages: number;
+  pages_with_code: number;
+  total_code_blocks: number;
+  languages: LanguageStats[];
+  patterns: PatternStats[];
+  validation: ValidationSummary;
+}
+
+/** Language statistics */
+export interface LanguageStats {
+  language: string;
+  block_count: number;
+  total_lines: number;
+  percentage: number;
+}
+
+/** Pattern statistics */
+export interface PatternStats {
+  pattern: string;
+  match_count: number;
+  percentage: number;
+}
+
+/** Validation summary */
+export interface ValidationSummary {
+  total_extracted: number;
+  passed: number;
+  pass_rate: number;
+  rejection_reasons: RejectionReason[];
+}
+
+/** Code rejection reason */
+export interface RejectionReason {
+  reason: string;
+  count: number;
+}
+
+/** Pattern info from API */
+export interface PatternInfo {
+  name: string;
+  css_selector: string;
+  description: string;
+  example_sites: string[];
+}
+
+/** Language info from API */
+export interface LanguageInfo {
+  name: string;
+  aliases: string[];
+  extensions: string[];
+  tree_sitter_support: boolean;
+}
+
+/** Code extraction SSE event */
+export interface CodeExtractionEvent {
+  type: 'code_extraction';
+  job_id: string;
+  url: string;
+  blocks_found: number;
+  patterns_matched: string[];
+  languages: { language: string; count: number }[];
+  validation_stats: {
+    total_extracted: number;
+    passed_validation: number;
+    rejected_too_short: number;
+    rejected_placeholder: number;
+    rejected_no_structure: number;
+    rejected_high_prose: number;
+  };
 }
 
 // API functions
@@ -339,6 +436,32 @@ export const indexingApi = {
 
     return response.json();
   },
+
+  // ============================================================================
+  // Code Extraction API (Phase 5/6)
+  // ============================================================================
+
+  // Get all supported code extraction patterns
+  async getPatterns(): Promise<PatternInfo[]> {
+    const response = await fetch(`${API_BASE}/patterns`);
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch patterns');
+    }
+
+    return response.json();
+  },
+
+  // Get all supported programming languages
+  async getLanguages(): Promise<LanguageInfo[]> {
+    const response = await fetch(`${API_BASE}/languages`);
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch languages');
+    }
+
+    return response.json();
+  },
 };
 
 // Utility function to convert File to base64
@@ -408,4 +531,58 @@ export function convertPersistedItemsToPages(items: PersistedJobItem[]): Record<
   }
 
   return pages;
+}
+
+/**
+ * Convert persisted code extraction stats to the format expected by CodeExtractionPanel
+ */
+export function convertPersistedCodeExtractionStats(
+  persisted: PersistedCodeExtractionStats
+): CodeExtractionStats {
+  // Calculate total blocks for percentage
+  const totalBlocks = persisted.languages.reduce((sum, l) => sum + l.count, 0);
+
+  // Calculate pass rate
+  const passRate = persisted.validation.total_extracted > 0
+    ? (persisted.validation.passed_validation / persisted.validation.total_extracted) * 100
+    : 100;
+
+  // Build rejection reasons from validation stats
+  const rejectionReasons: RejectionReason[] = [];
+  if (persisted.validation.rejected_too_short > 0) {
+    rejectionReasons.push({ reason: 'too_short', count: persisted.validation.rejected_too_short });
+  }
+  if (persisted.validation.rejected_placeholder > 0) {
+    rejectionReasons.push({ reason: 'placeholder', count: persisted.validation.rejected_placeholder });
+  }
+  if (persisted.validation.rejected_no_structure > 0) {
+    rejectionReasons.push({ reason: 'no_structure', count: persisted.validation.rejected_no_structure });
+  }
+  if (persisted.validation.rejected_high_prose > 0) {
+    rejectionReasons.push({ reason: 'high_prose', count: persisted.validation.rejected_high_prose });
+  }
+
+  return {
+    job_id: '', // Not stored in persisted data
+    total_pages: persisted.pages_with_code, // Approximate - we only know pages with code
+    pages_with_code: persisted.pages_with_code,
+    total_code_blocks: persisted.total_code_blocks,
+    languages: persisted.languages.map(l => ({
+      language: l.language,
+      block_count: l.count,
+      total_lines: 0, // Not tracked in persisted data
+      percentage: totalBlocks > 0 ? (l.count / totalBlocks) * 100 : 0,
+    })),
+    patterns: persisted.patterns_matched.map(p => ({
+      pattern: p,
+      match_count: 1, // Not tracked per-pattern
+      percentage: 0, // Can't calculate without total
+    })),
+    validation: {
+      total_extracted: persisted.validation.total_extracted,
+      passed: persisted.validation.passed_validation,
+      pass_rate: passRate,
+      rejection_reasons: rejectionReasons,
+    },
+  };
 }

@@ -80,8 +80,10 @@ pub struct CrawlResult {
     pub url: Url,
     /// HTTP status code
     pub status: u16,
-    /// Extracted markdown content
-    pub content: String,
+    /// Raw HTML content (for code extraction and processing)
+    pub html: String,
+    /// Markdown content (converted from HTML)
+    pub markdown: String,
     /// Structured content from ContentExtractor (includes title, description, code blocks, etc.)
     pub structured_content: ExtractedContent,
     /// Links found on the page
@@ -508,13 +510,14 @@ impl Crawler {
 
         // Extract structured content using ContentExtractor (includes title, description, etc.)
         let structured_content = self.extractor.extract(&render_result.html, &render_result.url);
-        let content = structured_content.markdown.clone();
+        let markdown = structured_content.markdown.clone();
         let source_domain = url.domain().map(|d| d.to_string());
+        let html_size = render_result.html.len();
 
         info!(
             url = %url,
             render_time_ms = render_result.render_time_ms,
-            content_len = content.len(),
+            markdown_len = markdown.len(),
             title = %structured_content.title,
             "Page rendered with browser"
         );
@@ -522,11 +525,12 @@ impl Crawler {
         Ok(CrawlResult {
             url: render_result.url,
             status: 200,
-            content,
+            html: render_result.html,
+            markdown,
             structured_content,
             links,
             content_type: "text/html".to_string(),
-            size: render_result.html.len(),
+            size: html_size,
             fetch_time_ms: start.elapsed().as_millis() as u64,
             source_domain,
         })
@@ -554,7 +558,8 @@ impl Crawler {
             return Ok(CrawlResult {
                 url: url.clone(),
                 status,
-                content: String::new(),
+                html: String::new(),
+                markdown: String::new(),
                 structured_content: ExtractedContent::empty(),
                 links: vec![],
                 content_type,
@@ -581,12 +586,13 @@ impl Crawler {
 
         // Extract structured content using ContentExtractor (includes title, description, etc.)
         let structured_content = self.extractor.extract(&body, url);
-        let content = structured_content.markdown.clone();
+        let markdown = structured_content.markdown.clone();
 
         Ok(CrawlResult {
             url: url.clone(),
             status,
-            content,
+            html: body,
+            markdown,
             structured_content,
             links,
             content_type,

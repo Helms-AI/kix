@@ -83,10 +83,38 @@ pub enum EventType {
         started_at: DateTime<Utc>,
     },
 
+    /// Code extraction completed for a page (NEW for code extraction visibility)
+    CodeExtraction {
+        job_id: Uuid,
+        url: String,
+        blocks_found: usize,
+        patterns_matched: Vec<String>,
+        languages: Vec<LanguageCount>,
+        validation_stats: CodeValidationStats,
+    },
+
     /// Heartbeat to keep connection alive
     Heartbeat {
         timestamp: DateTime<Utc>,
     },
+}
+
+/// Language count for code extraction statistics
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LanguageCount {
+    pub language: String,
+    pub count: usize,
+}
+
+/// Code validation statistics
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CodeValidationStats {
+    pub total_extracted: usize,
+    pub passed_validation: usize,
+    pub rejected_too_short: usize,
+    pub rejected_placeholder: usize,
+    pub rejected_no_structure: usize,
+    pub rejected_high_prose: usize,
 }
 
 /// Source type for indexing

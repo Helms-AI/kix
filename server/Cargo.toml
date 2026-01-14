@@ -49,8 +49,9 @@ scraper = "0.22"
 # PDF parsing
 pdf-extract = "0.7"
 
-# Embeddings
-fastembed = "5"
+# Embeddings (Ollama-only architecture)
+ollama-rs = { version = "0.2", features = ["stream"] }
+# fastembed = "5"  # Removed: Using Ollama-only embeddings
 
 # Web API
 axum = { version = "0.7", features = ["macros"] }
@@ -63,6 +64,10 @@ futures-util = "0.3"
 
 # HTTP client for crawling
 reqwest = { version = "0.12", features = ["json", "stream", "cookies"] }
+
+# Spider web crawler (core features without chrome to avoid version bugs)
+spider = { version = "2.30", default-features = false, features = ["sync", "cache", "sitemap"] }
+spider_transformations = "2"
 
 # Job management
 dashmap = "6.1"
@@ -112,3 +117,20 @@ tantivy = "0.22"
 # ORM
 sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-native-tls", "macros"] }
 sea-orm-migration = "1.1"
+
+# Tree-sitter for AST-aware code chunking
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-bash = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.23"

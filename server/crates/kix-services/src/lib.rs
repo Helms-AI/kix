@@ -89,6 +89,10 @@ pub use kix_projects::github::models::AuthenticatedUser;
 pub use indexing::{
     is_terminal_state, parse_job_id, DeleteResult, DeleteTarget, FileIndexConfig, FileInput,
     IndexStats, JobList, JobStatus, SyncIndexOptions, SyncIndexResult, UrlIndexConfig,
+    // Code extraction types (Phase 5)
+    list_code_patterns, list_supported_languages,
+    CodeBlockResponse, CodeExtractionStats, LanguageInfo, LanguageStats,
+    PatternInfo, PatternStats, RejectionReason, ValidationSummary,
 };
 
 // Re-export knowledge linking types and functions

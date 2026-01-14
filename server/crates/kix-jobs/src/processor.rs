@@ -1,151 +1,22 @@
-//! Content processor for indexing documents into LanceDB
+//! Content processor for indexing documents
 
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use kix_embeddings::{
-    ChunkingConfig, CodeBlockInput, DocumentChunker, EmbeddingGenerator,
-    AccelerationMode, HeaderInput, SmartChunkingInput,
+    ChunkingConfig, CodeBlockInput, DocumentChunker, OllamaEmbedder, EmbeddingConfig,
+    HeaderInput, SmartChunkingInput,
 };
 use kix_parser::{Entry, EntryChunk, EntryType, PdfParser, SourceType};
 use kix_store::{KixStore, PageRecord};
 use kix_crawler::ContentExtractor;
+use kix_sse::event::{CodeValidationStats, LanguageCount};
 
 use crate::linker::{LinkingConfig, PatternLink, PatternLinker};
 use crate::JobError;
-
-/// Request for the embedding worker
-struct EmbeddingRequest {
-    chunks: Vec<EntryChunk>,
-    response_tx: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
-}
-
-/// Embedding worker pool for parallel embedding generation
-///
-/// Uses multiple workers in CPU mode for better multi-core utilization,
-/// or a single worker in GPU mode since GPU is already parallel.
-struct EmbeddingWorkerPool {
-    tx: mpsc::Sender<EmbeddingRequest>,
-    worker_count: usize,
-}
-
-impl EmbeddingWorkerPool {
-    /// Create a new embedding worker pool
-    ///
-    /// - GPU mode: Single worker with larger queue (GPU handles parallelism)
-    /// - CPU mode: Multiple workers (one per CPU core, up to max_workers)
-    fn new(max_workers: usize, base_queue_size: usize) -> Result<Self, String> {
-        // Detect if we should use multi-worker mode
-        let sample_embedder = EmbeddingGenerator::new()
-            .map_err(|e| e.to_string())?;
-
-        let acceleration_mode = sample_embedder.acceleration_mode();
-        let backend_info = sample_embedder.info();
-
-        // Check if we're in CPU mode (use multiple workers)
-        // GPU modes (Cuda, Metal) use single worker since GPU handles parallelism
-        let is_cpu_mode = matches!(acceleration_mode, AccelerationMode::Cpu);
-
-        // Determine worker count
-        let worker_count = if is_cpu_mode {
-            // Use multiple workers for CPU mode (one per core, capped at max)
-            let cpu_cores = num_cpus::get();
-            std::cmp::min(cpu_cores, max_workers)
-        } else {
-            1 // GPU handles parallelism internally
-        };
-
-        // Adjust queue size based on mode:
-        // - GPU mode: Larger queue to maintain saturation
-        // - CPU mode: Standard queue size
-        let queue_size = if is_cpu_mode {
-            base_queue_size
-        } else {
-            base_queue_size * 4 // Larger queue for GPU to maintain saturation
-        };
-
-        info!(
-            "Creating embedding worker pool: {} workers, queue_size={}, backend={}, acceleration={}",
-            worker_count, queue_size, backend_info.name, acceleration_mode
-        );
-
-        let (tx, rx) = mpsc::channel::<EmbeddingRequest>(queue_size);
-
-        // Wrap receiver in Arc<Mutex> for sharing between workers
-        let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
-
-        // Spawn worker tasks
-        for worker_id in 0..worker_count {
-            let rx = rx.clone();
-
-            tokio::spawn(async move {
-                // Each worker creates its own embedder instance
-                let mut embedder = match EmbeddingGenerator::new() {
-                    Ok(e) => e,
-                    Err(e) => {
-                        warn!("Worker {} failed to init embedder: {}", worker_id, e);
-                        return;
-                    }
-                };
-
-                info!("Embedding worker {} started", worker_id);
-
-                loop {
-                    // Acquire lock, receive request, then release lock
-                    let request = {
-                        let mut rx_guard = rx.lock().await;
-                        rx_guard.recv().await
-                    };
-
-                    match request {
-                        Some(req) => {
-                            let result = embedder
-                                .embed_chunks(&req.chunks)
-                                .map_err(|e| e.to_string());
-
-                            let _ = req.response_tx.send(result);
-                        }
-                        None => {
-                            info!("Embedding worker {} shutting down", worker_id);
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(Self { tx, worker_count })
-    }
-
-    /// Get the number of workers in the pool
-    fn worker_count(&self) -> usize {
-        self.worker_count
-    }
-
-    /// Generate embeddings for chunks via the worker pool
-    async fn embed_chunks(&self, chunks: Vec<EntryChunk>) -> Result<Vec<Vec<f32>>, String> {
-        let (response_tx, response_rx) = oneshot::channel();
-
-        let request = EmbeddingRequest {
-            chunks,
-            response_tx,
-        };
-
-        // Send request to worker pool
-        self.tx
-            .send(request)
-            .await
-            .map_err(|_| "Embedding worker pool channel closed".to_string())?;
-
-        // Wait for response
-        response_rx
-            .await
-            .map_err(|_| "Embedding response channel closed".to_string())?
-    }
-}
 
 /// Content processor configuration
 #[derive(Clone, Debug)]
@@ -179,7 +50,7 @@ impl Default for ProcessorConfig {
 /// Content processor handles parsing, chunking, embedding, and storage
 pub struct ContentProcessor {
     store: Arc<RwLock<KixStore>>,
-    embedding_pool: Arc<EmbeddingWorkerPool>,
+    embedder: Arc<OllamaEmbedder>,
     linker: PatternLinker,
     chunker: DocumentChunker,
     pdf_parser: PdfParser,
@@ -223,21 +94,20 @@ impl ContentProcessor {
     ) -> Result<Self, JobError> {
         info!("Initializing content processor with shared store");
 
-        // Create embedding worker pool (auto-scales based on GPU/CPU)
-        // Max 8 workers for CPU mode, queue size of 64
-        let embedding_pool = Arc::new(
-            EmbeddingWorkerPool::new(8, 64)
-                .map_err(|e| JobError::Processing(format!("Failed to create embedding pool: {}", e)))?
-        );
+        // Create Ollama embedder with config
+        let embedding_config = EmbeddingConfig::default()
+            .with_batch_size(config.embedding_batch_size);
+
+        let embedder = OllamaEmbedder::new(embedding_config)
+            .map_err(|e| JobError::Processing(format!("Failed to create embedder: {}", e)))?;
+
+        let embedder = Arc::new(embedder);
 
         info!(
-            "Embedding worker pool initialized with {} workers",
-            embedding_pool.worker_count()
+            "Ollama embedder initialized: model={}, dimensions={}",
+            embedder.model(),
+            embedder.dimensions()
         );
-
-        // Initialize a separate embedder for linker compatibility
-        let embedder_compat = EmbeddingGenerator::new()
-            .map_err(|e| JobError::Processing(format!("Failed to init linker embedder: {}", e)))?;
 
         // Initialize chunker
         let chunker = DocumentChunker::new(ChunkingConfig {
@@ -246,24 +116,36 @@ impl ContentProcessor {
             ..Default::default()
         });
 
-        let embedder_compat = Arc::new(Mutex::new(embedder_compat));
-
-        // Initialize pattern linker (still uses mutex-based embedder for compatibility)
+        // Initialize pattern linker
         let linker = PatternLinker::new(
             store.clone(),
-            embedder_compat.clone(),
+            embedder.clone(),
             config.linking.clone(),
         );
 
         Ok(Self {
             store,
-            embedding_pool,
+            embedder,
             linker,
             chunker,
             pdf_parser: PdfParser::new(),
             content_extractor: ContentExtractor::default(),
             config,
         })
+    }
+
+    /// Generate embeddings for chunks using the Ollama embedder
+    async fn embed_chunks(&self, chunks: &[EntryChunk]) -> Result<Vec<Vec<f32>>, JobError> {
+        if chunks.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+
+        self.embedder
+            .embed_batch(&texts)
+            .await
+            .map_err(|e| JobError::Processing(format!("Failed to generate embeddings: {}", e)))
     }
 
     /// Process HTML content and store it
@@ -348,16 +230,6 @@ impl ContentProcessor {
     }
 
     /// Process a document with smart chunking
-    ///
-    /// Uses the smart chunking algorithm that prioritizes:
-    /// 1. Code block boundaries (never splits code blocks)
-    /// 2. Paragraph boundaries (\n\n)
-    /// 3. Sentence boundaries (. )
-    /// 4. Consolidates small chunks (<200 chars) together
-    ///
-    /// When code_blocks and headers are provided, uses `chunk_smart()` to
-    /// create separate indexed chunks for each code block. This enables
-    /// code-specific searches and preserves language metadata.
     async fn process_document_with_markdown(
         &self,
         entry: Entry,
@@ -374,7 +246,7 @@ impl ContentProcessor {
             markdown: markdown.to_string(),
             code_blocks: code_blocks
                 .iter()
-                .filter(|cb| !cb.is_inline) // Only index block code, not inline
+                .filter(|cb| !cb.is_inline)
                 .map(|cb| CodeBlockInput {
                     language: cb.language.clone(),
                     content: cb.content.clone(),
@@ -390,7 +262,7 @@ impl ContentProcessor {
             plain_text: String::new(),
         };
 
-        // Use smart chunking that creates separate chunks for code blocks
+        // Use smart chunking
         let chunks = self.chunker.chunk_smart(&entry, &smart_input);
 
         if chunks.is_empty() {
@@ -409,34 +281,26 @@ impl ContentProcessor {
             "Generated smart chunks from document"
         );
 
-        // Generate embeddings via worker pool
-        let embeddings = self
-            .embedding_pool
-            .embed_chunks(chunks.clone())
-            .await
-            .map_err(|e| JobError::Processing(format!("Failed to generate embeddings: {}", e)))?;
+        // Generate embeddings
+        let embeddings = self.embed_chunks(&chunks).await?;
 
         // Store document and chunks
         {
             let store = self.store.write().await;
 
-            // Check if document already exists
             let exists = store.document_exists(&doc_id).await
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document and chunks
                 store.delete_chunks_by_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
             }
 
-            // Insert new document (from Entry type)
             store.insert_documents_from_entries(&[entry]).await
                 .map_err(|e| JobError::Processing(format!("Failed to insert document: {}", e)))?;
 
-            // Insert chunks with embeddings (sync operation)
             store.insert_chunks(&chunks, &embeddings)
                 .map_err(|e| JobError::Processing(format!("Failed to insert chunks: {}", e)))?;
         }
@@ -451,11 +315,7 @@ impl ContentProcessor {
                 Some(&doc_id),
             ).await {
                 Ok(links) => {
-                    info!(
-                        doc_id = doc_id,
-                        related_count = links.len(),
-                        "Found related patterns"
-                    );
+                    info!(doc_id = doc_id, related_count = links.len(), "Found related patterns");
                     links
                 }
                 Err(e) => {
@@ -497,16 +357,13 @@ impl ContentProcessor {
             .unwrap_or("")
             .to_lowercase();
 
-        // Read file content
         let content = tokio::fs::read(file_path)
             .await
             .map_err(|e| JobError::Processing(format!("Failed to read file: {}", e)))?;
 
-        // Process based on file type
         let document = match extension.as_str() {
             "html" | "htm" => {
                 let text = String::from_utf8_lossy(&content);
-                // Use ContentExtractor for consistent HTML processing
                 let url = url::Url::parse(&format!("file://{}", original_name))
                     .unwrap_or_else(|_| url::Url::parse("file:///unknown").unwrap());
                 let extracted = self.content_extractor.extract(&text, &url);
@@ -526,7 +383,6 @@ impl ContentProcessor {
                 self.create_text_document(&text, original_name, file_path)?
             }
             _ => {
-                // Try to process as text
                 if let Ok(text) = String::from_utf8(content.clone()) {
                     self.create_text_document(&text, original_name, file_path)?
                 } else {
@@ -542,12 +398,6 @@ impl ContentProcessor {
     }
 
     /// Process a file with two-layer storage pattern.
-    ///
-    /// This method:
-    /// 1. Stores the full page content in the pages table (for RAG context)
-    /// 2. Stores chunks with page_id FK (for vector search)
-    ///
-    /// Use this for uploaded files where full context is valuable for RAG.
     pub async fn process_file_with_page(
         &self,
         file_path: &Path,
@@ -561,12 +411,10 @@ impl ContentProcessor {
             .unwrap_or("")
             .to_lowercase();
 
-        // Read file content
         let content = tokio::fs::read(file_path)
             .await
             .map_err(|e| JobError::Processing(format!("Failed to read file: {}", e)))?;
 
-        // Process based on file type and get entry, markdown, code blocks, and headers
         let (document, markdown_content, code_blocks, headers) = match extension.as_str() {
             "html" | "htm" => {
                 let text = String::from_utf8_lossy(&content);
@@ -581,13 +429,11 @@ impl ContentProcessor {
                     .parse(file_path.to_str().unwrap_or(""))
                     .map_err(|e| JobError::Processing(format!("Failed to parse PDF: {}", e)))?;
                 let markdown = entry.content.clone();
-                // PDFs don't have structured code blocks
                 (entry, markdown, vec![], vec![])
             }
             "txt" | "md" | "markdown" => {
                 let text = String::from_utf8_lossy(&content).to_string();
                 let entry = self.create_text_document(&text, original_name, file_path)?;
-                // Plain text/markdown files don't have HTML-extracted code blocks
                 (entry, text, vec![], vec![])
             }
             "json" => {
@@ -596,7 +442,6 @@ impl ContentProcessor {
                 (entry, text, vec![], vec![])
             }
             _ => {
-                // Try to process as text
                 if let Ok(text) = String::from_utf8(content.clone()) {
                     let entry = self.create_text_document(&text, original_name, file_path)?;
                     (entry, text, vec![], vec![])
@@ -612,11 +457,9 @@ impl ContentProcessor {
         let entry_id = document.id.clone();
         let source_url = format!("file://{}", original_name);
 
-        // Create page record for full content storage
         let page = PageRecord::new(&entry_id, &source_url, &markdown_content)
             .with_title(document.title.clone());
 
-        // Process with two-layer storage, including code blocks for indexing
         self.process_document_with_page(
             document,
             &markdown_content,
@@ -665,7 +508,6 @@ impl ContentProcessor {
         let doc_title = entry.title.clone();
         let doc_description = entry.description.clone();
 
-        // Create chunks from entry
         let chunks = self.chunker.chunk(&entry);
 
         if chunks.is_empty() {
@@ -678,59 +520,40 @@ impl ContentProcessor {
             });
         }
 
-        info!(
-            doc_id = doc_id,
-            chunks = chunks.len(),
-            "Generated chunks from document"
-        );
+        info!(doc_id = doc_id, chunks = chunks.len(), "Generated chunks from document");
 
-        // Generate embeddings via worker pool (non-blocking, auto-scales)
-        let embeddings = self
-            .embedding_pool
-            .embed_chunks(chunks.clone())
-            .await
-            .map_err(|e| JobError::Processing(format!("Failed to generate embeddings: {}", e)))?;
+        let embeddings = self.embed_chunks(&chunks).await?;
 
-        // Store document and chunks using write lock
         {
             let store = self.store.write().await;
 
-            // Check if document already exists
             let exists = store.document_exists(&doc_id).await
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document and chunks
                 store.delete_chunks_by_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
             }
 
-            // Insert new document (from Entry type)
             store.insert_documents_from_entries(&[entry]).await
                 .map_err(|e| JobError::Processing(format!("Failed to insert document: {}", e)))?;
 
-            // Insert chunks with embeddings (sync operation)
             store.insert_chunks(&chunks, &embeddings)
                 .map_err(|e| JobError::Processing(format!("Failed to insert chunks: {}", e)))?;
         }
 
-        // Find related patterns via semantic similarity
         let related_patterns = if self.config.enable_linking {
             match self.linker.find_related_for_document(
                 &doc_title,
                 &doc_description,
-                None, // problem field no longer exists
-                None, // solution field no longer exists
+                None,
+                None,
                 Some(&doc_id),
             ).await {
                 Ok(links) => {
-                    info!(
-                        doc_id = doc_id,
-                        related_count = links.len(),
-                        "Found related patterns"
-                    );
+                    info!(doc_id = doc_id, related_count = links.len(), "Found related patterns");
                     links
                 }
                 Err(e) => {
@@ -758,7 +581,7 @@ impl ContentProcessor {
         })
     }
 
-    /// Get store reference for direct access (uses RwLock)
+    /// Get store reference for direct access
     pub fn store(&self) -> Arc<RwLock<KixStore>> {
         self.store.clone()
     }
@@ -779,21 +602,21 @@ impl ContentProcessor {
             .await
     }
 
-    /// Get document count (uses read lock for concurrent access)
+    /// Get document count
     pub async fn document_count(&self) -> Result<usize, JobError> {
         let store = self.store.read().await;
         store.document_count().await
             .map_err(|e| JobError::Processing(format!("Failed to get document count: {}", e)))
     }
 
-    /// Get chunk count (uses read lock for concurrent access)
+    /// Get chunk count
     pub async fn chunk_count(&self) -> Result<usize, JobError> {
         let store = self.store.read().await;
         store.chunk_count()
             .map_err(|e| JobError::Processing(format!("Failed to get chunk count: {}", e)))
     }
 
-    /// Get page count (uses read lock for concurrent access)
+    /// Get page count
     pub async fn page_count(&self) -> Result<usize, JobError> {
         let store = self.store.read().await;
         store.page_count().await
@@ -805,17 +628,6 @@ impl ContentProcessor {
     // ========================================================================
 
     /// Process HTML content using two-layer storage pattern for RAG.
-    ///
-    /// This method:
-    /// 1. Stores the full page content in the pages table (for RAG context)
-    /// 2. Stores chunks with page_id FK (for vector search)
-    /// 3. Generates embeddings with optional page context
-    ///
-    /// Use this for crawled pages where full context is valuable for RAG.
-    /// Uses ContentExtractor (source of truth) for all HTML processing.
-    ///
-    /// If `title` is provided, it will be used instead of re-extracting from content.
-    /// This is useful when the crawler has already extracted the title from raw HTML.
     pub async fn process_html_with_page(
         &self,
         content: &str,
@@ -825,21 +637,18 @@ impl ContentProcessor {
     ) -> Result<TwoLayerResult, JobError> {
         debug!(url = source_url, "Processing HTML with two-layer storage using ContentExtractor");
 
-        // Parse URL for extractor
         let url = url::Url::parse(source_url)
             .unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
 
-        // Use content extraction (source of truth, never fails)
         let mut extracted = self.content_extractor.extract(content, &url);
 
-        // Use provided title if available (crawler already extracted it from raw HTML)
         if let Some(t) = title {
             if !t.is_empty() {
                 extracted.title = t;
             }
         }
 
-        debug!(
+        info!(
             url = source_url,
             title = %extracted.title,
             markdown_len = extracted.markdown.len(),
@@ -849,11 +658,9 @@ impl ContentProcessor {
             "ContentExtractor extraction complete for two-layer storage"
         );
 
-        // Create entry with extracted content
         let entry = self.create_entry_from_extracted(&extracted, source_url)?;
         let entry_id = entry.id.clone();
 
-        // Create page record for full content storage
         let page = PageRecord::new(&entry_id, source_url, &extracted.markdown)
             .with_title(extracted.title.clone());
 
@@ -863,7 +670,6 @@ impl ContentProcessor {
             page
         };
 
-        // Process with two-layer storage, including code blocks for indexing
         self.process_document_with_page(
             entry,
             &extracted.markdown,
@@ -874,9 +680,6 @@ impl ContentProcessor {
     }
 
     /// Process a document with two-layer storage pattern.
-    ///
-    /// Stores both the full page content and smaller chunks for search.
-    /// Code blocks are indexed as separate searchable chunks with language metadata.
     async fn process_document_with_page(
         &self,
         entry: Entry,
@@ -890,12 +693,11 @@ impl ContentProcessor {
         let doc_description = entry.description.clone();
         let page_id = page.page_id.clone();
 
-        // Build SmartChunkingInput with code blocks for separate indexing
         let smart_input = SmartChunkingInput {
             markdown: markdown.to_string(),
             code_blocks: code_blocks
                 .iter()
-                .filter(|cb| !cb.is_inline) // Only index block code, not inline
+                .filter(|cb| !cb.is_inline)
                 .map(|cb| CodeBlockInput {
                     language: cb.language.clone(),
                     content: cb.content.clone(),
@@ -911,8 +713,10 @@ impl ContentProcessor {
             plain_text: String::new(),
         };
 
-        // Use smart chunking that creates separate chunks for code blocks
         let mut chunks = self.chunker.chunk_smart(&entry, &smart_input);
+
+        // Build code extraction stats from the code_blocks
+        let code_extraction = Self::build_code_extraction_stats(code_blocks);
 
         if chunks.is_empty() {
             warn!(doc_id = doc_id, "No chunks generated from document");
@@ -922,6 +726,7 @@ impl ContentProcessor {
                 chunks_created: 0,
                 embeddings_generated: 0,
                 related_patterns: vec![],
+                code_extraction,
             });
         }
 
@@ -937,43 +742,30 @@ impl ContentProcessor {
             "Generated chunks with page FK reference"
         );
 
-        // Generate embeddings via worker pool
-        let embeddings = self
-            .embedding_pool
-            .embed_chunks(chunks.clone())
-            .await
-            .map_err(|e| JobError::Processing(format!("Failed to generate embeddings: {}", e)))?;
+        let embeddings = self.embed_chunks(&chunks).await?;
 
-        // Store using two-layer storage
         {
             let store = self.store.write().await;
 
-            // Check if document already exists
             let exists = store.document_exists(&doc_id).await
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document, chunks, and pages
                 store.delete_chunks_by_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
-
-                // Delete pages by source_id (entry_id)
                 store.delete_pages_by_source(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old pages: {}", e)))?;
             }
 
-            // Insert new document (from Entry type)
             store.insert_documents_from_entries(&[entry]).await
                 .map_err(|e| JobError::Processing(format!("Failed to insert document: {}", e)))?;
 
-            // Insert page and chunks together using two-layer storage
             store.store_page_with_chunks(&page, &chunks, &embeddings).await
                 .map_err(|e| JobError::Processing(format!("Failed to store page with chunks: {}", e)))?;
         }
 
-        // Find related patterns
         let related_patterns = if self.config.enable_linking {
             match self.linker.find_related_for_document(
                 &doc_title,
@@ -983,11 +775,7 @@ impl ContentProcessor {
                 Some(&doc_id),
             ).await {
                 Ok(links) => {
-                    info!(
-                        doc_id = doc_id,
-                        related_count = links.len(),
-                        "Found related patterns"
-                    );
+                    info!(doc_id = doc_id, related_count = links.len(), "Found related patterns");
                     links
                 }
                 Err(e) => {
@@ -1014,13 +802,58 @@ impl ContentProcessor {
             chunks_created: chunks.len(),
             embeddings_generated: embeddings.len(),
             related_patterns,
+            code_extraction,
+        })
+    }
+
+    /// Build code extraction statistics from extracted code blocks
+    fn build_code_extraction_stats(
+        code_blocks: &[kix_crawler::ExtractedCodeBlock],
+    ) -> Option<CodeExtractionResult> {
+        // Only non-inline code blocks count
+        let blocks: Vec<_> = code_blocks.iter().filter(|cb| !cb.is_inline).collect();
+
+        if blocks.is_empty() {
+            return None;
+        }
+
+        // Count languages
+        let mut language_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for block in &blocks {
+            let lang = block.language.clone().unwrap_or_else(|| "unknown".to_string());
+            *language_counts.entry(lang).or_insert(0) += 1;
+        }
+
+        // Convert to LanguageCount vec, sorted by count desc
+        let mut languages: Vec<LanguageCount> = language_counts
+            .into_iter()
+            .map(|(language, count)| LanguageCount { language, count })
+            .collect();
+        languages.sort_by(|a, b| b.count.cmp(&a.count));
+
+        // For now, we don't have pattern matching info from ContentExtractor
+        // This would need to come from the CodeExtractor if we use it
+        let patterns_matched = vec!["pre>code".to_string()]; // Default pattern
+
+        // All blocks from ContentExtractor pass validation (it doesn't do validation)
+        let validation_stats = CodeValidationStats {
+            total_extracted: blocks.len(),
+            passed_validation: blocks.len(),
+            rejected_too_short: 0,
+            rejected_placeholder: 0,
+            rejected_no_structure: 0,
+            rejected_high_prose: 0,
+        };
+
+        Some(CodeExtractionResult {
+            blocks_found: blocks.len(),
+            patterns_matched,
+            languages,
+            validation_stats,
         })
     }
 
     /// Get the full page context for a chunk (for RAG enrichment).
-    ///
-    /// When a search returns chunks, use this to retrieve the full page
-    /// content for better context in RAG applications.
     pub async fn get_page_context(&self, page_id: &str) -> Result<Option<PageRecord>, JobError> {
         let store = self.store.read().await;
         store.get_page_for_chunk(page_id).await
@@ -1041,6 +874,21 @@ pub struct TwoLayerResult {
     pub embeddings_generated: usize,
     /// Related patterns found via semantic similarity
     pub related_patterns: Vec<PatternLink>,
+    /// Code extraction statistics for SSE visibility
+    pub code_extraction: Option<CodeExtractionResult>,
+}
+
+/// Code extraction result for SSE visibility
+#[derive(Debug, Clone)]
+pub struct CodeExtractionResult {
+    /// Total code blocks found
+    pub blocks_found: usize,
+    /// Patterns that matched during extraction
+    pub patterns_matched: Vec<String>,
+    /// Language breakdown
+    pub languages: Vec<LanguageCount>,
+    /// Validation statistics
+    pub validation_stats: CodeValidationStats,
 }
 
 /// Result of processing a document

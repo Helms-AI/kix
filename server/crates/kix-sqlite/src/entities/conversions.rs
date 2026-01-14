@@ -278,6 +278,7 @@ impl From<job::Model> for crate::jobs::JobRecord {
             duration_ms: model.duration_ms,
             processing_rate: model.processing_rate,
             errors: model.errors,
+            code_extraction_stats: model.code_extraction_stats,
         }
     }
 }
@@ -303,6 +304,7 @@ impl From<&crate::jobs::JobRecord> for job::ActiveModel {
             duration_ms: Set(record.duration_ms),
             processing_rate: Set(record.processing_rate),
             errors: Set(record.errors.clone()),
+            code_extraction_stats: Set(record.code_extraction_stats.clone()),
         }
     }
 }

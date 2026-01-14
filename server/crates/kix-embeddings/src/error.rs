@@ -5,27 +5,35 @@ use thiserror::Error;
 /// Errors that can occur during embedding generation.
 #[derive(Error, Debug)]
 pub enum EmbeddingError {
-    /// Failed to initialize the embedding model.
-    #[error("Failed to initialize embedding model: {0}")]
-    ModelInit(String),
+    /// Ollama API error
+    #[error("Ollama error: {0}")]
+    OllamaError(String),
 
-    /// Failed to generate embeddings.
-    #[error("Failed to generate embeddings: {0}")]
-    Generation(String),
+    /// Empty response from Ollama
+    #[error("Empty response from Ollama")]
+    EmptyResponse,
 
-    /// Batch size exceeded limit.
-    #[error("Batch size {0} exceeds maximum {1}")]
-    BatchTooLarge(usize, usize),
+    /// Dimension mismatch between expected and actual
+    #[error("Dimension mismatch: expected {expected}, got {actual}")]
+    DimensionMismatch { expected: usize, actual: usize },
 
-    /// Empty input provided.
+    /// Semaphore acquisition error
+    #[error("Semaphore error")]
+    SemaphoreError,
+
+    /// Connection error to Ollama server
+    #[error("Connection error: {0}")]
+    ConnectionError(String),
+
+    /// Empty input provided
     #[error("Cannot generate embeddings for empty input")]
     EmptyInput,
 
-    /// No embedding backend available.
-    #[error("No embedding backend available: {0}")]
-    NoBackendAvailable(String),
+    /// Failed to initialize embedding model
+    #[error("Failed to initialize embedding model: {0}")]
+    ModelInit(String),
 
-    /// Backend initialization failed.
-    #[error("Backend initialization failed: {0}")]
-    BackendInit(String),
+    /// Failed to generate embeddings
+    #[error("Failed to generate embeddings: {0}")]
+    Generation(String),
 }

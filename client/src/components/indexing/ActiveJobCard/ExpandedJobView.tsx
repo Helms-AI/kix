@@ -3,6 +3,7 @@ import type { Job, EnhancedLiveJobData } from '../../../api/indexingClient';
 import { JobMetrics } from './JobMetrics';
 import { ETACountdown } from './ETACountdown';
 import { PageStatusList } from './PageStatusList';
+import { CodeExtractionPanel } from '../code-extraction';
 
 interface ExpandedJobViewProps {
   job: Job;
@@ -26,6 +27,7 @@ export const ExpandedJobView = memo(function ExpandedJobView({
   const rateHistory = liveData?.rateHistory ?? [];
   const pages = liveData?.pages ?? {};
   const etaSeconds = liveData?.etaSeconds;
+  const codeExtraction = liveData?.codeExtraction;
 
   const isActive = job.status === 'running' || job.status === 'queued';
 
@@ -48,6 +50,14 @@ export const ExpandedJobView = memo(function ExpandedJobView({
         <ETACountdown
           etaSeconds={etaSeconds}
           percentage={percentage}
+        />
+      )}
+
+      {/* Code Extraction Panel - show compact version if we have extraction data */}
+      {codeExtraction && codeExtraction.total_code_blocks > 0 && (
+        <CodeExtractionPanel
+          stats={codeExtraction}
+          compact
         />
       )}
 

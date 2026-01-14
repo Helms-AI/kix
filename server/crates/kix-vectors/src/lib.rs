@@ -278,17 +278,21 @@ impl VectorStore {
         };
 
         // Build filter clause with numbered parameters starting from ?3
+        // NOTE: We use split/rejoin to avoid infinite loop - the old while-loop approach
+        // would replace '?' with '?3', which still contains '?', causing infinite iteration
         let numbered_filter_clause = if filter_clause.is_empty() {
             String::new()
         } else {
-            // Replace sequential ? placeholders with numbered ones starting at 3
-            let mut clause = filter_clause.clone();
-            let mut param_num = 3;
-            while clause.contains('?') {
-                clause = clause.replacen('?', &format!("?{}", param_num), 1);
-                param_num += 1;
+            // Split on '?' and rejoin with numbered parameters
+            let parts: Vec<&str> = filter_clause.split('?').collect();
+            let mut result = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                result.push_str(part);
+                if i < parts.len() - 1 {
+                    result.push_str(&format!("?{}", 3 + i));
+                }
             }
-            format!("AND {}", clause)
+            format!("AND {}", result)
         };
 
         // Use chunk_vectors MATCH for KNN search with k constraint, then join with metadata
@@ -896,5 +900,49 @@ mod tests {
         // No chunks inserted
         let result = store.get_entry_embedding("nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_filter_parameter_replacement_no_infinite_loop() {
+        // This test verifies the SQL parameter replacement logic doesn't infinite loop
+        // The bug: while clause.contains('?') { clause = clause.replacen('?', "?N", 1) }
+        // This loops forever because "?3" still contains "?"
+
+        // Simulate the fixed logic
+        let filter_clause = "entry_type = ? AND source_domain = ?";
+        let parts: Vec<&str> = filter_clause.split('?').collect();
+        let mut result = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            result.push_str(part);
+            if i < parts.len() - 1 {
+                result.push_str(&format!("?{}", 3 + i));
+            }
+        }
+
+        assert_eq!(result, "entry_type = ?3 AND source_domain = ?4");
+
+        // Single parameter case
+        let filter_clause = "entry_type = ?";
+        let parts: Vec<&str> = filter_clause.split('?').collect();
+        let mut result = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            result.push_str(part);
+            if i < parts.len() - 1 {
+                result.push_str(&format!("?{}", 3 + i));
+            }
+        }
+        assert_eq!(result, "entry_type = ?3");
+
+        // Empty clause case
+        let filter_clause = "";
+        let parts: Vec<&str> = filter_clause.split('?').collect();
+        let mut result = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            result.push_str(part);
+            if i < parts.len() - 1 {
+                result.push_str(&format!("?{}", 3 + i));
+            }
+        }
+        assert_eq!(result, "");
     }
 }

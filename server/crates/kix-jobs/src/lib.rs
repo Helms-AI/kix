@@ -7,13 +7,17 @@ pub mod progress;
 pub mod persistence;
 pub mod processor;
 pub mod linker;
+pub mod crawler;
+pub mod extraction;
 
 pub use job::{Job, JobConfig, JobState, JobType};
 pub use queue::{JobQueue, QueueConfig};
 pub use executor::{JobExecutor, ExecutorConfig};
 pub use progress::{Progress, ProgressTracker};
-pub use processor::{ContentProcessor, ProcessorConfig, ProcessingResult, TwoLayerResult};
+pub use processor::{ContentProcessor, ProcessorConfig, ProcessingResult, TwoLayerResult, CodeExtractionResult};
 pub use linker::{PatternLinker, PatternLink, LinkStrength, LinkingConfig, LinkSuggestions};
+pub use crawler::{SpiderCrawler, SpiderConfig, CrawledPage, CrawlMode, CrawlError};
+pub use extraction::{CodeExtractor, CodeExtractionConfig, CodeBlock, ExtractionResult, Language, CodePattern};
 
 use thiserror::Error;
 use uuid::Uuid;

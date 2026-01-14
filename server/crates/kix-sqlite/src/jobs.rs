@@ -57,6 +57,10 @@ pub struct JobRecord {
 
     /// Error messages as JSON array
     pub errors: Option<String>,
+
+    /// Code extraction statistics as JSON
+    /// Contains: total_code_blocks, pages_with_code, languages, patterns_matched, validation
+    pub code_extraction_stats: Option<String>,
 }
 
 impl JobRecord {
@@ -80,6 +84,7 @@ impl JobRecord {
             duration_ms: 0,
             processing_rate: 0.0,
             errors: None,
+            code_extraction_stats: None,
         }
     }
 
@@ -227,8 +232,8 @@ pub async fn insert_job(pool: &SqlitePool, job: &JobRecord) -> Result<()> {
             job_id, job_type, status, created_at, started_at, completed_at,
             source_url, source_domain, config, items_processed, items_discovered,
             chunks_created, embeddings_generated, error_count, duration_ms,
-            processing_rate, errors
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            processing_rate, errors, code_extraction_stats
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&job.job_id)
@@ -248,6 +253,7 @@ pub async fn insert_job(pool: &SqlitePool, job: &JobRecord) -> Result<()> {
     .bind(job.duration_ms)
     .bind(job.processing_rate)
     .bind(&job.errors)
+    .bind(&job.code_extraction_stats)
     .execute(pool)
     .await?;
 

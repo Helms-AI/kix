@@ -10,6 +10,7 @@ export type SSEEventType =
   | 'job_completed'
   | 'job_cancelled'
   | 'job_history_updated'
+  | 'code_extraction'
   | 'heartbeat';
 
 // Backend sends this structure
@@ -99,6 +100,20 @@ export interface SSEEvent {
 
     // Item started fields
     started_at?: string;
+
+    // Code extraction fields
+    url?: string;
+    blocks_found?: number;
+    patterns_matched?: string[];
+    languages?: { language: string; count: number }[];
+    validation_stats?: {
+      total_extracted: number;
+      passed_validation: number;
+      rejected_too_short: number;
+      rejected_placeholder: number;
+      rejected_no_structure: number;
+      rejected_high_prose: number;
+    };
   };
 }
 
@@ -262,6 +277,7 @@ export function useSSE({
       'job_completed',
       'job_cancelled',
       'job_history_updated',
+      'code_extraction',
       'heartbeat',
     ];
 

@@ -42,6 +42,7 @@ pub mod excel;
 pub mod markdown;
 pub mod pdf;
 pub mod text;
+pub mod treesitter;
 pub mod validator;
 
 // Re-export main types (new names)
@@ -93,3 +94,6 @@ pub use chunker::{
     ChunkerConfig, SmartChunk, SmartChunkType, SmartChunker,
     chunk_text, chunk_text_with_size, chunk_for_embeddings,
 };
+
+// Re-export tree-sitter types for convenience
+pub use treesitter::{TreeSitterChunker, SourceLanguage, CodeChunk};

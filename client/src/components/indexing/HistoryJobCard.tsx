@@ -14,15 +14,18 @@ import type {
   PersistedJob,
   PersistedJobItem,
   PageState,
+  CodeExtractionStats,
 } from '../../api/indexingClient';
 import {
   indexingApi,
   convertPersistedItemsToPages,
+  convertPersistedCodeExtractionStats,
 } from '../../api/indexingClient';
 import { ProgressRing } from './ActiveJobCard/ProgressRing';
 import { JobMetrics } from './ActiveJobCard/JobMetrics';
 import { JobDuration } from './ActiveJobCard/JobDuration';
 import { PageStatusList } from './ActiveJobCard/PageStatusList';
+import { CodeExtractionPanel } from './code-extraction';
 
 interface HistoryJobCardProps {
   job: PersistedJob;
@@ -208,6 +211,11 @@ const HistoryExpandedView = memo(function HistoryExpandedView({
     ? convertPersistedItemsToPages(items)
     : {};
 
+  // Convert persisted code extraction stats to display format
+  const codeExtractionStats: CodeExtractionStats | null = job.code_extraction
+    ? convertPersistedCodeExtractionStats(job.code_extraction)
+    : null;
+
   return (
     <div className="px-4 pb-4 space-y-4 border-t border-slate-700/50">
       {/* Metrics Grid */}
@@ -224,6 +232,14 @@ const HistoryExpandedView = memo(function HistoryExpandedView({
 
       {/* Job Duration */}
       <JobDuration durationMs={job.stats.duration_ms} />
+
+      {/* Code Extraction Panel - show if we have extraction data */}
+      {codeExtractionStats && codeExtractionStats.total_code_blocks > 0 && (
+        <CodeExtractionPanel
+          stats={codeExtractionStats}
+          compact
+        />
+      )}
 
       {/* Page Status List or Loading State */}
       {isLoading ? (

@@ -16,44 +16,34 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, error};
 
-use kix_embeddings::EmbeddingGenerator;
+use kix_embeddings::OllamaEmbedder;
 use kix_services::{self, Pagination, QueryFilters, SearchMode};
 use kix_store::search::{PatternSummary, SearchResult, EntryChunk};
 use kix_store::KixStore;
 
 /// Application state shared across all routes.
-/// Uses RwLock for high-concurrency read access - most API operations are reads.
+/// Uses RwLock for store and Arc for embedder (embedder has internal concurrency control).
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<RwLock<KixStore>>,
-    embedder: Arc<RwLock<EmbeddingGenerator>>,
+    embedder: Arc<OllamaEmbedder>,
 }
 
 impl AppState {
     /// Create a new application state with an owned store.
-    ///
-    /// This wraps the store in Arc<RwLock> internally.
-    /// For sharing a store with other components (e.g., JobExecutor),
-    /// use `new_with_store()` instead.
-    pub fn new(store: KixStore, embedder: EmbeddingGenerator) -> Self {
+    pub fn new(store: KixStore, embedder: OllamaEmbedder) -> Self {
         Self::new_with_store(Arc::new(RwLock::new(store)), embedder)
     }
 
     /// Create a new application state with a pre-wrapped shared store.
-    ///
-    /// This is the preferred constructor when the store needs to be shared
-    /// with other components like the JobExecutor's ContentProcessor.
-    pub fn new_with_store(store: Arc<RwLock<KixStore>>, embedder: EmbeddingGenerator) -> Self {
-        Self::with_shared(store, Arc::new(RwLock::new(embedder)))
+    pub fn new_with_store(store: Arc<RwLock<KixStore>>, embedder: OllamaEmbedder) -> Self {
+        Self::with_shared(store, Arc::new(embedder))
     }
 
     /// Create a new application state with both shared store and shared embedder.
-    ///
-    /// This is the preferred constructor for unified server mode where both
-    /// API and MCP servers share the same resources.
     pub fn with_shared(
         store: Arc<RwLock<KixStore>>,
-        embedder: Arc<RwLock<EmbeddingGenerator>>,
+        embedder: Arc<OllamaEmbedder>,
     ) -> Self {
         info!("Initialized API state with shared store and embedder (real-time data mode)");
 
@@ -66,7 +56,7 @@ impl AppState {
     }
 
     /// Get a reference to the embedder.
-    pub fn embedder(&self) -> &Arc<RwLock<EmbeddingGenerator>> {
+    pub fn embedder(&self) -> &Arc<OllamaEmbedder> {
         &self.embedder
     }
 }
@@ -659,15 +649,12 @@ async fn get_entry_graph(
         // Create a query from the entry's title and description
         let query = format!("{} {}", pattern.title, pattern.description);
 
-        // Generate embedding for this entry
-        let embedding = {
-            let mut embedder = state.embedder.write().await;
-            match embedder.embed_query(&query) {
-                Ok(emb) => emb,
-                Err(e) => {
-                    error!("Failed to embed entry '{}': {}", pattern.id, e);
-                    continue;
-                }
+        // Generate embedding for this entry (async)
+        let embedding = match state.embedder.embed_one(&query).await {
+            Ok(emb) => emb,
+            Err(e) => {
+                error!("Failed to embed entry '{}': {}", pattern.id, e);
+                continue;
             }
         };
 

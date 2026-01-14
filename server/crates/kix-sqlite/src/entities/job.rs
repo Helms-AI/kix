@@ -59,6 +59,11 @@ pub struct Model {
 
     /// Error messages as JSON array
     pub errors: Option<String>,
+
+    /// Code extraction statistics as JSON
+    /// Contains: total_code_blocks, pages_with_code, languages, patterns_matched, validation
+    #[sea_orm(column_type = "Text", nullable)]
+    pub code_extraction_stats: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

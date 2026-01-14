@@ -21,7 +21,7 @@ use tracing::{error, info};
 
 use kix_api::{create_router, create_indexing_router, create_project_router, AppState, IndexingState, ProjectState};
 use kix_crawler::file_handler::FileHandler;
-use kix_embeddings::{DocumentChunker, EmbeddingGenerator, ensure_setup, is_setup, model_cache_dir};
+use kix_embeddings::{DocumentChunker, OllamaEmbedder, EmbeddingConfig};
 use kix_jobs::{JobExecutor, ExecutorConfig, JobQueue, QueueConfig};
 use kix_mcp::KixMcpServer;
 use kix_parser::{Entry, EntryType, PdfParser, SourceType};
@@ -187,13 +187,12 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
     println!("Database path: {}", db_path);
     println!("Rebuild: {}", rebuild);
 
-    // Auto-setup: download models if not present
-    auto_setup()?;
-
-    // Initialize embedder
-    println!("\nInitializing embedding model...");
-    let mut embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
-    println!("Embedding model initialized.");
+    // Initialize embedder (connects to Ollama server)
+    println!("\nInitializing Ollama embedder...");
+    let config = EmbeddingConfig::default();
+    let embedder = OllamaEmbedder::new(config).context("Failed to initialize Ollama embedder")?;
+    embedder.health_check().await.context("Ollama server not reachable")?;
+    println!("Ollama embedder initialized.");
 
     // Initialize store
     println!("\nInitializing database...");
@@ -292,9 +291,9 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
             let chunks = chunker.chunk(&document);
 
             if !chunks.is_empty() {
-                // Generate embeddings for chunks
-                let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-                match embedder.embed_texts(&chunk_texts) {
+                // Generate embeddings for chunks (async)
+                let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+                match embedder.embed_batch(&chunk_texts).await {
                     Ok(embeddings) => {
                         if let Err(e) = store.insert_chunks(&chunks, &embeddings) {
                             error!("Failed to store chunks: {}", e);
@@ -349,9 +348,9 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
                     let chunks = chunker.chunk(&document);
 
                     if !chunks.is_empty() {
-                        // Generate embeddings for chunks
-                        let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-                        match embedder.embed_texts(&chunk_texts) {
+                        // Generate embeddings for chunks (async)
+                        let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+                        match embedder.embed_batch(&chunk_texts).await {
                             Ok(embeddings) => {
                                 if let Err(e) = store.insert_chunks(&chunks, &embeddings) {
                                     error!("Failed to store chunks: {}", e);
@@ -389,11 +388,12 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
 async fn run_serve(db_path: &str) -> Result<()> {
     info!("Starting MCP server...");
 
-    // Auto-setup: download models if not present
-    auto_setup()?;
+    // Initialize embedder (connects to Ollama server)
+    let config = EmbeddingConfig::default();
+    let embedder = OllamaEmbedder::new(config).context("Failed to initialize Ollama embedder")?;
+    embedder.health_check().await.context("Ollama server not reachable")?;
 
-    // Initialize embedder and store
-    let embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
+    // Initialize store
     let mut store = KixStore::new(Path::new(db_path))
         .await
         .context("Failed to open database")?;
@@ -444,9 +444,6 @@ async fn run_serve(db_path: &str) -> Result<()> {
 async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) -> Result<()> {
     info!("Starting unified server (API + MCP with shared store)...");
 
-    // Auto-setup: download models if not present
-    auto_setup()?;
-
     // Initialize store - SINGLE SHARED INSTANCE
     let mut store = KixStore::new(Path::new(db_path))
         .await
@@ -460,10 +457,12 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
     let shared_store = Arc::new(RwLock::new(store));
     info!("Created single shared KixStore instance for API and MCP servers");
 
-    // Create single shared embedder for both API and MCP
-    let embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
-    let shared_embedder = Arc::new(RwLock::new(embedder));
-    info!("Created single shared EmbeddingGenerator for API and MCP servers");
+    // Create single shared embedder for both API and MCP (connects to Ollama server)
+    let config = EmbeddingConfig::default();
+    let embedder = OllamaEmbedder::new(config).context("Failed to initialize Ollama embedder")?;
+    embedder.health_check().await.context("Ollama server not reachable")?;
+    let shared_embedder = Arc::new(embedder);
+    info!("Created single shared OllamaEmbedder for API and MCP servers");
 
     // Create shared components
     let job_queue = Arc::new(JobQueue::new(QueueConfig::default()));
@@ -658,11 +657,12 @@ async fn run_search(
     println!("Query: {}", query);
     println!("Search type: {}", search_type);
 
-    // Auto-setup: download models if not present
-    auto_setup()?;
+    // Initialize embedder (connects to Ollama server)
+    let config = EmbeddingConfig::default();
+    let embedder = OllamaEmbedder::new(config).context("Failed to initialize Ollama embedder")?;
+    embedder.health_check().await.context("Ollama server not reachable")?;
 
-    // Initialize embedder and store
-    let mut embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
+    // Initialize store
     let mut store = KixStore::new(Path::new(db_path))
         .await
         .context("Failed to open database")?;
@@ -678,20 +678,20 @@ async fn run_search(
         source_domain: None,
     };
 
-    // Perform search based on type
+    // Perform search based on type (all modes use async embedding)
     let results = match search_type {
         "semantic" | "vector" => {
-            let embedding = embedder.embed_query(query)?;
+            let embedding = embedder.embed_one(query).await?;
             store.vector_search(&embedding, limit, &filters).await?
         }
         "text" | "fts" => {
             // FTS-only search: Use hybrid search with zero-vector for pure text matching
-            let embedding = embedder.embed_query(query)?;
+            let embedding = embedder.embed_one(query).await?;
             store.hybrid_search(query, &embedding, limit, &filters).await?
         }
         _ => {
             // Default to hybrid
-            let embedding = embedder.embed_query(query)?;
+            let embedding = embedder.embed_one(query).await?;
             store
                 .hybrid_search(query, &embedding, limit, &filters)
                 .await?
@@ -794,76 +794,65 @@ async fn run_create_indexes(db_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Download and setup embedding models.
-async fn run_setup(model: Option<String>, force: bool) -> Result<()> {
-    println!("\n=== Embedding Model Setup ===\n");
+/// Verify Ollama connection and embedding model availability.
+async fn run_setup(model: Option<String>, _force: bool) -> Result<()> {
+    println!("\n=== Ollama Embedding Setup ===\n");
 
-    // Set model via environment variable if specified
-    if let Some(ref model_name) = model {
-        std::env::set_var("KIX_EMBEDDING_MODEL", model_name);
-        println!("Model: {}", model_name);
-    } else {
-        let default_model = std::env::var("KIX_EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "bge-base-en-v1.5".to_string());
-        println!("Model: {} (default)", default_model);
+    // Get model name
+    let model_name = model.unwrap_or_else(|| {
+        std::env::var("OLLAMA_MODEL")
+            .unwrap_or_else(|_| "nomic-embed-text".to_string())
+    });
+    println!("Model: {}", model_name);
+
+    // Get Ollama URL
+    let ollama_url = std::env::var("OLLAMA_URL")
+        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    println!("Ollama URL: {}", ollama_url);
+
+    // Create embedder config with model
+    let config = EmbeddingConfig {
+        model: model_name.clone(),
+        ollama_url: ollama_url.clone(),
+        ..Default::default()
+    };
+
+    println!("\nConnecting to Ollama...");
+    let embedder = OllamaEmbedder::new(config).context("Failed to initialize Ollama embedder")?;
+
+    // Test connection and model availability
+    match embedder.health_check().await {
+        Ok(()) => {
+            println!("✓ Ollama server is reachable");
+        }
+        Err(e) => {
+            println!("✗ Failed to connect to Ollama: {}", e);
+            println!("\nMake sure Ollama is running:");
+            println!("  ollama serve");
+            println!("\nAnd the embedding model is pulled:");
+            println!("  ollama pull {}", model_name);
+            return Err(anyhow::anyhow!("Ollama not reachable: {}", e));
+        }
     }
 
-    let cache_dir = model_cache_dir();
-    println!("Cache directory: {:?}", cache_dir);
-
-    // Check if already set up
-    if !force && is_setup() {
-        println!("\nModel is already downloaded and ready!");
-        println!("Use --force to re-download.");
-        return Ok(());
-    }
-
-    if force {
-        println!("\nForce re-download requested...");
-        // Remove existing files
-        let model_name = model.unwrap_or_else(|| {
-            std::env::var("KIX_EMBEDDING_MODEL")
-                .unwrap_or_else(|_| "bge-base-en-v1.5".to_string())
-        });
-        let safe_name = model_name.replace("-", "_").replace("/", "_");
-        let model_path = cache_dir.join(format!("{}.onnx", safe_name));
-        let tokenizer_path = cache_dir.join(format!("{}_tokenizer.json", safe_name));
-        let _ = std::fs::remove_file(&model_path);
-        let _ = std::fs::remove_file(&tokenizer_path);
-    }
-
-    println!("\nDownloading model...");
-    let setup_info = ensure_setup().context("Failed to setup embedding model")?;
-
-    if setup_info.downloaded {
-        println!("\nModel downloaded successfully!");
-    } else {
-        println!("\nModel was already present.");
+    // Test embedding generation
+    println!("\nTesting embedding generation...");
+    match embedder.embed_one("test embedding").await {
+        Ok(embedding) => {
+            println!("✓ Embedding generated successfully ({} dimensions)", embedding.len());
+        }
+        Err(e) => {
+            println!("✗ Failed to generate embedding: {}", e);
+            println!("\nMake sure the model is pulled:");
+            println!("  ollama pull {}", model_name);
+            return Err(anyhow::anyhow!("Embedding generation failed: {}", e));
+        }
     }
 
     println!("\nSetup complete!");
-    println!("  Model: {}", setup_info.model_name);
-    println!("  Cache: {:?}", setup_info.cache_dir);
+    println!("  Ollama URL: {}", ollama_url);
+    println!("  Model: {}", model_name);
 
-    Ok(())
-}
-
-/// Ensure models are set up before starting the server.
-fn auto_setup() -> Result<()> {
-    if !is_setup() {
-        println!("First-time setup: downloading embedding model...");
-        match ensure_setup() {
-            Ok(info) => {
-                if info.downloaded {
-                    println!("Model downloaded: {}", info.model_name);
-                }
-            }
-            Err(e) => {
-                error!("Warning: Failed to auto-download model: {}", e);
-                error!("You may need to run 'eip setup' manually.");
-            }
-        }
-    }
     Ok(())
 }
 

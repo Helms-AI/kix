@@ -1,0 +1,21 @@
+-- ===========================================================================
+-- Migration 003: Add code extraction stats to jobs table
+-- ===========================================================================
+
+-- Add code_extraction_stats column to track extraction metrics
+-- Stored as JSON with structure:
+-- {
+--   "total_code_blocks": number,
+--   "pages_with_code": number,
+--   "languages": [{"language": string, "count": number}],
+--   "patterns_matched": [string],
+--   "validation": {
+--     "total_extracted": number,
+--     "passed_validation": number,
+--     "rejected_too_short": number,
+--     "rejected_placeholder": number,
+--     "rejected_no_structure": number,
+--     "rejected_high_prose": number
+--   }
+-- }
+ALTER TABLE jobs ADD COLUMN code_extraction_stats TEXT;

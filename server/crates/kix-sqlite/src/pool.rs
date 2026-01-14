@@ -15,6 +15,9 @@ const INITIAL_MIGRATION: &str = include_str!("migrations/001_initial.sql");
 /// Sync state migration SQL
 const SYNC_STATE_MIGRATION: &str = include_str!("migrations/002_sync_state.sql");
 
+/// Code extraction stats migration SQL
+const CODE_EXTRACTION_STATS_MIGRATION: &str = include_str!("migrations/003_code_extraction_stats.sql");
+
 /// Create a new SQLite connection pool
 ///
 /// Creates the database file and parent directories if they don't exist.
@@ -56,6 +59,7 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     let migrations = vec![
         ("001_initial", INITIAL_MIGRATION),
         ("002_sync_state", SYNC_STATE_MIGRATION),
+        ("003_code_extraction_stats", CODE_EXTRACTION_STATS_MIGRATION),
     ];
 
     for (name, migration_sql) in migrations {
@@ -69,6 +73,17 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             let trimmed = statement.trim();
             if !trimmed.is_empty() {
                 if let Err(e) = sqlx::query(trimmed).execute(pool).await {
+                    // SQLite doesn't support "ADD COLUMN IF NOT EXISTS", so we need to
+                    // handle the "duplicate column name" error gracefully for idempotency
+                    let error_msg = e.to_string();
+                    let is_duplicate_column = error_msg.contains("duplicate column name")
+                        && trimmed.to_uppercase().contains("ADD COLUMN");
+
+                    if is_duplicate_column {
+                        debug!("Column already exists, skipping: {}", &trimmed[..trimmed.len().min(100)]);
+                        continue;
+                    }
+
                     tracing::error!("Migration {} statement failed: {}", name, &trimmed[..trimmed.len().min(200)]);
                     return Err(SqliteError::Database(e));
                 }

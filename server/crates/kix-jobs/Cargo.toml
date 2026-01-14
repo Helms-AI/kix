@@ -60,10 +60,16 @@ kix-embeddings = { path = "../kix-embeddings" }
 kix-parser = { path = "../kix-parser" }
 kix-crawler = { path = "../kix-crawler" }
 
+# Spider web crawler
+spider = { workspace = true }
+spider_transformations = { workspace = true }
+
+# HTML parsing for code extraction
+scraper = { workspace = true }
+
 [features]
-default = ["persistence", "fastembed-backend"]
+default = ["persistence"]
 persistence = ["sqlx"]
-fastembed-backend = ["kix-embeddings/fastembed-backend"]
 
 [dev-dependencies]
 tempfile = "3.14"

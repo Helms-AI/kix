@@ -5,10 +5,10 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use kix_embeddings::EmbeddingGenerator;
+use kix_embeddings::OllamaEmbedder;
 use kix_store::search::SearchFilters;
 use kix_store::KixStore;
 
@@ -91,7 +91,7 @@ impl std::fmt::Display for LinkStrength {
 /// Pattern linker finds related patterns using semantic similarity
 pub struct PatternLinker {
     store: Arc<RwLock<KixStore>>,
-    embedder: Arc<Mutex<EmbeddingGenerator>>,
+    embedder: Arc<OllamaEmbedder>,
     config: LinkingConfig,
 }
 
@@ -99,7 +99,7 @@ impl PatternLinker {
     /// Create a new pattern linker
     pub fn new(
         store: Arc<RwLock<KixStore>>,
-        embedder: Arc<Mutex<EmbeddingGenerator>>,
+        embedder: Arc<OllamaEmbedder>,
         config: LinkingConfig,
     ) -> Self {
         Self {
@@ -112,7 +112,7 @@ impl PatternLinker {
     /// Create with default configuration
     pub fn with_defaults(
         store: Arc<RwLock<KixStore>>,
-        embedder: Arc<Mutex<EmbeddingGenerator>>,
+        embedder: Arc<OllamaEmbedder>,
     ) -> Self {
         Self::new(store, embedder, LinkingConfig::default())
     }
@@ -129,13 +129,11 @@ impl PatternLinker {
 
         debug!(query_len = query_text.len(), "Finding related patterns");
 
-        // Generate embedding for query
-        let embedding = {
-            let mut embedder = self.embedder.lock().await;
-            embedder
-                .embed_query(query_text)
-                .map_err(|e| JobError::Processing(format!("Failed to embed query: {}", e)))?
-        };
+        // Generate embedding for query (async)
+        let embedding = self.embedder
+            .embed_one(query_text)
+            .await
+            .map_err(|e| JobError::Processing(format!("Failed to embed query: {}", e)))?;
 
         self.find_by_embedding(&embedding, exclude_pattern_id).await
     }

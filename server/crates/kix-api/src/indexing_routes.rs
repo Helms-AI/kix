@@ -94,6 +94,9 @@ pub fn create_indexing_router(state: IndexingState) -> Router {
         // Re-index endpoints
         .route("/api/indexing/reindex/:id", post(reindex_entry))
         .route("/api/indexing/reindex-domain", post(reindex_by_domain))
+        // Code extraction endpoints (NEW - Phase 5)
+        .route("/api/indexing/patterns", get(list_patterns))
+        .route("/api/indexing/languages", get(list_languages))
         // SSE endpoints
         .route("/api/indexing/sse/:job_id", get(sse_job_stream))
         .route("/api/indexing/sse", get(sse_global_stream))
@@ -779,6 +782,9 @@ pub struct JobHistoryItem {
     pub created_at: String,
     pub completed_at: String,
     pub stats: JobHistoryStats,
+    /// Code extraction statistics (if any code was extracted)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_extraction: Option<CodeExtractionStatsResponse>,
 }
 
 /// Job statistics
@@ -791,6 +797,39 @@ pub struct JobHistoryStats {
     pub error_count: u32,
     pub duration_ms: u64,
     pub rate: f64,
+}
+
+/// Code extraction statistics for API response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeExtractionStatsResponse {
+    /// Total code blocks extracted across all pages
+    pub total_code_blocks: usize,
+    /// Number of pages that had code blocks
+    pub pages_with_code: usize,
+    /// Aggregated language counts
+    pub languages: Vec<LanguageCountResponse>,
+    /// All patterns that matched during extraction
+    pub patterns_matched: Vec<String>,
+    /// Aggregated validation statistics
+    pub validation: ValidationStatsResponse,
+}
+
+/// Language count for API response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageCountResponse {
+    pub language: String,
+    pub count: usize,
+}
+
+/// Validation statistics for API response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationStatsResponse {
+    pub total_extracted: usize,
+    pub passed_validation: usize,
+    pub rejected_too_short: usize,
+    pub rejected_placeholder: usize,
+    pub rejected_no_structure: usize,
+    pub rejected_high_prose: usize,
 }
 
 /// Detailed job response with items
@@ -817,6 +856,11 @@ pub struct JobHistoryItemDetail {
     pub error_message: Option<String>,
 }
 
+/// Parse code extraction stats from JSON string
+fn parse_code_extraction_stats(json_str: Option<&str>) -> Option<CodeExtractionStatsResponse> {
+    json_str.and_then(|s| serde_json::from_str(s).ok())
+}
+
 /// GET /api/indexing/history - List persisted job history
 async fn list_job_history(
     State(state): State<IndexingState>,
@@ -840,23 +884,27 @@ async fn list_job_history(
 
     let items: Vec<JobHistoryItem> = jobs
         .into_iter()
-        .map(|j| JobHistoryItem {
-            job_id: j.job_id,
-            job_type: j.job_type,
-            status: j.status,
-            source_url: j.source_url,
-            source_domain: j.source_domain,
-            created_at: j.created_at.clone(),  // Already a String
-            completed_at: j.completed_at.clone(),  // Already a String
-            stats: JobHistoryStats {
-                items_processed: j.items_processed as u32,  // inline field
-                items_discovered: j.items_discovered as u32,
-                chunks_created: j.chunks_created as u32,
-                embeddings_generated: j.embeddings_generated as u32,
-                error_count: j.error_count as u32,
-                duration_ms: j.duration_ms as u64,
-                rate: j.processing_rate,
-            },
+        .map(|j| {
+            let code_extraction = parse_code_extraction_stats(j.code_extraction_stats.as_deref());
+            JobHistoryItem {
+                job_id: j.job_id,
+                job_type: j.job_type,
+                status: j.status,
+                source_url: j.source_url,
+                source_domain: j.source_domain,
+                created_at: j.created_at.clone(),  // Already a String
+                completed_at: j.completed_at.clone(),  // Already a String
+                stats: JobHistoryStats {
+                    items_processed: j.items_processed as u32,  // inline field
+                    items_discovered: j.items_discovered as u32,
+                    chunks_created: j.chunks_created as u32,
+                    embeddings_generated: j.embeddings_generated as u32,
+                    error_count: j.error_count as u32,
+                    duration_ms: j.duration_ms as u64,
+                    rate: j.processing_rate,
+                },
+                code_extraction,
+            }
         })
         .collect();
 
@@ -889,6 +937,7 @@ async fn get_job_detail(
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get job items: {}", e))
         })?;
 
+    let code_extraction = parse_code_extraction_stats(job.code_extraction_stats.as_deref());
     let job_item = JobHistoryItem {
         job_id: job.job_id,
         job_type: job.job_type,
@@ -906,6 +955,7 @@ async fn get_job_detail(
             duration_ms: job.duration_ms as u64,
             rate: job.processing_rate,
         },
+        code_extraction,
     };
 
     let item_details: Vec<JobHistoryItemDetail> = items
@@ -973,4 +1023,18 @@ async fn get_job_items(
         .collect();
 
     Ok(Json(item_details))
+}
+
+// ============================================================================
+// Code Extraction Endpoints (Phase 5)
+// ============================================================================
+
+/// GET /api/indexing/patterns - List all supported code extraction patterns
+async fn list_patterns() -> Json<Vec<kix_services::PatternInfo>> {
+    Json(kix_services::list_code_patterns())
+}
+
+/// GET /api/indexing/languages - List all supported programming languages
+async fn list_languages() -> Json<Vec<kix_services::LanguageInfo>> {
+    Json(kix_services::list_supported_languages())
 }

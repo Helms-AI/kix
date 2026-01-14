@@ -102,6 +102,7 @@ fn event_type_name(event: &EventType) -> &'static str {
         EventType::JobHistoryUpdated { .. } => "job_history_updated",
         EventType::ItemDiscovered { .. } => "item_discovered",
         EventType::ItemStarted { .. } => "item_started",
+        EventType::CodeExtraction { .. } => "code_extraction",
         EventType::Heartbeat { .. } => "heartbeat",
     }
 }

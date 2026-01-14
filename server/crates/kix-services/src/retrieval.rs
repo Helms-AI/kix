@@ -6,7 +6,7 @@
 //! - Page context for RAG synthesis
 //! - Related entries via semantic similarity
 
-use kix_embeddings::EmbeddingGenerator;
+use kix_embeddings::OllamaEmbedder;
 use kix_store::{KixStore, SearchFilters, SearchResult as StoreSearchResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -166,7 +166,7 @@ pub struct RelatedEntry {
 ///
 /// # Arguments
 /// * `store` - The KixStore instance
-/// * `embedder` - The embedding generator for vector search
+/// * `embedder` - The Ollama embedding generator for vector search
 /// * `query` - Natural language search query
 /// * `mode` - Search mode (hybrid, vector, text)
 /// * `filters` - Optional filters for entry_type, tag, etc.
@@ -176,7 +176,7 @@ pub struct RelatedEntry {
 /// Search results with pagination info
 pub async fn search_knowledge(
     store: &Arc<RwLock<KixStore>>,
-    embedder: &Arc<RwLock<EmbeddingGenerator>>,
+    embedder: &Arc<OllamaEmbedder>,
     query: &str,
     mode: SearchMode,
     filters: QueryFilters,
@@ -187,12 +187,11 @@ pub async fn search_knowledge(
     let search_filters: SearchFilters = filters.into();
     let fetch_limit = pagination.limit + pagination.offset;
 
-    // Generate embedding for vector/hybrid search
+    // Generate embedding for vector/hybrid search (async)
     let embedding = match mode {
         SearchMode::Text => vec![], // Not needed for text-only
         _ => {
-            let mut emb = embedder.write().await;
-            emb.embed_query(query).map_err(|e| {
+            embedder.embed_one(query).await.map_err(|e| {
                 ServiceError::External(format!("Failed to generate embedding: {}", e))
             })?
         }
@@ -360,7 +359,7 @@ pub async fn get_page_context(
 ///
 /// # Arguments
 /// * `store` - The KixStore instance
-/// * `embedder` - The embedding generator (fallback if no cached embedding)
+/// * `embedder` - The Ollama embedding generator (fallback if no cached embedding)
 /// * `entry_id` - The entry to find related entries for
 /// * `limit` - Maximum number of related entries to return
 ///
@@ -368,7 +367,7 @@ pub async fn get_page_context(
 /// List of related entries sorted by similarity
 pub async fn find_related(
     store: &Arc<RwLock<KixStore>>,
-    embedder: &Arc<RwLock<EmbeddingGenerator>>,
+    embedder: &Arc<OllamaEmbedder>,
     entry_id: &str,
     limit: usize,
 ) -> ServiceResult<Vec<RelatedEntry>> {
@@ -411,8 +410,7 @@ pub async fn find_related(
                 "No cached embedding found, generating via Ollama (cache miss)"
             );
             let query = format!("entries related to {} {}", entry_title, entry_description);
-            let mut emb = embedder.write().await;
-            emb.embed_query(&query).map_err(|e| {
+            embedder.embed_one(&query).await.map_err(|e| {
                 ServiceError::External(format!("Failed to generate embedding: {}", e))
             })?
         }

@@ -3,45 +3,40 @@ name = "kix-embeddings"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Embedding generation and auto-tagging for Knowledge Indexer"
+description = "Ollama-based embedding generation for Knowledge Indexer"
 
+# No features - Ollama-only architecture
 [features]
-default = ["ollama-backend"]
-# Backend selection (Ollama is now the default - fast, local, GPU-accelerated)
-ollama-backend = ["reqwest"]
-fastembed-backend = ["fastembed"]
-onnx-backend = ["ort", "ureq", "dirs", "tokenizers"]
-onnx-cuda = ["onnx-backend", "ort/cuda"]
-onnx-coreml = ["onnx-backend", "ort/coreml"]
-# Legacy GPU features (mapped to new backends)
-cuda = ["onnx-cuda"]
-coreml = ["onnx-coreml"]
+default = []
 
 [dependencies]
 kix-parser = { path = "../kix-parser" }
+
+# Ollama embedding client
+ollama-rs = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
 serde.workspace = true
+serde_json = "1.0"
+
+# Error handling
 thiserror.workspace = true
+
+# Logging
 tracing.workspace = true
-num_cpus = "1.16"  # For detecting CPU cores
 
-# Embedding backends (optional)
-fastembed = { workspace = true, optional = true }
-ort = { version = "=2.0.0-rc.10", features = ["download-binaries"], optional = true }
+# URL parsing
+url = "2.5"
 
-# Model downloading for ONNX backend
-ureq = { version = "2.9", optional = true }
-dirs = { version = "5.0", optional = true }
-
-# Tokenization for ONNX backend (proper HuggingFace tokenizer)
-tokenizers = { version = "0.20", optional = true }
+# Async futures
+futures = "0.3"
 
 # Keyword extraction for auto-tagging
 keyword_extraction = { version = "1.5", features = ["rake", "tf_idf"] }
 stop-words = "0.8"
-
-# HTTP client for Ollama backend
-reqwest = { version = "0.12", features = ["json", "blocking"], optional = true }
-serde_json = "1.0"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

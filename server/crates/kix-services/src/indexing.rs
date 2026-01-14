@@ -11,6 +11,126 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ServiceError, ServiceResult};
 
 // =============================================================================
+// CODE EXTRACTION TYPES (Phase 5)
+// =============================================================================
+
+/// Code extraction pattern information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternInfo {
+    pub name: String,
+    pub css_selector: String,
+    pub description: String,
+    pub example_sites: Vec<String>,
+}
+
+/// Supported language information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageInfo {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub extensions: Vec<String>,
+    pub tree_sitter_support: bool,
+}
+
+/// Code extraction statistics for a job
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeExtractionStats {
+    pub job_id: String,
+    pub total_pages: usize,
+    pub pages_with_code: usize,
+    pub total_code_blocks: usize,
+    pub languages: Vec<LanguageStats>,
+    pub patterns: Vec<PatternStats>,
+    pub validation: ValidationSummary,
+}
+
+/// Language statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageStats {
+    pub language: String,
+    pub block_count: usize,
+    pub total_lines: usize,
+    pub percentage: f32,
+}
+
+/// Pattern match statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternStats {
+    pub pattern: String,
+    pub match_count: usize,
+    pub percentage: f32,
+}
+
+/// Validation summary for code extraction
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ValidationSummary {
+    pub total_extracted: usize,
+    pub passed: usize,
+    pub pass_rate: f32,
+    pub rejection_reasons: Vec<RejectionReason>,
+}
+
+/// Code rejection reason
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectionReason {
+    pub reason: String,
+    pub count: usize,
+}
+
+/// Code block response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeBlockResponse {
+    pub id: String,
+    pub content: String,
+    pub language: String,
+    pub pattern: String,
+    pub line_count: usize,
+    pub source_url: String,
+    pub validated: bool,
+}
+
+// =============================================================================
+// CODE EXTRACTION FUNCTIONS
+// =============================================================================
+
+/// List all supported code extraction patterns
+pub fn list_code_patterns() -> Vec<PatternInfo> {
+    use kix_jobs::CodePattern;
+
+    CodePattern::all()
+        .iter()
+        .map(|p| PatternInfo {
+            name: p.name().to_string(),
+            css_selector: p.selector().to_string(),
+            description: p.description().to_string(),
+            example_sites: p.example_sites().iter().map(|s| s.to_string()).collect(),
+        })
+        .collect()
+}
+
+/// List all supported programming languages
+pub fn list_supported_languages() -> Vec<LanguageInfo> {
+    use kix_jobs::Language;
+    use kix_parser::treesitter::SourceLanguage;
+
+    Language::all()
+        .iter()
+        .map(|lang| {
+            // Check if tree-sitter supports this language
+            let ext = lang.extension();
+            let tree_sitter_support = SourceLanguage::from_extension(ext).is_some();
+
+            LanguageInfo {
+                name: lang.display_name().to_string(),
+                aliases: lang.aliases().iter().map(|s| s.to_string()).collect(),
+                extensions: lang.extensions().iter().map(|s| s.to_string()).collect(),
+                tree_sitter_support,
+            }
+        })
+        .collect()
+}
+
+// =============================================================================
 // TYPES
 // =============================================================================
 

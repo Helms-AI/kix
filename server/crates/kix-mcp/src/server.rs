@@ -49,7 +49,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use kix_embeddings::{DocumentChunker, EmbeddingGenerator};
+use kix_embeddings::{DocumentChunker, OllamaEmbedder};
 use kix_jobs::{Job, JobConfig, JobQueue, JobState, JobType};
 use kix_parser::{Entry, EntryType, PdfParser, SourceType};
 use kix_crawler::ContentExtractor;
@@ -427,7 +427,7 @@ pub struct IndexStatus {
 #[derive(Clone)]
 pub struct KixMcpServer {
     store: Arc<RwLock<KixStore>>,
-    embedder: Arc<RwLock<EmbeddingGenerator>>,
+    embedder: Arc<OllamaEmbedder>,
     http_client: HttpClient,
     /// Job queue for async indexing operations
     job_queue: Arc<JobQueue>,
@@ -448,30 +448,27 @@ pub struct KixMcpServer {
 #[tool_router]
 impl KixMcpServer {
     /// Creates a new MCP server with the given store, embedder, and job queue.
-    /// This creates owned store and embedder wrapped in Arc<RwLock<>>.
-    pub fn new(store: KixStore, embedder: EmbeddingGenerator, job_queue: Arc<JobQueue>) -> Self {
+    pub fn new(store: KixStore, embedder: OllamaEmbedder, job_queue: Arc<JobQueue>) -> Self {
         Self::with_shared(
             Arc::new(RwLock::new(store)),
-            Arc::new(RwLock::new(embedder)),
+            Arc::new(embedder),
             job_queue,
         )
     }
 
     /// Creates a new MCP server with a shared store.
-    /// Use this when running MCP and API servers in the same process to share the store.
     pub fn with_shared_store(
         store: Arc<RwLock<KixStore>>,
-        embedder: EmbeddingGenerator,
+        embedder: OllamaEmbedder,
         job_queue: Arc<JobQueue>,
     ) -> Self {
-        Self::with_shared(store, Arc::new(RwLock::new(embedder)), job_queue)
+        Self::with_shared(store, Arc::new(embedder), job_queue)
     }
 
     /// Creates a new MCP server with both shared store and shared embedder.
-    /// Use this in unified server mode where API and MCP share all resources.
     pub fn with_shared(
         store: Arc<RwLock<KixStore>>,
-        embedder: Arc<RwLock<EmbeddingGenerator>>,
+        embedder: Arc<OllamaEmbedder>,
         job_queue: Arc<JobQueue>,
     ) -> Self {
         Self {
@@ -828,13 +825,11 @@ impl KixMcpServer {
         let chunker = DocumentChunker::with_defaults();
         let chunks = chunker.chunk(&entry);
 
-        let embeddings = {
-            let mut embedder = self.embedder.write().await;
-            let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-            embedder
-                .embed_texts(&texts)
-                .map_err(|e| McpError::internal_error(format!("Embedding failed: {}", e), None))?
-        };
+        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+        let embeddings = self.embedder
+            .embed_batch(&texts)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Embedding failed: {}", e), None))?;
 
         // Store entry and chunks
         {

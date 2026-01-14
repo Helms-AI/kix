@@ -14,9 +14,10 @@ use tracing::{error, info, warn};
 use url::Url;
 
 use kix_crawler::crawler::{CrawlResult, Crawler, CrawlerConfig};
-use kix_sse::event::{Event, EventType, SourceType};
+use kix_sse::event::{Event, EventType, LanguageCount, CodeValidationStats, SourceType};
 use kix_sse::ConnectionManager;
 use kix_store::{JobItemRecord, JobRecord, JobStore, KixStore};
+use serde::{Deserialize, Serialize};
 
 use crate::job::{Job, JobResult, JobType};
 use crate::processor::{ContentProcessor, ProcessorConfig};
@@ -97,6 +98,60 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// Aggregated code extraction statistics for the entire job
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AggregatedCodeExtractionStats {
+    /// Total code blocks extracted across all pages
+    pub total_code_blocks: usize,
+    /// Number of pages that had code blocks
+    pub pages_with_code: usize,
+    /// Aggregated language counts
+    pub languages: Vec<LanguageCount>,
+    /// All patterns that matched during extraction
+    pub patterns_matched: Vec<String>,
+    /// Aggregated validation statistics
+    pub validation: CodeValidationStats,
+}
+
+impl AggregatedCodeExtractionStats {
+    /// Merge in stats from a single page
+    pub fn merge(&mut self, page_stats: &crate::CodeExtractionResult) {
+        self.total_code_blocks += page_stats.blocks_found;
+        if page_stats.blocks_found > 0 {
+            self.pages_with_code += 1;
+        }
+
+        // Merge languages
+        for lang in &page_stats.languages {
+            if let Some(existing) = self.languages.iter_mut().find(|l| l.language == lang.language) {
+                existing.count += lang.count;
+            } else {
+                self.languages.push(lang.clone());
+            }
+        }
+
+        // Merge patterns (deduplicated)
+        for pattern in &page_stats.patterns_matched {
+            if !self.patterns_matched.contains(pattern) {
+                self.patterns_matched.push(pattern.clone());
+            }
+        }
+
+        // Merge validation stats
+        self.validation.total_extracted += page_stats.validation_stats.total_extracted;
+        self.validation.passed_validation += page_stats.validation_stats.passed_validation;
+        self.validation.rejected_too_short += page_stats.validation_stats.rejected_too_short;
+        self.validation.rejected_placeholder += page_stats.validation_stats.rejected_placeholder;
+        self.validation.rejected_no_structure += page_stats.validation_stats.rejected_no_structure;
+        self.validation.rejected_high_prose += page_stats.validation_stats.rejected_high_prose;
+    }
+
+    /// Check if any code was extracted
+    pub fn has_code(&self) -> bool {
+        self.total_code_blocks > 0
+    }
+}
+
 /// Context for tracking items during job execution.
 /// Collects data for job history persistence.
 #[derive(Clone)]
@@ -107,6 +162,8 @@ pub struct JobExecutionContext {
     pub start_time: std::time::Instant,
     /// Actual count of discovered items (may differ from items.len() due to filtering)
     pub items_discovered: Arc<AtomicUsize>,
+    /// Aggregated code extraction statistics
+    pub code_extraction_stats: Arc<RwLock<AggregatedCodeExtractionStats>>,
 }
 
 /// Job executor manages job execution
@@ -261,6 +318,7 @@ impl JobExecutor {
                         items: Arc::new(RwLock::new(HashMap::new())),
                         start_time: std::time::Instant::now(),
                         items_discovered: Arc::new(AtomicUsize::new(0)),
+                        code_extraction_stats: Arc::new(RwLock::new(AggregatedCodeExtractionStats::default())),
                     };
 
                     match Self::execute_job(&job, &sse_manager, processor.as_ref(), &ctx).await {
@@ -383,6 +441,14 @@ impl JobExecutor {
         job_record.processing_rate = rate;
         if !result.errors.is_empty() {
             job_record.set_errors(result.errors.clone());
+        }
+
+        // Serialize code extraction stats if we have any
+        {
+            let code_stats = ctx.code_extraction_stats.read().await;
+            if code_stats.has_code() {
+                job_record.code_extraction_stats = serde_json::to_string(&*code_stats).ok();
+            }
         }
 
         // Get collected items as Vec
@@ -602,6 +668,7 @@ impl JobExecutor {
             chunks: usize,
             embeddings: usize,
             error: Option<String>,
+            code_extraction: Option<crate::CodeExtractionResult>,
         }
 
         // Convert receiver to stream for parallel processing
@@ -663,19 +730,20 @@ impl JobExecutor {
                     );
 
                     if let Some(ref p) = proc {
-                        // Use raw URL for content processing with two-layer storage
+                        // Use raw HTML for content processing (code extraction needs HTML, not markdown)
                         // Pass title from structured_content (extracted by ContentExtractor)
                         let title = if result.structured_content.title.is_empty() {
                             None
                         } else {
                             Some(result.structured_content.title.clone())
                         };
-                        match p.process_html_with_page(&result.content, &raw_url, Some(result.fetch_time_ms), title).await {
+                        match p.process_html_with_page(&result.html, &raw_url, Some(result.fetch_time_ms), title).await {
                             Ok(res) => PageResult {
                                 url: display_url,
                                 chunks: res.chunks_created,
                                 embeddings: res.embeddings_generated,
                                 error: None,
+                                code_extraction: res.code_extraction,
                             },
                             Err(e) => {
                                 let error_msg = format!("Failed to process {}: {}", raw_url, e);
@@ -685,6 +753,7 @@ impl JobExecutor {
                                     chunks: 0,
                                     embeddings: 0,
                                     error: Some(error_msg),
+                                    code_extraction: None,
                                 }
                             }
                         }
@@ -694,6 +763,7 @@ impl JobExecutor {
                             chunks: 0,
                             embeddings: 0,
                             error: None,
+                            code_extraction: None,
                         }
                     }
                 }
@@ -740,6 +810,26 @@ impl JobExecutor {
                         duration_ms: 0,
                     }),
                 );
+
+                // Emit CodeExtraction event if we have code blocks
+                if let Some(ref code_stats) = result.code_extraction {
+                    let _ = sse_manager.broadcast_to_job(
+                        job_id,
+                        Event::new(EventType::CodeExtraction {
+                            job_id,
+                            url: result.url.clone(),
+                            blocks_found: code_stats.blocks_found,
+                            patterns_matched: code_stats.patterns_matched.clone(),
+                            languages: code_stats.languages.clone(),
+                            validation_stats: code_stats.validation_stats.clone(),
+                        }),
+                    );
+
+                    // Aggregate code extraction stats for persistence
+                    let mut stats = ctx.code_extraction_stats.write().await;
+                    stats.merge(code_stats);
+                }
+
                 // Update or insert item for persistence (upsert)
                 {
                     let mut items = ctx.items.write().await;

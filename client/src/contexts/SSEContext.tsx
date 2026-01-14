@@ -8,7 +8,15 @@ import {
   type ReactNode,
 } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import type { EnhancedLiveJobData, JobLogEntry, PageState } from '../api/indexingClient';
+import type {
+  EnhancedLiveJobData,
+  JobLogEntry,
+  PageState,
+  CodeExtractionStats,
+  LanguageStats,
+  PatternStats,
+  RejectionReason,
+} from '../api/indexingClient';
 import type { SSEEvent, SSEEventType } from '../hooks/useSSE';
 
 // ============================================================================
@@ -66,6 +74,19 @@ interface BackendSSEEvent {
     depth?: number;
     // Item started fields
     started_at?: string;
+    // Code extraction fields (NEW)
+    url?: string;
+    blocks_found?: number;
+    patterns_matched?: string[];
+    languages?: { language: string; count: number }[];
+    validation_stats?: {
+      total_extracted: number;
+      passed_validation: number;
+      rejected_too_short: number;
+      rejected_placeholder: number;
+      rejected_no_structure: number;
+      rejected_high_prose: number;
+    };
   };
 }
 
@@ -79,6 +100,126 @@ const MAX_RATE_SAMPLES = 20;
 let logEntryIdCounter = 0;
 function generateLogEntryId(): string {
   return `log-${Date.now()}-${logEntryIdCounter++}`;
+}
+
+// Helper to merge language stats from code_extraction events
+function mergeLanguageStats(
+  existing: LanguageStats[],
+  eventLangs: { language: string; count: number }[]
+): LanguageStats[] {
+  const langMap = new Map<string, LanguageStats>();
+
+  // Add existing stats
+  for (const lang of existing) {
+    langMap.set(lang.language, { ...lang });
+  }
+
+  // Merge in new counts
+  for (const { language, count } of eventLangs) {
+    const current = langMap.get(language);
+    if (current) {
+      current.block_count += count;
+    } else {
+      langMap.set(language, {
+        language,
+        block_count: count,
+        total_lines: 0, // Updated incrementally
+        percentage: 0,  // Recalculated below
+      });
+    }
+  }
+
+  // Recalculate percentages
+  const allLangs = Array.from(langMap.values());
+  const totalBlocks = allLangs.reduce((sum, l) => sum + l.block_count, 0);
+  for (const lang of allLangs) {
+    lang.percentage = totalBlocks > 0 ? (lang.block_count / totalBlocks) * 100 : 0;
+  }
+
+  return allLangs.sort((a, b) => b.block_count - a.block_count);
+}
+
+// Helper to merge pattern stats from code_extraction events
+function mergePatternStats(
+  existing: PatternStats[],
+  eventPatterns: string[]
+): PatternStats[] {
+  const patternMap = new Map<string, PatternStats>();
+
+  // Add existing stats
+  for (const p of existing) {
+    patternMap.set(p.pattern, { ...p });
+  }
+
+  // Merge in new patterns (each occurrence = +1)
+  for (const pattern of eventPatterns) {
+    const current = patternMap.get(pattern);
+    if (current) {
+      current.match_count += 1;
+    } else {
+      patternMap.set(pattern, {
+        pattern,
+        match_count: 1,
+        percentage: 0, // Recalculated below
+      });
+    }
+  }
+
+  // Recalculate percentages
+  const allPatterns = Array.from(patternMap.values());
+  const totalMatches = allPatterns.reduce((sum, p) => sum + p.match_count, 0);
+  for (const pattern of allPatterns) {
+    pattern.percentage = totalMatches > 0 ? (pattern.match_count / totalMatches) * 100 : 0;
+  }
+
+  return allPatterns.sort((a, b) => b.match_count - a.match_count);
+}
+
+// Helper to merge validation stats from code_extraction events
+function mergeValidationStats(
+  existing: { total_extracted: number; passed: number; pass_rate: number; rejection_reasons: RejectionReason[] } | undefined,
+  eventValidation: BackendSSEEvent['data']['validation_stats']
+): { total_extracted: number; passed: number; pass_rate: number; rejection_reasons: RejectionReason[] } {
+  if (!eventValidation) {
+    return existing || { total_extracted: 0, passed: 0, pass_rate: 100, rejection_reasons: [] };
+  }
+
+  const total = (existing?.total_extracted || 0) + eventValidation.total_extracted;
+  const passed = (existing?.passed || 0) + eventValidation.passed_validation;
+
+  // Aggregate rejection reasons
+  const reasonMap = new Map<string, number>();
+
+  // Add existing reasons
+  if (existing?.rejection_reasons) {
+    for (const r of existing.rejection_reasons) {
+      reasonMap.set(r.reason, r.count);
+    }
+  }
+
+  // Add new reasons
+  const newReasons = [
+    { reason: 'too_short', count: eventValidation.rejected_too_short },
+    { reason: 'placeholder', count: eventValidation.rejected_placeholder },
+    { reason: 'no_structure', count: eventValidation.rejected_no_structure },
+    { reason: 'high_prose', count: eventValidation.rejected_high_prose },
+  ];
+
+  for (const { reason, count } of newReasons) {
+    if (count > 0) {
+      reasonMap.set(reason, (reasonMap.get(reason) || 0) + count);
+    }
+  }
+
+  return {
+    total_extracted: total,
+    passed: passed,
+    pass_rate: total > 0 ? (passed / total) * 100 : 100,
+    rejection_reasons: Array.from(reasonMap.entries())
+      .map(([reason, count]) => ({ reason, count }))
+      .filter(r => r.count > 0)
+      .sort((a, b) => b.count - a.count),
+  };
 }
 
 // ============================================================================
@@ -144,6 +285,12 @@ function transformBackendEvent(raw: BackendSSEEvent): SSEEvent | null {
       depth: data.depth,
       // Item started fields
       started_at: data.started_at,
+      // Code extraction fields
+      url: data.url,
+      blocks_found: data.blocks_found,
+      patterns_matched: data.patterns_matched,
+      languages: data.languages,
+      validation_stats: data.validation_stats,
     },
   };
 }
@@ -324,6 +471,28 @@ export function SSEProvider({ children }: { children: ReactNode }) {
           break;
         }
 
+        case 'code_extraction': {
+          // Aggregate code extraction stats for the job
+          const existingExtraction = updated.codeExtraction;
+          const eventLanguages = event.data.languages || [];
+          const eventPatterns = event.data.patterns_matched || [];
+          const eventValidation = event.data.validation_stats;
+
+          // Initialize or update code extraction stats
+          const newExtraction: CodeExtractionStats = {
+            job_id: jobId,
+            total_pages: (existingExtraction?.total_pages || 0) + 1,
+            pages_with_code: (existingExtraction?.pages_with_code || 0) + (event.data.blocks_found && event.data.blocks_found > 0 ? 1 : 0),
+            total_code_blocks: (existingExtraction?.total_code_blocks || 0) + (event.data.blocks_found || 0),
+            languages: mergeLanguageStats(existingExtraction?.languages || [], eventLanguages),
+            patterns: mergePatternStats(existingExtraction?.patterns || [], eventPatterns),
+            validation: mergeValidationStats(existingExtraction?.validation, eventValidation),
+          };
+
+          updated.codeExtraction = newExtraction;
+          break;
+        }
+
         case 'job_completed':
         case 'job_cancelled': {
           // Handle cleanup after a delay to show final state
@@ -413,6 +582,7 @@ export function SSEProvider({ children }: { children: ReactNode }) {
       'job_completed',
       'job_cancelled',
       'job_history_updated',
+      'code_extraction',
       'heartbeat',
     ];
 

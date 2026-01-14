@@ -415,18 +415,105 @@ Vite proxy configuration:
 | REST API | 3001 |
 | MCP HTTP | 3002 |
 
+## New Features (Spider Migration)
+
+### Code Extraction (30+ Patterns)
+Framework-aware code extraction from HTML pages, configured in `kix-jobs/src/extraction/`:
+
+| Framework | Patterns |
+|-----------|----------|
+| **Docusaurus** | theme-code-block, prism-code-block |
+| **MkDocs** | codehilite, md-code |
+| **Sphinx** | highlight-python, highlight-rust |
+| **Hugo** | highlight.js, chroma |
+| **GitHub** | highlight-source-*, blob-code |
+| **GitLab** | blob-content |
+| **General** | pre>code, pre.language-*, fenced code blocks |
+
+### Language Detection (20+ Languages)
+Automatic language detection from CSS classes and hints:
+
+| Language | Aliases | Extensions |
+|----------|---------|------------|
+| Rust | rs, rust | .rs |
+| Python | py, python, python3 | .py |
+| JavaScript | js, javascript | .js, .mjs |
+| TypeScript | ts, typescript | .ts, .tsx |
+| Go | go, golang | .go |
+| Java | java | .java |
+| C/C++ | c, cpp, c++ | .c, .h, .cpp, .hpp |
+| And 13+ more... | | |
+
+### Tree-sitter Integration
+AST-aware chunking for source files (`kix-parser/src/treesitter/`):
+- **14 supported languages**: Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, C#, Ruby, Bash, JSON, HTML, CSS
+- **Symbol extraction**: Functions, classes, structs, enums, traits, interfaces
+- **Configurable chunking**: Min/max chunk sizes, overlap, symbol-based boundaries
+- **Smart consolidation**: Merges small chunks while respecting AST boundaries
+
+### Code Validation
+Multi-stage validation to filter out noise (`kix-parser/src/validator.rs`):
+1. **Length check**: Minimum 20 characters
+2. **Structure check**: Must have recognizable code patterns
+3. **Prose ratio check**: Rejects > 60% natural language content
+4. **Placeholder detection**: Rejects "TODO", "...", skeleton code
+5. **Deduplication**: Content-hash based duplicate removal
+
+### Ollama Embeddings
+Local embedding generation with GPU support (`kix-embeddings/`):
+- **Model**: nomic-embed-text (via Ollama)
+- **Dimensions**: 768
+- **Max tokens**: 8192
+- **GPU auto-detection**: Uses CUDA/Metal when available
+- **Batch processing**: Configurable batch sizes for efficiency
+
+### New API Endpoints
+Code extraction visibility endpoints:
+- `GET /api/indexing/patterns` - List all extraction patterns
+- `GET /api/indexing/languages` - List supported languages with tree-sitter info
+
+### New SSE Events
+Real-time code extraction visibility:
+```typescript
+// code_extraction event
+{
+  type: 'code_extraction',
+  job_id: string,
+  url: string,
+  blocks_found: number,
+  patterns_matched: string[],
+  languages: { language: string, count: number }[],
+  validation_stats: {
+    total_extracted: number,
+    passed_validation: number,
+    rejected_too_short: number,
+    rejected_placeholder: number,
+    rejected_no_structure: number,
+    rejected_high_prose: number
+  }
+}
+```
+
+### UI Components
+New React components for code extraction visibility (`client/src/components/indexing/code-extraction/`):
+- **CodeExtractionPanel**: Main panel with stats overview
+- **LanguageBreakdown**: GitHub-style language breakdown chart
+- **PatternMatches**: Extraction pattern usage visualization
+- **ValidationStats**: Pass rate gauge with rejection reasons
+
 ## Testing
 
-Tests are colocated with source files using `#[cfg(test)]` modules. **170+ tests across core crates.**
+Tests are colocated with source files using `#[cfg(test)]` modules. **350+ tests across core crates.**
 
 ### Unit Tests
 ```bash
 cargo test --release -p kix-crawler    # 59 tests (discovery, code, strategies, etc.)
-cargo test --release -p kix-parser     # 40 tests (chunker, validator, parsers)
+cargo test --release -p kix-parser     # 57 tests (chunker, validator, tree-sitter, parsers)
 cargo test --release -p kix-sqlite     # 33 tests (entities, CRUD operations)
 cargo test --release -p kix-search     # 21 tests (Tantivy indexing, search)
 cargo test --release -p kix-store      # 3 tests (pages, hybrid search, projects)
-cargo test --release -p kix-projects   # 47 tests (project, issue, github, events)
+cargo test --release -p kix-projects   # 59 tests (project, issue, github, events)
+cargo test --release -p kix-jobs       # 23 tests (extraction, language, patterns)
 ```
 
 ### Integration Tests
@@ -439,6 +526,8 @@ cargo test --release -p kix-jobs --test pipeline_integration  # Full pipeline te
 - `kix-crawler/src/code.rs` - 30+ code extraction patterns
 - `kix-parser/src/chunker.rs` - Smart chunking algorithm
 - `kix-parser/src/validator.rs` - Multi-stage code validation
+- `kix-parser/src/treesitter/` - Tree-sitter AST-aware chunking (14 languages)
+- `kix-jobs/src/extraction/` - Code extraction patterns and language detection
 - `kix-store/src/pages.rs` - Two-layer storage
 - `kix-store/src/search.rs` - Hybrid search functionality
 - `kix-jobs/tests/pipeline_integration.rs` - End-to-end pipeline tests
