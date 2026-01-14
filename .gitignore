@@ -21,7 +21,7 @@ yarn-error.log*
 # ===================
 # Data & Caches
 # ===================
-/data/
+data
 **/.fastembed_cache/
 .playwright-mcp/
 *.db
