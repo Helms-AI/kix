@@ -210,8 +210,20 @@ impl From<EntryChunk> for ChunkResponse {
             id: c.chunk_id,
             entry_id: c.entry_id,
             text: c.text,
-            chunk_type: c.chunk_type,
-            chunk_index: c.chunk_index,
+            chunk_type: Some(c.chunk_type.to_string()),
+            chunk_index: Some(c.chunk_index as i32),
+        }
+    }
+}
+
+impl From<kix_store::VectorSearchResult> for ChunkResponse {
+    fn from(c: kix_store::VectorSearchResult) -> Self {
+        Self {
+            id: c.chunk_id,
+            entry_id: c.entry_id,
+            text: c.text,
+            chunk_type: Some(c.chunk_type),
+            chunk_index: Some(c.chunk_index as i32),
         }
     }
 }
@@ -440,7 +452,6 @@ async fn get_entry_chunks(
     let store = state.store.read().await;
     let chunks = store
         .get_chunks_by_entry_id(&id)
-        .await
         .map_err(|e| {
             error!("Failed to get chunks for entry '{}': {}", id, e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -491,7 +502,6 @@ async fn get_related_entries(
             };
             let results = store
                 .vector_search(&embedding, 6, &filters)
-                .await
                 .map_err(|e| {
                     error!("Vector search for related entries failed: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
@@ -669,7 +679,6 @@ async fn get_entry_graph(
         let filters = kix_store::search::SearchFilters::default();
         let results = match store
             .vector_search(&embedding, neighbors_per_entry + 1, &filters)
-            .await
         {
             Ok(r) => r,
             Err(e) => {

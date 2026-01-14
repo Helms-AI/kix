@@ -6,7 +6,8 @@ import {
   Database,
   Activity,
   Shield,
-  Sparkles
+  Sparkles,
+  Plug,
 } from 'lucide-react';
 
 // Import admin tab components
@@ -14,6 +15,7 @@ import AdminDashboard from './admin/AdminDashboard';
 import AdminConfiguration from './admin/AdminConfiguration';
 import AdminDataManagement from './admin/AdminDataManagement';
 import AdminMonitoring from './admin/AdminMonitoring';
+import AdminIntegrations from './admin/AdminIntegrations';
 
 interface AdminTab {
   id: string;
@@ -30,6 +32,13 @@ const tabs: AdminTab[] = [
     icon: LayoutDashboard,
     component: AdminDashboard,
     path: 'dashboard'
+  },
+  {
+    id: 'integrations',
+    label: 'Integrations',
+    icon: Plug,
+    component: AdminIntegrations,
+    path: 'integrations'
   },
   {
     id: 'config',

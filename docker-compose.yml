@@ -46,6 +46,7 @@ services:
 
   # Kix API Server - serves REST API for the dashboard
   # Uses Ollama backend with nomic-embed-text embeddings (768 dimensions)
+  # Hybrid architecture: SQLite for metadata, LanceDB for vectors
   kix-api:
     build:
       context: .
@@ -57,12 +58,18 @@ services:
     ports:
       - "3001:3001"
     volumes:
-      # Persist LanceDB data
+      # Persist SQLite data (metadata, projects, issues, etc.)
+      - kix-sqlite-data:/app/data/sqlite
+      # Persist LanceDB data (vector embeddings only)
       - kix-lancedb-data:/app/data/lancedb
       # Persist model cache (fallback for non-Ollama backends)
       - kix-model-cache:/app/cache
     environment:
       - RUST_LOG=info
+      # Hybrid storage paths
+      - KIX_DATA_DIR=/app/data
+      - KIX_SQLITE_PATH=/app/data/sqlite/kix.db
+      - KIX_LANCE_PATH=/app/data/lancedb/vectors.lance
       - KIX_DB_PATH=/app/data/lancedb
       - KIX_API_PORT=3001
       # Ollama embedding configuration (primary)
@@ -108,10 +115,15 @@ services:
         TARGET_CPU: ${TARGET_CPU:-x86-64-v3}
     container_name: kix-tools
     volumes:
+      - kix-sqlite-data:/app/data/sqlite
       - kix-lancedb-data:/app/data/lancedb
       - kix-model-cache:/app/cache
     environment:
       - RUST_LOG=info
+      # Hybrid storage paths
+      - KIX_DATA_DIR=/app/data
+      - KIX_SQLITE_PATH=/app/data/sqlite/kix.db
+      - KIX_LANCE_PATH=/app/data/lancedb/vectors.lance
       - KIX_DB_PATH=/app/data/lancedb
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=nomic-embed-text
@@ -127,6 +139,8 @@ services:
 
 volumes:
   ollama-models:
+    driver: local
+  kix-sqlite-data:
     driver: local
   kix-lancedb-data:
     driver: local

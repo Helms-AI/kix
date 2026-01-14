@@ -199,7 +199,7 @@ impl ContentProcessor {
         info!("Initializing content processor with database at: {}", db_path);
 
         // Initialize store
-        let mut store = KixStore::new(db_path)
+        let mut store = KixStore::new(Path::new(db_path))
             .await
             .map_err(|e| JobError::Processing(format!("Failed to create store: {}", e)))?;
 
@@ -425,19 +425,19 @@ impl ContentProcessor {
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document and chunks
-                store.delete_chunks_by_document(&doc_id).await
+                // Delete existing document and chunks (sync operation)
+                store.delete_chunks_by_document(&doc_id)
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
             }
 
-            // Insert new document
-            store.insert_documents(&[entry]).await
+            // Insert new document (from Entry type)
+            store.insert_documents_from_entries(&[entry]).await
                 .map_err(|e| JobError::Processing(format!("Failed to insert document: {}", e)))?;
 
-            // Insert chunks with embeddings
-            store.insert_chunks(&chunks, &embeddings).await
+            // Insert chunks with embeddings (sync operation)
+            store.insert_chunks(&chunks, &embeddings)
                 .map_err(|e| JobError::Processing(format!("Failed to insert chunks: {}", e)))?;
         }
 
@@ -700,19 +700,19 @@ impl ContentProcessor {
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document and chunks
-                store.delete_chunks_by_document(&doc_id).await
+                // Delete existing document and chunks (sync operation)
+                store.delete_chunks_by_document(&doc_id)
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
             }
 
-            // Insert new document
-            store.insert_documents(&[entry]).await
+            // Insert new document (from Entry type)
+            store.insert_documents_from_entries(&[entry]).await
                 .map_err(|e| JobError::Processing(format!("Failed to insert document: {}", e)))?;
 
-            // Insert chunks with embeddings
-            store.insert_chunks(&chunks, &embeddings).await
+            // Insert chunks with embeddings (sync operation)
+            store.insert_chunks(&chunks, &embeddings)
                 .map_err(|e| JobError::Processing(format!("Failed to insert chunks: {}", e)))?;
         }
 
@@ -789,7 +789,7 @@ impl ContentProcessor {
     /// Get chunk count (uses read lock for concurrent access)
     pub async fn chunk_count(&self) -> Result<usize, JobError> {
         let store = self.store.read().await;
-        store.chunk_count().await
+        store.chunk_count()
             .map_err(|e| JobError::Processing(format!("Failed to get chunk count: {}", e)))
     }
 
@@ -953,21 +953,19 @@ impl ContentProcessor {
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document, chunks, and pages
-                store.delete_chunks_by_document(&doc_id).await
+                // Delete existing document, chunks, and pages (sync operation for chunks)
+                store.delete_chunks_by_document(&doc_id)
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
 
                 // Delete pages by source_id (entry_id)
-                let page_store = store.page_store()
-                    .map_err(|e| JobError::Processing(format!("Failed to get page store: {}", e)))?;
-                page_store.delete_pages_by_source(&doc_id).await
+                store.delete_pages_by_source(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old pages: {}", e)))?;
             }
 
-            // Insert new document
-            store.insert_documents(&[entry]).await
+            // Insert new document (from Entry type)
+            store.insert_documents_from_entries(&[entry]).await
                 .map_err(|e| JobError::Processing(format!("Failed to insert document: {}", e)))?;
 
             // Insert page and chunks together using two-layer storage

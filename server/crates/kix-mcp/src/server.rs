@@ -1,7 +1,7 @@
 //! MCP server implementation for RAG (Retrieval Augmented Generation) system.
 //!
-//! This module provides 8 domain-agnostic tools for AI agents to interact with
-//! the knowledge base:
+//! This module provides domain-agnostic tools for AI agents to interact with
+//! the knowledge base, plus project management tools for AI-assisted planning.
 //!
 //! **Retrieval (3 tools):**
 //! - `search` - Unified semantic + keyword search
@@ -16,6 +16,15 @@
 //!
 //! **Status (1 tool):**
 //! - `status` - Index health and statistics
+//!
+//! **Project Management (25+ tools):**
+//! - Project CRUD: `create_project`, `list_projects`, `get_project`, `update_project`, `delete_project`
+//! - Issue CRUD: `create_issue`, `list_issues`, `get_issue`, `update_issue`, `delete_issue`
+//! - GitHub Projects V2: `create_github_project`, `get_github_project`, `add_issue_to_project`, `update_project_item`, `sync_github_project`
+//! - AI Planning: `plan_project`, `suggest_tasks`, `get_project_context`, `breakdown_task`
+//! - Token management: `set_github_token`, `sync_github_issues`
+//! - Knowledge linking: `link_entry_to_project`, `unlink_entry_from_project`, `list_project_entries`
+//! - Search: `search_project`
 
 use reqwest::Client as HttpClient;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -37,7 +46,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use kix_embeddings::{DocumentChunker, EmbeddingGenerator};
@@ -45,7 +54,16 @@ use kix_jobs::{Job, JobConfig, JobQueue, JobState, JobType};
 use kix_parser::{Entry, EntryType, PdfParser, SourceType};
 use kix_crawler::ContentExtractor;
 use kix_store::search::SearchFilters;
-use kix_store::KixStore;
+use kix_store::{KixStore, ProjectRecord, IssueRecord, ProjectEntryRecord};
+use kix_store::projects::ProjectStore;
+use kix_projects::{
+    GitHubTokenManager, InMemoryTokenStorage, TokenStorage, TokenScope, TokenService,
+    GitHubSyncService, IssueInfo, IssueState, IssueSource,
+    SyncDirection, SyncConfig, calculate_text_score, generate_excerpt,
+    SharedEventBus, ProjectV2Service, ProjectTemplate,
+};
+
+use crate::project_tools::*;
 
 // =============================================================================
 // RETRIEVAL TOOL PARAMETERS
@@ -413,6 +431,16 @@ pub struct KixMcpServer {
     http_client: HttpClient,
     /// Job queue for async indexing operations
     job_queue: Arc<JobQueue>,
+    /// Project store for project management
+    project_store: Option<Arc<RwLock<ProjectStore>>>,
+    /// GitHub token storage (legacy)
+    token_storage: Option<Arc<dyn TokenStorage>>,
+    /// GitHub token manager for encryption (legacy)
+    token_manager: Option<Arc<GitHubTokenManager>>,
+    /// Token service for GitHub integration (preferred)
+    token_service: Option<Arc<TokenService>>,
+    /// Event bus for real-time events
+    event_bus: Option<SharedEventBus>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -454,8 +482,51 @@ impl KixMcpServer {
                 .build()
                 .expect("Failed to create HTTP client"),
             job_queue,
+            project_store: None,
+            token_storage: None,
+            token_manager: None,
+            token_service: None,
+            event_bus: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Enable project management features with the given project store.
+    pub fn with_project_store(mut self, project_store: Arc<RwLock<ProjectStore>>) -> Self {
+        self.project_store = Some(project_store);
+        self
+    }
+
+    /// Enable event bus for real-time events.
+    pub fn with_event_bus(mut self, event_bus: SharedEventBus) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// Get the event bus if configured.
+    pub fn event_bus(&self) -> Option<&SharedEventBus> {
+        self.event_bus.as_ref()
+    }
+
+    /// Enable GitHub token storage with the given storage backend.
+    pub fn with_token_storage(mut self, storage: Arc<dyn TokenStorage>, manager: Arc<GitHubTokenManager>) -> Self {
+        self.token_storage = Some(storage);
+        self.token_manager = Some(manager);
+        self
+    }
+
+    /// Create with in-memory token storage (for testing or simple setups).
+    pub fn with_in_memory_tokens(mut self, manager: Arc<GitHubTokenManager>) -> Self {
+        self.token_storage = Some(Arc::new(InMemoryTokenStorage::default()));
+        self.token_manager = Some(manager);
+        self
+    }
+
+    /// Enable GitHub token service (preferred over raw storage).
+    /// Uses the same token service as the REST API.
+    pub fn with_token_service(mut self, service: Arc<TokenService>) -> Self {
+        self.token_service = Some(service);
+        self
     }
 
     // =========================================================================
@@ -504,14 +575,16 @@ impl KixMcpServer {
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?
             }
             SearchMode::Vector => {
+                // vector_search is sync (sqlite-vec)
                 store
                     .vector_search(&embedding, limit + offset, &filters)
-                    .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?
             }
             SearchMode::Text => {
+                // Text-only mode: use hybrid search (includes FTS) as fallback
+                // Pure text search is part of hybrid search
                 store
-                    .text_search(query, limit + offset, &filters)
+                    .hybrid_search(query, &embedding, limit + offset, &filters)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?
             }
@@ -638,9 +711,9 @@ impl KixMcpServer {
             Some(e) => {
                 // Optionally get chunks
                 let chunks = if params.0.include_chunks.unwrap_or(false) {
+                    // get_chunks_by_entry_id is sync (sqlite-vec)
                     let chunk_list = store
                         .get_chunks_by_entry_id(&params.0.id)
-                        .await
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
                     Some(
@@ -648,8 +721,8 @@ impl KixMcpServer {
                             .into_iter()
                             .map(|c| ChunkInfo {
                                 chunk_id: c.chunk_id,
-                                chunk_index: c.chunk_index.unwrap_or(0),
-                                chunk_type: c.chunk_type,
+                                chunk_index: c.chunk_index as i32,
+                                chunk_type: Some(c.chunk_type),
                                 text: c.text,
                             })
                             .collect(),
@@ -658,15 +731,20 @@ impl KixMcpServer {
                     None
                 };
 
+                // Convert EntryRecord to Document
+                let tags: Vec<String> = e.tags.as_ref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+
                 let doc = Document {
                     id: e.id,
                     title: e.title,
-                    description: e.description,
+                    description: e.description.unwrap_or_default(),
                     entry_type: e.entry_type,
-                    source_url: e.source_path,
+                    source_url: Some(e.source_path),
                     source_domain: e.source_domain,
-                    tags: e.tags,
-                    created_at: e.created_at,
+                    tags,
+                    created_at: Some(e.created_at),
                     chunks,
                 };
 
@@ -764,7 +842,8 @@ impl KixMcpServer {
         // If replacing, delete existing first
         if exists {
             let store = self.store.write().await;
-            store.delete_chunks_by_entry(&entry.id).await.ok();
+            // delete_chunks_by_entry is sync (sqlite-vec)
+            store.delete_chunks_by_entry(&entry.id).ok();
             store.delete_entry(&entry.id).await.ok();
         }
 
@@ -783,13 +862,14 @@ impl KixMcpServer {
         // Store entry and chunks
         {
             let store = self.store.write().await;
+            // Insert entry using the Entry type converter
             store
-                .insert_entries(&[entry.clone()])
+                .insert_documents_from_entries(&[entry.clone()])
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            // insert_chunks is sync (sqlite-vec)
             store
                 .insert_chunks(&chunks, &embeddings)
-                .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         }
 
@@ -997,11 +1077,22 @@ impl KixMcpServer {
             let store = self.store.read().await;
 
             if let Some(ref tag) = filter.tag {
+                // List all entries and filter by tag (tags stored as JSON array)
                 let entries = store
-                    .list_by_tag(tag)
+                    .list_all_entries()
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                ids_to_delete.extend(entries.into_iter().map(|e| e.id));
+                ids_to_delete.extend(
+                    entries
+                        .into_iter()
+                        .filter(|e| {
+                            e.tags.as_ref()
+                                .and_then(|t| serde_json::from_str::<Vec<String>>(t).ok())
+                                .map(|tags| tags.contains(tag))
+                                .unwrap_or(false)
+                        })
+                        .map(|e| e.id),
+                );
             }
 
             if let Some(ref domain) = filter.source_domain {
@@ -1045,7 +1136,8 @@ impl KixMcpServer {
             let store = self.store.read().await;
             for id in &ids_to_delete {
                 if store.entry_exists(id).await.unwrap_or(false) {
-                    let chunks = store.get_chunks_by_entry_id(id).await.unwrap_or_default();
+                    // get_chunks_by_entry_id is sync (sqlite-vec)
+                    let chunks = store.get_chunks_by_entry_id(id).unwrap_or_default();
                     chunks_deleted += chunks.len();
                     actually_deleted.push(id.clone());
                 }
@@ -1055,10 +1147,12 @@ impl KixMcpServer {
             let store = self.store.write().await;
             for id in &ids_to_delete {
                 if store.entry_exists(id).await.unwrap_or(false) {
-                    let chunks = store.get_chunks_by_entry_id(id).await.unwrap_or_default();
+                    // get_chunks_by_entry_id is sync (sqlite-vec)
+                    let chunks = store.get_chunks_by_entry_id(id).unwrap_or_default();
                     chunks_deleted += chunks.len();
 
-                    store.delete_chunks_by_entry(id).await.ok();
+                    // delete_chunks_by_entry is sync (sqlite-vec)
+                    store.delete_chunks_by_entry(id).ok();
                     store.delete_entry(id).await.ok();
                     actually_deleted.push(id.clone());
                 }
@@ -1098,9 +1192,9 @@ impl KixMcpServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // chunk_count is sync (sqlite-vec)
         let chunk_count = store
             .chunk_count()
-            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let page_count = store
@@ -1148,6 +1242,1662 @@ impl KixMcpServer {
         };
 
         let json = serde_json::to_string_pretty(&status)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    // =========================================================================
+    // PROJECT MANAGEMENT TOOLS
+    // =========================================================================
+
+    /// Helper to get project store or return error.
+    fn require_project_store(&self) -> Result<&Arc<RwLock<ProjectStore>>, McpError> {
+        self.project_store.as_ref().ok_or_else(|| {
+            McpError::internal_error("Project management not enabled. Initialize server with project store.".to_string(), None)
+        })
+    }
+
+    /// Helper to get token storage and manager or return error.
+    fn require_token_storage(&self) -> Result<(&Arc<dyn TokenStorage>, &Arc<GitHubTokenManager>), McpError> {
+        let storage = self.token_storage.as_ref().ok_or_else(|| {
+            McpError::internal_error("Token storage not configured.".to_string(), None)
+        })?;
+        let manager = self.token_manager.as_ref().ok_or_else(|| {
+            McpError::internal_error("Token manager not configured.".to_string(), None)
+        })?;
+        Ok((storage, manager))
+    }
+
+    /// Helper to get a GitHub sync service for a project.
+    /// Prefers token_service if configured, falls back to legacy token_storage.
+    async fn get_sync_service(&self, project_id: Option<&str>) -> Result<GitHubSyncService, McpError> {
+        // Prefer token_service if configured (same as REST API)
+        if let Some(token_service) = &self.token_service {
+            let token = if let Some(pid) = project_id {
+                token_service.get_token_for_project(pid).await
+            } else {
+                token_service.get_global_token_decrypted().await
+            };
+
+            let token = token.map_err(|e| McpError::internal_error(
+                format!("Failed to get GitHub token: {}", e), None
+            ))?;
+
+            return GitHubSyncService::new(&token)
+                .map_err(|e| McpError::internal_error(e.to_string(), None));
+        }
+
+        // Fall back to legacy token storage
+        let (storage, manager) = self.require_token_storage()?;
+        let token = kix_projects::get_token_with_fallback(storage, manager.as_ref(), project_id)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        GitHubSyncService::new(token)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    /// Create a new project with required GitHub repository connection.
+    #[tool(description = "Create a new project. Projects must be connected to a GitHub repository for issue tracking.")]
+    async fn create_project(
+        &self,
+        params: Parameters<CreateProjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Creating project: {}", params.0.name);
+        let project_store = self.require_project_store()?;
+
+        // Parse template
+        let template = match params.0.template.as_str() {
+            "kanban" => ProjectTemplate::Kanban,
+            "bug_tracking" => ProjectTemplate::BugTracking,
+            "sprint_planning" => ProjectTemplate::SprintPlanning,
+            "feature_roadmap" => ProjectTemplate::FeatureRoadmap,
+            _ => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Invalid template '{}'. Choose: kanban, bug_tracking, sprint_planning, feature_roadmap",
+                    params.0.template
+                ))]));
+            }
+        };
+
+        // Create project record with GitHub config
+        let mut project = ProjectRecord::new(
+            params.0.name.clone(),
+            params.0.github_owner.clone(),
+            params.0.github_repo.clone(),
+        );
+
+        if let Some(desc) = &params.0.description {
+            project = project.with_description(desc.clone());
+        }
+        if let Some(color) = &params.0.color {
+            project = project.with_color(color.clone());
+        }
+
+        // Configure sync in github_config JSON
+        if params.0.auto_sync.is_some() || params.0.sync_direction.is_some() {
+            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&project.github_config) {
+                if let Some(sync) = config.get_mut("sync") {
+                    if let Some(auto_sync) = params.0.auto_sync {
+                        sync["enabled"] = serde_json::json!(auto_sync);
+                    }
+                    if let Some(direction) = &params.0.sync_direction {
+                        sync["direction"] = serde_json::json!(direction);
+                    }
+                }
+                project.github_config = config.to_string();
+            }
+        }
+
+        // Store project
+        {
+            let store = project_store.write().await;
+            store.create_project(&project).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
+
+        let github_url = format!(
+            "https://github.com/{}/{}",
+            params.0.github_owner, params.0.github_repo
+        );
+
+        // Create GitHub Project V2
+        let mut github_project_url: Option<String> = None;
+        let mut warning: Option<String> = None;
+
+        // Get token for GitHub API using fallback pattern
+        let github_token = self.require_token_storage()
+            .and_then(|(storage, manager)| {
+                kix_projects::get_token_with_fallback(storage, manager.as_ref(), Some(&project.id))
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))
+            })
+            .ok();
+
+        if let Some(token) = github_token {
+            match ProjectV2Service::new(&token) {
+                Ok(v2_service) => {
+                    info!(
+                        "Creating GitHub Project V2 '{}' with {} template for {}/{}",
+                        project.name, template, params.0.github_owner, params.0.github_repo
+                    );
+
+                    match v2_service
+                        .create_project_with_template(
+                            &params.0.github_owner,
+                            &params.0.github_repo,
+                            &project.name,
+                            template,
+                        )
+                        .await
+                    {
+                        Ok(v2_config) => {
+                            info!(
+                                "GitHub Project V2 created: {} at {}",
+                                v2_config.project_number, v2_config.url
+                            );
+                            github_project_url = Some(v2_config.url.clone());
+
+                            // Update project record with Project V2 config
+                            let v2_json = serde_json::json!({
+                                "project_id": v2_config.project_id,
+                                "project_number": v2_config.project_number,
+                                "url": v2_config.url,
+                                "status_field_id": v2_config.status_field_id,
+                                "status_options": v2_config.status_options.iter().map(|o| {
+                                    serde_json::json!({
+                                        "name": o.name,
+                                        "option_id": o.option_id
+                                    })
+                                }).collect::<Vec<_>>(),
+                                "custom_fields": v2_config.custom_fields.iter().map(|f| {
+                                    serde_json::json!({
+                                        "name": f.name,
+                                        "field_id": f.field_id,
+                                        "field_type": format!("{:?}", f.field_type),
+                                        "options": f.options.iter().map(|o| {
+                                            serde_json::json!({
+                                                "name": o.name,
+                                                "option_id": o.option_id
+                                            })
+                                        }).collect::<Vec<_>>()
+                                    })
+                                }).collect::<Vec<_>>()
+                            });
+
+                            let updated_project = project.clone().with_github_project_v2(v2_json);
+
+                            let store = project_store.write().await;
+                            if let Err(e) = store.update_project(&updated_project).await {
+                                warning = Some(format!("Project V2 created but config not saved: {}", e));
+                            }
+                        }
+                        Err(e) => {
+                            warning = Some(format!("Failed to create GitHub Project V2: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warning = Some(format!("Failed to initialize GitHub GraphQL client: {}", e));
+                }
+            }
+        } else {
+            warning = Some("No GitHub token available. Project V2 not created.".to_string());
+        }
+
+        // Emit event
+        if let Some(bus) = &self.event_bus {
+            bus.project_created(&project.id, &project.name);
+        }
+
+        let response = CreateProjectResponse {
+            success: true,
+            project_id: project.id.clone(),
+            name: project.name.clone(),
+            slug: project.slug.clone(),
+            github_url,
+            github_project_url,
+            warning,
+            error: None,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// List all projects.
+    #[tool(description = "List all projects. Use include_archived=true to include archived projects.")]
+    async fn list_projects(
+        &self,
+        params: Parameters<ListProjectsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Listing projects");
+        let project_store = self.require_project_store()?;
+
+        let include_archived = params.0.include_archived.unwrap_or(false);
+        let limit = params.0.limit.unwrap_or(50);
+        let offset = params.0.offset.unwrap_or(0);
+
+        let projects = {
+            let store = project_store.read().await;
+            store.list_projects(include_archived).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        };
+
+        let total = projects.len();
+        let paginated: Vec<_> = projects.into_iter().skip(offset).take(limit).collect();
+        let has_more = total > offset + limit;
+
+        // Convert to summaries (we'd need issue counts from a join or separate query)
+        let summaries: Vec<ProjectSummary> = paginated.into_iter().map(|p| {
+            let github_owner = p.github_owner().unwrap_or_default().to_string();
+            let github_repo = p.github_repo().unwrap_or_default().to_string();
+            let is_archived = p.is_archived();
+            ProjectSummary {
+                id: p.id,
+                name: p.name,
+                slug: p.slug,
+                description: p.description,
+                color: p.color,
+                github_owner,
+                github_repo,
+                archived: is_archived,
+                open_issues: 0, // Would need separate query
+                closed_issues: 0,
+                created_at: p.created_at,
+            }
+        }).collect();
+
+        let response = ListProjectsResponse {
+            projects: summaries,
+            total,
+            has_more,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Get a project by ID or slug.
+    #[tool(description = "Get detailed information about a project by ID or slug.")]
+    async fn get_project(
+        &self,
+        params: Parameters<GetProjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Getting project: {}", params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.read().await;
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match project {
+            Some(p) => {
+                // Get stats if requested
+                let stats = if params.0.include_stats.unwrap_or(true) {
+                    // list_issues takes 4 args: project_id, state_filter, limit, offset
+                    let issues = store.list_issues(&p.id, None, 10000, 0).await.unwrap_or_default();
+                    let open_count = issues.iter().filter(|i| i.state == "open").count();
+                    let closed_count = issues.len() - open_count;
+                    let entries = store.list_project_entries(&p.id).await.unwrap_or_default();
+                    Some(ProjectStats {
+                        open_issues: open_count,
+                        closed_issues: closed_count,
+                        total_issues: issues.len(),
+                        linked_entries: entries.len(),
+                    })
+                } else {
+                    None
+                };
+
+                // Get GitHub Project info if linked (github_config is a String, parse it)
+                let github_project = serde_json::from_str::<serde_json::Value>(&p.github_config)
+                    .ok()
+                    .and_then(|config| {
+                        let pv2 = config.get("project_v2")?;
+                        let node_id = pv2.get("project_id")?.as_str()?.to_string();
+                        let number = pv2.get("project_number")?.as_u64()? as u32;
+                        let title = pv2.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                        let owner = p.github_owner().unwrap_or_default();
+                        Some(GitHubProjectInfo {
+                            node_id,
+                            number,
+                            title,
+                            url: format!("https://github.com/orgs/{}/projects/{}", owner, number),
+                        })
+                    });
+
+                let github_owner = p.github_owner().unwrap_or_default().to_string();
+                let github_repo = p.github_repo().unwrap_or_default().to_string();
+                let is_archived = p.is_archived();
+
+                let response = ProjectDetail {
+                    id: p.id,
+                    name: p.name,
+                    slug: p.slug,
+                    description: p.description,
+                    color: p.color,
+                    github_owner: github_owner.clone(),
+                    github_repo: github_repo.clone(),
+                    github_url: format!("https://github.com/{}/{}", github_owner, github_repo),
+                    archived: is_archived,
+                    created_at: p.created_at.clone(),
+                    updated_at: p.updated_at.clone(),
+                    stats,
+                    github_project,
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => {
+                let error = serde_json::json!({
+                    "error": "not_found",
+                    "message": format!("Project '{}' not found", params.0.project)
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&error).unwrap(),
+                )]))
+            }
+        }
+    }
+
+    /// Update a project.
+    #[tool(description = "Update project properties like name, description, color, or archived status.")]
+    async fn update_project(
+        &self,
+        params: Parameters<UpdateProjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Updating project: {}", params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.write().await;
+
+        // Get existing project
+        let existing = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match existing {
+            Some(mut project) => {
+                // Apply updates (archived is i64: 0 = false, non-0 = true)
+                let was_archived = project.is_archived();
+                if let Some(name) = &params.0.name {
+                    project.name = name.clone();
+                    // Create simple slug
+                    project.slug = name.to_lowercase()
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                        .collect();
+                }
+                if let Some(desc) = &params.0.description {
+                    project.description = Some(desc.clone());
+                }
+                if let Some(color) = &params.0.color {
+                    project.color = Some(color.clone());
+                }
+                if let Some(archived) = params.0.archived {
+                    project.archived = if archived { 1 } else { 0 };
+                }
+                project.updated_at = chrono::Utc::now().to_rfc3339();
+
+                let project_id = project.id.clone();
+                let now_archived = project.is_archived();
+
+                store.update_project(&project).await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                drop(store); // Release lock before emitting event
+
+                // Emit appropriate event
+                if let Some(bus) = &self.event_bus {
+                    if !was_archived && now_archived {
+                        bus.project_archived(&project_id);
+                    } else if was_archived && !now_archived {
+                        bus.project_unarchived(&project_id);
+                    } else {
+                        bus.project_updated(&project_id);
+                    }
+                }
+
+                let response = UpdateProjectResponse {
+                    success: true,
+                    project_id,
+                    error: None,
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => {
+                let response = UpdateProjectResponse {
+                    success: false,
+                    project_id: String::new(),
+                    error: Some(format!("Project '{}' not found", params.0.project)),
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+        }
+    }
+
+    /// Delete a project.
+    #[tool(description = "Delete a project and its local issues/entries. Does not delete GitHub issues.")]
+    async fn delete_project(
+        &self,
+        params: Parameters<DeleteProjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Deleting project: {}", params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.write().await;
+
+        // Get project first to count what will be deleted
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match project {
+            Some(p) => {
+                // Count issues and entries before deletion
+                let project_id = p.id.clone();
+                let issues_deleted = store.list_issues(&p.id, None, 10000, 0).await
+                    .map(|i| i.len())
+                    .unwrap_or(0);
+                let entries_unlinked = store.list_project_entries(&p.id).await
+                    .map(|e| e.len())
+                    .unwrap_or(0);
+
+                // Delete project (cascade deletes issues and entries)
+                store.delete_project(&p.id).await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                drop(store); // Release lock before emitting event
+
+                // Emit event
+                if let Some(bus) = &self.event_bus {
+                    bus.project_deleted(&project_id);
+                }
+
+                let response = DeleteProjectResponse {
+                    success: true,
+                    issues_deleted,
+                    entries_unlinked,
+                    error: None,
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => {
+                let response = DeleteProjectResponse {
+                    success: false,
+                    issues_deleted: 0,
+                    entries_unlinked: 0,
+                    error: Some(format!("Project '{}' not found", params.0.project)),
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+        }
+    }
+
+    // =========================================================================
+    // ISSUE CRUD TOOLS
+    // =========================================================================
+
+    /// Create a new issue in a project.
+    #[tool(description = "Create a new issue in a project. When GitHub integration is configured, the issue is ALWAYS created on GitHub first. If GitHub fails, the operation fails.")]
+    async fn create_issue(
+        &self,
+        params: Parameters<CreateIssueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Creating issue in project: {}", params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.write().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        let owner = project.github_owner().unwrap_or_default();
+        let repo = project.github_repo().unwrap_or_default();
+        let has_github_config = !owner.is_empty() && !repo.is_empty();
+
+        // If GitHub is configured, ALWAYS create there FIRST - fail if it fails
+        if has_github_config {
+            // Get sync service - fail if not available
+            let sync_service = match self.get_sync_service(Some(&project.id)).await {
+                Ok(service) => service,
+                Err(e) => {
+                    let response = CreateIssueResponse {
+                        success: false,
+                        issue_id: String::new(),
+                        number: 0,
+                        title: params.0.title.clone(),
+                        github_url: None,
+                        error: Some(format!("GitHub sync service unavailable: {}", e)),
+                    };
+                    let json = serde_json::to_string_pretty(&response)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    return Ok(CallToolResult::success(vec![Content::text(json)]));
+                }
+            };
+
+            let issue_info = IssueInfo {
+                id: uuid::Uuid::new_v4().to_string(),
+                title: params.0.title.clone(),
+                body: params.0.body.clone(),
+                state: IssueState::Open,
+                labels: params.0.labels.clone().unwrap_or_default(),
+                assignees: params.0.assignees.clone().unwrap_or_default(),
+                github_number: None,
+                github_node_id: None,
+                source: IssueSource::Mcp,
+            };
+
+            // Create on GitHub FIRST - fail if it fails
+            let gh_issue = match sync_service.push_issue(&owner, &repo, &issue_info).await {
+                Ok(issue) => {
+                    info!("Created GitHub issue #{} for project {}", issue.number, project.id);
+                    issue
+                }
+                Err(e) => {
+                    warn!("Failed to create issue on GitHub: {}", e);
+                    let response = CreateIssueResponse {
+                        success: false,
+                        issue_id: String::new(),
+                        number: 0,
+                        title: params.0.title.clone(),
+                        github_url: None,
+                        error: Some(format!("Failed to create on GitHub: {}", e)),
+                    };
+                    let json = serde_json::to_string_pretty(&response)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    return Ok(CallToolResult::success(vec![Content::text(json)]));
+                }
+            };
+
+            // GitHub succeeded - now create locally with GitHub's number
+            let mut issue = IssueRecord::new(project.id.clone(), gh_issue.number, params.0.title.clone());
+            if let Some(body) = &params.0.body {
+                issue = issue.with_body(body.clone());
+            }
+            if let Some(labels) = &params.0.labels {
+                issue = issue.with_labels(labels.clone());
+            }
+            if let Some(assignees) = &params.0.assignees {
+                issue = issue.with_assignees(assignees.clone());
+            }
+            issue.github_number = Some(gh_issue.number as i64);
+            issue.github_node_id = Some(gh_issue.node_id.clone());
+            issue.github_url = Some(gh_issue.html_url.clone());
+            issue.source = "github".to_string();
+
+            // Add issue to GitHub Project V2 if configured (non-blocking)
+            if let Some(project_v2_id) = project.github_project_v2_id() {
+                if let Some(token_service) = &self.token_service {
+                    if let Ok(token) = token_service.get_token_for_project(&project.id).await {
+                        if let Ok(v2_service) = ProjectV2Service::new(&token) {
+                            match v2_service.add_issue_to_project(&project_v2_id, &gh_issue.node_id).await {
+                                Ok(item_id) => {
+                                    info!("Added issue #{} to GitHub Project V2: item_id={}", gh_issue.number, item_id);
+                                    issue.github_project_item_id = Some(item_id);
+                                }
+                                Err(e) => {
+                                    info!("Failed to add issue to Project V2: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let issue_id = issue.id.clone();
+            let issue_title = issue.title.clone();
+            let project_id = project.id.clone();
+            let issue_number = gh_issue.number;
+            let github_url = Some(gh_issue.html_url);
+
+            store.create_issue(&issue).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            drop(store);
+
+            if let Some(bus) = &self.event_bus {
+                bus.issue_created(&project_id, &issue_id, &issue_title);
+            }
+
+            let response = CreateIssueResponse {
+                success: true,
+                issue_id,
+                number: issue_number as u32,
+                title: issue_title,
+                github_url,
+                error: None,
+            };
+
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        // No GitHub config - create locally only
+        let issue_number = store.next_issue_number(&project.id).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let mut issue = IssueRecord::new(project.id.clone(), issue_number, params.0.title.clone());
+        if let Some(body) = &params.0.body {
+            issue = issue.with_body(body.clone());
+        }
+        if let Some(labels) = &params.0.labels {
+            issue = issue.with_labels(labels.clone());
+        }
+        if let Some(assignees) = &params.0.assignees {
+            issue = issue.with_assignees(assignees.clone());
+        }
+        issue.source = "mcp".to_string();
+
+        let issue_id = issue.id.clone();
+        let issue_title = issue.title.clone();
+        let project_id = project.id.clone();
+
+        store.create_issue(&issue).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        drop(store);
+
+        if let Some(bus) = &self.event_bus {
+            bus.issue_created(&project_id, &issue_id, &issue_title);
+        }
+
+        let response = CreateIssueResponse {
+            success: true,
+            issue_id,
+            number: issue_number as u32,
+            title: issue_title,
+            github_url: None,
+            error: None,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// List issues in a project.
+    #[tool(description = "List issues in a project with optional filters for state, labels, assignee, and search.")]
+    async fn list_issues(
+        &self,
+        params: Parameters<ListIssuesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Listing issues for project: {}", params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.read().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        // State filter (pass as Option<&str>)
+        let state_filter = params.0.state.as_deref();
+
+        let limit = params.0.limit.unwrap_or(50);
+        let offset = params.0.offset.unwrap_or(0);
+
+        // list_issues takes (project_id, state, limit, offset) - fetch more for filtering
+        let issues = store.list_issues(&project.id, state_filter, 10000, 0).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        // Apply additional filters in memory (labels, assignee, search)
+        let filtered: Vec<_> = issues.into_iter().filter(|i| {
+            // Label filter (labels is Option<String> JSON)
+            if let Some(labels) = &params.0.labels {
+                let issue_labels = i.labels_vec();
+                if !labels.iter().any(|l| issue_labels.contains(l)) {
+                    return false;
+                }
+            }
+            // Assignee filter (assignees is Option<String> JSON)
+            if let Some(assignee) = &params.0.assignee {
+                if !i.assignees_vec().contains(assignee) {
+                    return false;
+                }
+            }
+            // Search filter
+            if let Some(search) = &params.0.search {
+                let search_lower = search.to_lowercase();
+                if !i.title.to_lowercase().contains(&search_lower) &&
+                   !i.body.as_ref().map(|b| b.to_lowercase().contains(&search_lower)).unwrap_or(false) {
+                    return false;
+                }
+            }
+            true
+        }).collect();
+
+        let total = filtered.len();
+        let paginated: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+        let has_more = total > offset + limit;
+
+        let github_owner = project.github_owner().unwrap_or_default();
+        let github_repo = project.github_repo().unwrap_or_default();
+
+        let summaries: Vec<IssueSummary> = paginated.into_iter().map(|i| {
+            let github_url = i.github_number.map(|n| {
+                format!("https://github.com/{}/{}/issues/{}", github_owner, github_repo, n)
+            });
+            let labels_list = i.labels_vec();
+            let assignees_list = i.assignees_vec();
+
+            IssueSummary {
+                id: i.id,
+                number: i.number as u32,
+                title: i.title,
+                state: i.state,
+                labels: labels_list,
+                assignees: if assignees_list.is_empty() { None } else { Some(assignees_list) },
+                github_url,
+                created_at: i.created_at,
+                updated_at: i.updated_at,
+            }
+        }).collect();
+
+        let response = ListIssuesResponse {
+            issues: summaries,
+            total,
+            has_more,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Get a specific issue.
+    #[tool(description = "Get detailed information about a specific issue by number or ID.")]
+    async fn get_issue(
+        &self,
+        params: Parameters<GetIssueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Getting issue {} in project {}", params.0.issue, params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.read().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        // Try to parse as number first, then as ID
+        let issue = if let Ok(num) = params.0.issue.parse::<u32>() {
+            store.get_issue_by_number(&project.id, num).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            store.get_issue(&params.0.issue).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        };
+
+        match issue {
+            Some(i) => {
+                let github_owner = project.github_owner().unwrap_or_default();
+                let github_repo = project.github_repo().unwrap_or_default();
+                let github_url = i.github_number.map(|n| {
+                    format!("https://github.com/{}/{}/issues/{}", github_owner, github_repo, n)
+                });
+
+                let labels_list = i.labels_vec();
+                let assignees_list = i.assignees_vec();
+                let response = IssueDetail {
+                    id: i.id,
+                    project_id: i.project_id,
+                    number: i.number as u32,
+                    title: i.title,
+                    body: i.body,
+                    state: i.state,
+                    labels: labels_list,
+                    assignees: if assignees_list.is_empty() { None } else { Some(assignees_list) },
+                    github_number: i.github_number.map(|n| n as u32),
+                    github_url,
+                    source: i.source,
+                    created_at: i.created_at,
+                    updated_at: i.updated_at,
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => {
+                let error = serde_json::json!({
+                    "error": "not_found",
+                    "message": format!("Issue '{}' not found in project '{}'", params.0.issue, params.0.project)
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&error).unwrap(),
+                )]))
+            }
+        }
+    }
+
+    /// Update an issue.
+    #[tool(description = "Update an issue's title, body, state, labels, or assignees. When GitHub is configured, updates GitHub first. If GitHub fails, the operation fails.")]
+    async fn update_issue(
+        &self,
+        params: Parameters<UpdateIssueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Updating issue {} in project {}", params.0.issue, params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.write().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        // Get issue
+        let issue = if let Ok(num) = params.0.issue.parse::<u32>() {
+            store.get_issue_by_number(&project.id, num).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            store.get_issue(&params.0.issue).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        };
+
+        match issue {
+            Some(mut i) => {
+                let was_open = i.state != "closed";
+                let owner = project.github_owner().unwrap_or_default();
+                let repo = project.github_repo().unwrap_or_default();
+                let has_github_config = !owner.is_empty() && !repo.is_empty();
+
+                // If GitHub is configured AND issue exists on GitHub, ALWAYS update there FIRST
+                if has_github_config && i.github_number.is_some() {
+                    let gh_num = i.github_number.unwrap() as u32;
+
+                    // Get sync service - fail if not available
+                    let sync_service = match self.get_sync_service(Some(&project.id)).await {
+                        Ok(service) => service,
+                        Err(e) => {
+                            let response = UpdateIssueResponse {
+                                success: false,
+                                issue_id: i.id.clone(),
+                                synced_to_github: false,
+                                error: Some(format!("GitHub sync service unavailable: {}", e)),
+                            };
+                            let json = serde_json::to_string_pretty(&response)
+                                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                            return Ok(CallToolResult::success(vec![Content::text(json)]));
+                        }
+                    };
+
+                    // Build update request with GitHub models
+                    let github_req = kix_projects::github::models::UpdateIssueRequest {
+                        title: params.0.title.clone(),
+                        body: params.0.body.clone(),
+                        state: params.0.state.clone(),
+                        labels: params.0.labels.clone(),
+                        assignees: params.0.assignees.clone(),
+                    };
+
+                    // Update on GitHub FIRST - fail if it fails
+                    match sync_service.rest().update_issue(&owner, &repo, gh_num, &github_req).await {
+                        Ok(gh_issue) => {
+                            info!("Updated GitHub issue #{} for project {}", gh_num, project.id);
+                            // Update local issue with data from GitHub response
+                            i.title = gh_issue.title;
+                            i.body = gh_issue.body;
+                            i.state = gh_issue.state.clone();
+                            i.set_labels(gh_issue.labels.iter().map(|l| l.name.clone()).collect());
+                            i.set_assignees(gh_issue.assignees.iter().map(|u| u.login.clone()).collect());
+                        }
+                        Err(e) => {
+                            warn!("Failed to update issue on GitHub: {}", e);
+                            let response = UpdateIssueResponse {
+                                success: false,
+                                issue_id: i.id.clone(),
+                                synced_to_github: false,
+                                error: Some(format!("Failed to update on GitHub: {}", e)),
+                            };
+                            let json = serde_json::to_string_pretty(&response)
+                                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                            return Ok(CallToolResult::success(vec![Content::text(json)]));
+                        }
+                    }
+                } else {
+                    // No GitHub config or issue not on GitHub - update locally only
+                    if let Some(title) = &params.0.title {
+                        i.title = title.clone();
+                    }
+                    if let Some(body) = &params.0.body {
+                        i.body = Some(body.clone());
+                    }
+                    if let Some(state) = &params.0.state {
+                        i.state = state.clone();
+                    }
+                    if let Some(labels) = &params.0.labels {
+                        i.set_labels(labels.clone());
+                    }
+                    if let Some(assignees) = &params.0.assignees {
+                        i.set_assignees(assignees.clone());
+                    }
+                }
+
+                i.updated_at = chrono::Utc::now().to_rfc3339();
+                let is_now_closed = i.state == "closed";
+                let issue_id = i.id.clone();
+                let project_id = project.id.clone();
+                let synced = has_github_config && i.github_number.is_some();
+
+                store.update_issue(&i).await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                drop(store); // Release lock before emitting event
+
+                // Emit appropriate event
+                if let Some(bus) = &self.event_bus {
+                    if was_open && is_now_closed {
+                        bus.issue_closed(&project_id, &issue_id);
+                    } else if !was_open && !is_now_closed {
+                        bus.issue_reopened(&project_id, &issue_id);
+                    } else {
+                        bus.issue_updated(&project_id, &issue_id);
+                    }
+                }
+
+                let response = UpdateIssueResponse {
+                    success: true,
+                    issue_id,
+                    synced_to_github: synced,
+                    error: None,
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => {
+                let response = UpdateIssueResponse {
+                    success: false,
+                    issue_id: String::new(),
+                    synced_to_github: false,
+                    error: Some(format!("Issue '{}' not found", params.0.issue)),
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+        }
+    }
+
+    /// Delete an issue from Kix. When the issue exists on GitHub, closes it there first.
+    #[tool(description = "Delete an issue from Kix. When GitHub is configured and the issue exists there, closes it on GitHub first (GitHub doesn't allow deleting issues). If GitHub close fails, the operation fails.")]
+    async fn delete_issue(
+        &self,
+        params: Parameters<DeleteIssueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Deleting issue {} from project {}", params.0.issue, params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.write().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        // Get issue
+        let issue = if let Ok(num) = params.0.issue.parse::<u32>() {
+            store.get_issue_by_number(&project.id, num).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            store.get_issue(&params.0.issue).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        };
+
+        match issue {
+            Some(i) => {
+                let owner = project.github_owner().unwrap_or_default();
+                let repo = project.github_repo().unwrap_or_default();
+                let has_github_config = !owner.is_empty() && !repo.is_empty();
+                let mut closed_on_github = false;
+
+                // If GitHub is configured AND issue exists on GitHub, ALWAYS close there FIRST
+                if has_github_config && i.github_number.is_some() {
+                    let gh_num = i.github_number.unwrap() as u32;
+
+                    // Get sync service - fail if not available
+                    let sync_service = match self.get_sync_service(Some(&project.id)).await {
+                        Ok(service) => service,
+                        Err(e) => {
+                            let response = DeleteIssueResponse {
+                                success: false,
+                                closed_on_github: false,
+                                error: Some(format!("GitHub sync service unavailable: {}", e)),
+                            };
+                            let json = serde_json::to_string_pretty(&response)
+                                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                            return Ok(CallToolResult::success(vec![Content::text(json)]));
+                        }
+                    };
+
+                    // Close on GitHub FIRST - fail if it fails (unless already deleted)
+                    match sync_service.rest().close_issue(&owner, &repo, gh_num).await {
+                        Ok(_) => {
+                            info!("Closed GitHub issue #{} for project {}", gh_num, project.id);
+                            closed_on_github = true;
+                        }
+                        Err(e) => {
+                            let error_str = e.to_string();
+                            // Treat 410 Gone as success - issue was already deleted on GitHub
+                            if error_str.contains("410") || error_str.contains("Gone") {
+                                info!("GitHub issue #{} was already deleted, proceeding with local deletion", gh_num);
+                                closed_on_github = true; // Consider it handled
+                            } else {
+                                warn!("Failed to close issue on GitHub: {}", e);
+                                let response = DeleteIssueResponse {
+                                    success: false,
+                                    closed_on_github: false,
+                                    error: Some(format!("Failed to close on GitHub: {}", e)),
+                                };
+                                let json = serde_json::to_string_pretty(&response)
+                                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                            }
+                        }
+                    }
+                }
+
+                // GitHub succeeded (or no GitHub) - now delete locally
+                let issue_id = i.id.clone();
+                let project_id = project.id.clone();
+
+                store.delete_issue(&i.id).await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                drop(store); // Release lock before emitting event
+
+                // Emit event
+                if let Some(bus) = &self.event_bus {
+                    bus.issue_deleted(&project_id, &issue_id);
+                }
+
+                let response = DeleteIssueResponse {
+                    success: true,
+                    closed_on_github,
+                    error: None,
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => {
+                let response = DeleteIssueResponse {
+                    success: false,
+                    closed_on_github: false,
+                    error: Some(format!("Issue '{}' not found", params.0.issue)),
+                };
+
+                let json = serde_json::to_string_pretty(&response)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+        }
+    }
+
+    // =========================================================================
+    // GITHUB TOKEN MANAGEMENT
+    // =========================================================================
+
+    /// Set a GitHub Personal Access Token for API access.
+    #[tool(description = "Set a GitHub Personal Access Token for API access. Use scope='global' or a project ID for project-specific token.")]
+    async fn set_github_token(
+        &self,
+        params: Parameters<SetGitHubTokenParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Setting GitHub token");
+        let (storage, manager) = self.require_token_storage()?;
+
+        // Validate token format
+        if let Err(e) = GitHubTokenManager::validate_token_format(&params.0.token) {
+            let response = SetGitHubTokenResponse {
+                success: false,
+                scope: String::new(),
+                error: Some(e.to_string()),
+            };
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        // Determine scope
+        let scope_str = params.0.scope.as_deref().unwrap_or("global");
+        let scope = if scope_str == "global" {
+            TokenScope::Global
+        } else {
+            TokenScope::Project(scope_str.to_string())
+        };
+
+        // Encrypt and store
+        let encrypted = manager.encrypt(&params.0.token)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        storage.store_token(&scope, &encrypted)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let response = SetGitHubTokenResponse {
+            success: true,
+            scope: scope_str.to_string(),
+            error: None,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Sync issues with GitHub.
+    #[tool(description = "Sync issues between Kix and GitHub. Direction can be 'pull', 'push', or 'bidirectional'.")]
+    async fn sync_github_issues(
+        &self,
+        params: Parameters<SyncGitHubIssuesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Syncing GitHub issues for project: {}", params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.write().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        // Get sync service
+        let sync_service = self.get_sync_service(Some(&project.id)).await?;
+
+        // Build sync config
+        let direction = params.0.direction.as_ref().map(|d| match d.as_str() {
+            "pull" => SyncDirection::Pull,
+            "push" => SyncDirection::Push,
+            _ => SyncDirection::Bidirectional,
+        }).unwrap_or(SyncDirection::Bidirectional);
+
+        let config = SyncConfig {
+            direction,
+            include_closed: params.0.include_closed.unwrap_or(true),
+            labels_filter: params.0.labels.clone().unwrap_or_default(),
+            max_issues: params.0.max_issues.unwrap_or(100) as u32,
+        };
+
+        // Get local issues for push (list_issues takes project_id, state, limit, offset)
+        let local_issues = store.list_issues(&project.id, None, 10000, 0).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let local_issue_infos: Vec<_> = local_issues.iter().map(|i| {
+            // Convert string state/source to enums for IssueInfo
+            let state_enum = match i.state.as_str() {
+                "closed" => IssueState::Closed,
+                _ => IssueState::Open,
+            };
+            let source_enum = match i.source.as_str() {
+                "github" => IssueSource::GitHub,
+                "mcp" => IssueSource::Mcp,
+                _ => IssueSource::Local,
+            };
+            IssueInfo {
+                id: i.id.clone(),
+                title: i.title.clone(),
+                body: i.body.clone(),
+                state: state_enum,
+                labels: i.labels_vec(),
+                assignees: i.assignees_vec(),
+                github_number: i.github_number.map(|n| n as u32),
+                github_node_id: i.github_node_id.clone(),
+                source: source_enum,
+            }
+        }).collect();
+
+        let github_owner = project.github_owner().unwrap_or_default();
+        let github_repo = project.github_repo().unwrap_or_default();
+        let project_id = project.id.clone();
+
+        // Emit sync started event
+        if let Some(bus) = &self.event_bus {
+            bus.github_sync_started(&project_id);
+        }
+
+        // Perform sync
+        let result = sync_service.sync_issues(
+            &github_owner,
+            &github_repo,
+            &config,
+            &local_issue_infos,
+        ).await.map_err(|e| {
+            // Emit sync failed event
+            if let Some(bus) = &self.event_bus {
+                bus.github_sync_failed(&project_id, &e.to_string());
+            }
+            McpError::internal_error(e.to_string(), None)
+        })?;
+
+        // Import pulled issues
+        let pulled_issues = sync_service.pull_issues(
+            &github_owner,
+            &github_repo,
+            &config,
+        ).await.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        for gh_issue in pulled_issues {
+            // Check if we already have this issue
+            if store.get_issue_by_github_number(&project.id, gh_issue.number).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?.is_some() {
+                continue;
+            }
+
+            let mut issue = IssueRecord::new(project.id.clone(), gh_issue.number, gh_issue.title.clone());
+            if let Some(body) = gh_issue.body {
+                issue = issue.with_body(body);
+            }
+            issue.state = if gh_issue.state == "open" { "open".to_string() } else { "closed".to_string() };
+            issue = issue.with_labels(gh_issue.labels.iter().map(|l| l.name.clone()).collect());
+            let assignees: Vec<String> = gh_issue.assignees.iter().map(|a| a.login.clone()).collect();
+            issue.set_assignees(assignees);
+            issue.github_number = Some(gh_issue.number as i64);
+            issue.github_node_id = Some(gh_issue.node_id.clone());
+            issue.github_url = Some(gh_issue.html_url);
+            issue.source = "github".to_string();
+
+            store.create_issue(&issue).await.ok();
+        }
+
+        drop(store); // Release lock before emitting event
+
+        // Emit sync completed event
+        if let Some(bus) = &self.event_bus {
+            bus.github_sync_completed(
+                &project_id,
+                result.issues_pulled as usize,
+                result.issues_updated as usize,
+            );
+        }
+
+        let response = SyncGitHubIssuesResponse {
+            success: true,
+            issues_pulled: result.issues_pulled as usize,
+            issues_pushed: result.issues_pushed as usize,
+            issues_updated: result.issues_updated as usize,
+            issues_failed: result.issues_failed as usize,
+            errors: result.errors,
+            synced_at: result.synced_at.to_rfc3339(),
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    // =========================================================================
+    // KNOWLEDGE LINKING TOOLS
+    // =========================================================================
+
+    /// Link a knowledge entry to a project.
+    #[tool(description = "Link a knowledge entry to a project for project-scoped search and AI planning context.")]
+    async fn link_entry_to_project(
+        &self,
+        params: Parameters<LinkEntryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Linking entry {} to project {}", params.0.entry_id, params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.write().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        // Verify entry exists
+        let kix_store = self.store.read().await;
+        let entry_exists = kix_store.entry_exists(&params.0.entry_id).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        if !entry_exists {
+            let response = LinkEntryResponse {
+                success: false,
+                link_id: String::new(),
+                error: Some(format!("Entry '{}' not found", params.0.entry_id)),
+            };
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        drop(kix_store);
+
+        // Create link record
+        let mut link = ProjectEntryRecord::new(project.id.clone(), params.0.entry_id.clone());
+        if let Some(notes) = &params.0.notes {
+            link = link.with_notes(notes.clone());
+        }
+        if let Some(relevance) = params.0.relevance {
+            link = link.with_relevance(relevance as f64);
+        }
+
+        let link_id = link.id.clone();
+        let entry_id = params.0.entry_id.clone();
+        let project_id = project.id.clone();
+
+        store.link_entry(&link).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        drop(store); // Release lock before emitting event
+
+        // Emit event
+        if let Some(bus) = &self.event_bus {
+            bus.entry_linked(&project_id, &entry_id, &link_id);
+        }
+
+        let response = LinkEntryResponse {
+            success: true,
+            link_id,
+            error: None,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Unlink a knowledge entry from a project.
+    #[tool(description = "Remove a knowledge entry link from a project.")]
+    async fn unlink_entry_from_project(
+        &self,
+        params: Parameters<UnlinkEntryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Unlinking entry {} from project {}", params.0.entry_id, params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.write().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        // Remove link
+        let project_id = project.id.clone();
+        let entry_id = params.0.entry_id.clone();
+
+        let removed = store.unlink_entry(&project.id, &params.0.entry_id).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        drop(store); // Release lock before emitting event
+
+        // Emit event if unlinked successfully
+        if removed {
+            if let Some(bus) = &self.event_bus {
+                bus.entry_unlinked(&project_id, &entry_id);
+            }
+        }
+
+        let response = UnlinkEntryResponse {
+            success: removed,
+            error: if !removed {
+                Some(format!("Entry '{}' was not linked to project", entry_id))
+            } else {
+                None
+            },
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// List knowledge entries linked to a project.
+    #[tool(description = "List all knowledge entries linked to a project.")]
+    async fn list_project_entries(
+        &self,
+        params: Parameters<ListProjectEntriesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Listing entries for project: {}", params.0.project);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.read().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        let limit = params.0.limit.unwrap_or(50);
+
+        let entries = store.list_project_entries(&project.id).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        drop(store); // Release lock before accessing main store
+
+        // Look up entry details from main store
+        let main_store = self.store.read().await;
+        let mut linked_entries: Vec<LinkedEntry> = Vec::new();
+
+        for link in entries {
+            // Try to get entry details from main store
+            if let Ok(Some(entry)) = main_store.get_entry_by_id(&link.entry_id).await {
+                // Filter by type if specified
+                if let Some(filter_type) = &params.0.entry_type {
+                    if &entry.entry_type != filter_type {
+                        continue;
+                    }
+                }
+
+                // Construct source URL from domain and path
+                let source_url = if let Some(domain) = &entry.source_domain {
+                    Some(format!("https://{}{}", domain, entry.source_path))
+                } else if !entry.source_path.is_empty() {
+                    Some(entry.source_path.clone())
+                } else {
+                    None
+                };
+
+                linked_entries.push(LinkedEntry {
+                    entry_id: link.entry_id,
+                    title: entry.title,
+                    entry_type: entry.entry_type,
+                    source_url,
+                    relevance: link.relevance.map(|r| r as f32),
+                    notes: link.notes,
+                    linked_at: link.linked_at,
+                });
+            }
+        }
+
+        let total = linked_entries.len();
+        linked_entries.truncate(limit);
+
+        let response = ListProjectEntriesResponse {
+            entries: linked_entries,
+            total,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    // =========================================================================
+    // PROJECT SEARCH TOOL
+    // =========================================================================
+
+    /// Search within a project's issues and linked knowledge.
+    #[tool(description = "Search within a project's scope across issues and linked knowledge entries.")]
+    async fn search_project(
+        &self,
+        params: Parameters<SearchProjectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        info!("Searching project {} for: {}", params.0.project, params.0.query);
+        let project_store = self.require_project_store()?;
+
+        let store = project_store.read().await;
+
+        // Get project
+        let project = store.get_project(&params.0.project).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| McpError::invalid_params(
+                format!("Project '{}' not found", params.0.project),
+                None,
+            ))?;
+
+        let limit = params.0.limit.unwrap_or(20);
+        let include_closed = params.0.include_closed.unwrap_or(false);
+        let search_type = params.0.search_type.as_deref().unwrap_or("all");
+
+        let mut issue_results = Vec::new();
+        let mut knowledge_results = Vec::new();
+
+        // Search issues (list_issues takes project_id, state, limit, offset)
+        if search_type == "all" || search_type == "issues" {
+            let state_filter = if include_closed { None } else { Some("open") };
+            let issues = store.list_issues(&project.id, state_filter, 10000, 0).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            let github_owner = project.github_owner().unwrap_or_default();
+            let github_repo = project.github_repo().unwrap_or_default();
+
+            for issue in issues {
+                let score = calculate_text_score(&params.0.query, &issue.title, issue.body.as_deref());
+                if score > 0.0 {
+                    let excerpt = issue.body.as_ref().and_then(|b| generate_excerpt(b, &params.0.query, 50));
+                    let github_url = issue.github_number.map(|n| {
+                        format!("https://github.com/{}/{}/issues/{}", github_owner, github_repo, n)
+                    });
+                    let labels_list = issue.labels_vec();
+
+                    issue_results.push(IssueSearchResultItem {
+                        id: issue.id,
+                        number: issue.number as u32,
+                        title: issue.title,
+                        excerpt,
+                        state: issue.state,
+                        labels: labels_list,
+                        score,
+                        github_url,
+                    });
+                }
+            }
+            issue_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // Search knowledge (ProjectEntryRecord only has entry_id and notes,
+        // so we search by notes and look up actual entry details from main store)
+        if search_type == "all" || search_type == "knowledge" {
+            let linked_entries = store.list_project_entries(&project.id).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            let main_store = self.store.read().await;
+            for link in linked_entries {
+                // Try to get the actual entry from main store
+                if let Ok(Some(entry)) = main_store.get_entry_by_id(&link.entry_id).await {
+                    let notes_text = link.notes.as_deref();
+                    let score = calculate_text_score(&params.0.query, &entry.title, notes_text);
+                    if score > 0.0 {
+                        let excerpt = link.notes.as_ref().and_then(|n| generate_excerpt(n, &params.0.query, 50));
+
+                        // Construct source URL from domain and path (source_path is String, source_domain is Option)
+                        let source_url = if let Some(domain) = &entry.source_domain {
+                            Some(format!("https://{}{}", domain, entry.source_path))
+                        } else if !entry.source_path.is_empty() {
+                            Some(entry.source_path.clone())
+                        } else {
+                            None
+                        };
+
+                        knowledge_results.push(KnowledgeSearchResultItem {
+                            entry_id: link.entry_id,
+                            title: entry.title,
+                            excerpt,
+                            entry_type: entry.entry_type,
+                            source_url,
+                            score,
+                        });
+                    }
+                }
+            }
+            knowledge_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // Apply limit
+        issue_results.truncate(limit);
+        knowledge_results.truncate(limit);
+
+        let total = issue_results.len() + knowledge_results.len();
+
+        let response = SearchProjectResponse {
+            total,
+            issues: issue_results,
+            knowledge: knowledge_results,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))

@@ -1,6 +1,6 @@
 //! Integration tests for the full KIX processing pipeline
 //!
-//! Tests the complete flow from HTML content to searchable chunks in LanceDB,
+//! Tests the complete flow from HTML content to searchable chunks in SQLite,
 //! including two-layer storage with page context retrieval.
 
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ fn init_test_env() {
 /// Create a temporary directory for test database
 fn create_temp_db() -> (TempDir, PathBuf) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let db_path = temp_dir.path().join("test_lancedb");
+    let db_path = temp_dir.path().join("test_db");
     (temp_dir, db_path)
 }
 

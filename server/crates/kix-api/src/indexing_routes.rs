@@ -521,12 +521,12 @@ async fn delete_all_data(
     // Get counts before deletion for reporting
     let store = state.app_state.store().read().await;
     let doc_count = store.document_count().await.unwrap_or(0);
-    let chunk_count = store.chunk_count().await.unwrap_or(0);
+    let chunk_count = store.chunk_count().unwrap_or(0);  // sync operation
     drop(store); // Release read lock before write operation
 
-    // Acquire write lock and clear tables
-    let mut store = state.app_state.store().write().await;
-    store.clear_tables().await.map_err(|e| {
+    // Acquire write lock and clear all data
+    let store = state.app_state.store().write().await;
+    store.clear_all().await.map_err(|e| {
         error!(error = %e, "Failed to clear tables");
         ApiIndexingError::bad_request("clear_failed", format!("Failed to delete data: {}", e))
     })?;
@@ -593,15 +593,16 @@ async fn reindex_entry(
     // Get the entry to find its source URL
     let store = state.app_state.store().read().await;
     let entry = store
-        .get_pattern_by_id(&id)
+        .get_entry(&id)
         .await
         .map_err(|e| ApiIndexingError::bad_request("store_error", format!("Failed to get entry: {}", e)))?
         .ok_or_else(|| ApiIndexingError::bad_request("not_found", format!("Entry not found: {}", id)))?;
 
     // Get the source URL from source_path
-    let source_url = entry.source_path.ok_or_else(|| {
-        ApiIndexingError::bad_request("no_source", "Entry has no source URL and cannot be re-indexed")
-    })?;
+    let source_url = entry.source_path.clone();
+    if source_url.is_empty() {
+        return Err(ApiIndexingError::bad_request("no_source", "Entry has no source URL and cannot be re-indexed"));
+    }
 
     // Validate it's a URL
     let _parsed_url = url::Url::parse(&source_url).map_err(|e| {
@@ -613,7 +614,7 @@ async fn reindex_entry(
     // Delete existing entry and chunks
     {
         let store = state.app_state.store().write().await;
-        if let Err(e) = store.delete_chunks_by_entry(&id).await {
+        if let Err(e) = store.delete_chunks_by_entry(&id) {  // sync operation
             error!(error = %e, "Failed to delete chunks for entry");
         }
         if let Err(e) = store.delete_entry(&id).await {
@@ -667,25 +668,12 @@ async fn reindex_by_domain(
 ) -> Result<Json<ReindexResponse>, ApiIndexingError> {
     info!(domain = %request.domain, "Re-indexing all entries from domain");
 
-    // Get all entries and filter by domain
+    // Get entries filtered by domain (using source_domain filter)
     let store = state.app_state.store().read().await;
-    let all_entries = store
-        .list_all_entries()
+    let domain_entries = store
+        .list_entries(None, Some(&request.domain), 10000, 0)  // Large limit to get all
         .await
         .map_err(|e| ApiIndexingError::bad_request("store_error", format!("Failed to list entries: {}", e)))?;
-
-    // Filter entries by domain
-    let domain_entries: Vec<_> = all_entries
-        .into_iter()
-        .filter(|entry| {
-            entry.source_path.as_ref().map_or(false, |path| {
-                url::Url::parse(path)
-                    .ok()
-                    .and_then(|u| u.domain().map(|d| d.to_string()))
-                    .map_or(false, |d| d.contains(&request.domain) || request.domain.contains(&d))
-            })
-        })
-        .collect();
 
     if domain_entries.is_empty() {
         return Err(ApiIndexingError::bad_request(
@@ -702,15 +690,15 @@ async fn reindex_by_domain(
 
     for entry in domain_entries {
         let entry_id = entry.id.clone();
-        let source_url = match entry.source_path {
-            Some(url) => url,
-            None => continue,
-        };
+        let source_url = entry.source_path.clone();
+        if source_url.is_empty() {
+            continue;  // Skip entries without source path
+        }
 
         // Delete existing entry and chunks
         {
             let store = state.app_state.store().write().await;
-            if let Err(e) = store.delete_chunks_by_entry(&entry_id).await {
+            if let Err(e) = store.delete_chunks_by_entry(&entry_id) {  // sync operation
                 error!(error = %e, entry_id = %entry_id, "Failed to delete chunks");
             }
             if let Err(e) = store.delete_entry(&entry_id).await {
@@ -843,14 +831,16 @@ async fn list_job_history(
     })?;
 
     let jobs = store
-        .list_jobs(query.limit, query.offset)
+        .list_jobs(None, query.limit, query.offset)  // (status, limit, offset)
         .await
         .map_err(|e| {
             error!(error = %e, "Failed to list job history");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list jobs: {}", e))
         })?;
 
-    let total = store.job_count().await.unwrap_or(0);
+    // Get total count from aggregate stats
+    let aggregate = store.get_aggregate_stats().await.unwrap_or_default();
+    let total = aggregate.total_jobs;
 
     let items: Vec<JobHistoryItem> = jobs
         .into_iter()
@@ -860,16 +850,16 @@ async fn list_job_history(
             status: j.status,
             source_url: j.source_url,
             source_domain: j.source_domain,
-            created_at: j.created_at.to_rfc3339(),
-            completed_at: j.completed_at.to_rfc3339(),
+            created_at: j.created_at.clone(),  // Already a String
+            completed_at: j.completed_at.clone(),  // Already a String
             stats: JobHistoryStats {
-                items_processed: j.stats.items_processed,
-                items_discovered: j.stats.items_discovered,
-                chunks_created: j.stats.chunks_created,
-                embeddings_generated: j.stats.embeddings_generated,
-                error_count: j.stats.error_count,
-                duration_ms: j.stats.duration_ms,
-                rate: j.stats.processing_rate,
+                items_processed: j.items_processed as u32,  // inline field
+                items_discovered: j.items_discovered as u32,
+                chunks_created: j.chunks_created as u32,
+                embeddings_generated: j.embeddings_generated as u32,
+                error_count: j.error_count as u32,
+                duration_ms: j.duration_ms as u64,
+                rate: j.processing_rate,
             },
         })
         .collect();
@@ -909,16 +899,16 @@ async fn get_job_detail(
         status: job.status,
         source_url: job.source_url,
         source_domain: job.source_domain,
-        created_at: job.created_at.to_rfc3339(),
-        completed_at: job.completed_at.to_rfc3339(),
+        created_at: job.created_at.clone(),  // Already a String
+        completed_at: job.completed_at.clone(),  // Already a String
         stats: JobHistoryStats {
-            items_processed: job.stats.items_processed,
-            items_discovered: job.stats.items_discovered,
-            chunks_created: job.stats.chunks_created,
-            embeddings_generated: job.stats.embeddings_generated,
-            error_count: job.stats.error_count,
-            duration_ms: job.stats.duration_ms,
-            rate: job.stats.processing_rate,
+            items_processed: job.items_processed as u32,  // inline field
+            items_discovered: job.items_discovered as u32,
+            chunks_created: job.chunks_created as u32,
+            embeddings_generated: job.embeddings_generated as u32,
+            error_count: job.error_count as u32,
+            duration_ms: job.duration_ms as u64,
+            rate: job.processing_rate,
         },
     };
 
@@ -928,21 +918,27 @@ async fn get_job_detail(
             url: i.item_path,
             status: i.status,
             parent_url: i.parent_url,
-            depth: i.depth,
-            discovered_at: i.discovered_at.to_rfc3339(),
-            started_at: i.started_at.map(|dt| dt.to_rfc3339()),
-            completed_at: i.completed_at.map(|dt| dt.to_rfc3339()),
-            chunks_created: i.chunks_created,
-            embeddings_generated: i.embeddings_generated,
-            duration_ms: i.duration_ms,
+            depth: i.depth as u32,  // i64 to u32
+            discovered_at: i.discovered_at.clone(),  // Already a String
+            started_at: i.started_at.clone(),  // Already Option<String>
+            completed_at: i.completed_at.clone(),  // Already Option<String>
+            chunks_created: i.chunks_created as u32,  // i64 to u32
+            embeddings_generated: i.embeddings_generated as u32,  // i64 to u32
+            duration_ms: i.duration_ms as u64,  // i64 to u64
             error_message: i.error_message,
         })
         .collect();
 
+    // Parse errors from JSON string to Vec<String>
+    let errors: Vec<String> = job.errors
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
     Ok(Json(JobDetailResponse {
         job: job_item,
         items: item_details,
-        errors: job.errors,
+        errors,
     }))
 }
 
@@ -969,13 +965,13 @@ async fn get_job_items(
             url: i.item_path,
             status: i.status,
             parent_url: i.parent_url,
-            depth: i.depth,
-            discovered_at: i.discovered_at.to_rfc3339(),
-            started_at: i.started_at.map(|dt| dt.to_rfc3339()),
-            completed_at: i.completed_at.map(|dt| dt.to_rfc3339()),
-            chunks_created: i.chunks_created,
-            embeddings_generated: i.embeddings_generated,
-            duration_ms: i.duration_ms,
+            depth: i.depth as u32,  // i64 to u32
+            discovered_at: i.discovered_at.clone(),  // Already a String
+            started_at: i.started_at.clone(),  // Already Option<String>
+            completed_at: i.completed_at.clone(),  // Already Option<String>
+            chunks_created: i.chunks_created as u32,  // i64 to u32
+            embeddings_generated: i.embeddings_generated as u32,  // i64 to u32
+            duration_ms: i.duration_ms as u64,  // i64 to u64
             error_message: i.error_message,
         })
         .collect();

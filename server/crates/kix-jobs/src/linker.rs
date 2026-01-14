@@ -149,11 +149,10 @@ impl PatternLinker {
         // Use read lock for concurrent read access
         let store = self.store.read().await;
 
-        // Search for similar patterns
+        // Search for similar patterns (sync operation)
         let filters = SearchFilters::new();
         let results = store
             .vector_search(embedding, self.config.max_links * 2, &filters)
-            .await
             .map_err(|e| JobError::Processing(format!("Vector search failed: {}", e)))?;
 
         let mut links = Vec::new();

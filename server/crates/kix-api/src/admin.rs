@@ -224,7 +224,7 @@ async fn get_data_stats(State(state): State<AppState>) -> impl IntoResponse {
 
     // Get actual statistics from the store
     let total_documents = store.entry_count().await.unwrap_or(0);
-    let total_chunks = store.chunk_count().await.unwrap_or(0);
+    let total_chunks = store.chunk_count().unwrap_or(0);  // sync operation
     let total_pages = store.page_count().await.unwrap_or(0);
 
     // For now, return mock data for fields we don't have direct methods for

@@ -189,6 +189,15 @@ run_local_mode() {
     # Enable logging (include debug for parser and embeddings to trace chunk creation)
     export RUST_LOG="${RUST_LOG:-kix=info,kix_parser=debug,kix_embeddings=debug,warn}"
 
+    # Hybrid storage configuration (SQLite for metadata, LanceDB for vectors)
+    # Create data directories if they don't exist
+    mkdir -p data/sqlite
+    mkdir -p data/lancedb
+
+    export KIX_DATA_DIR="${KIX_DATA_DIR:-$(pwd)/data}"
+    export KIX_SQLITE_PATH="${KIX_SQLITE_PATH:-$(pwd)/data/sqlite/kix.db}"
+    export KIX_LANCE_PATH="${KIX_LANCE_PATH:-$(pwd)/data/lancedb/vectors.lance}"
+
     # Ollama embedding configuration
     export OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
     export OLLAMA_MODEL="${OLLAMA_MODEL:-nomic-embed-text}"

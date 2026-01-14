@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation, Navigate, useParams } from 'react-router-dom';
-import { LayoutDashboard, Grid, Network, Menu, X, Zap, Settings, Plug2, BookOpen, Sparkles, FolderKanban } from 'lucide-react';
+import { LayoutDashboard, Grid, Network, Menu, X, Zap, Settings, Plug2, BookOpen, Sparkles, FolderKanban, Plus } from 'lucide-react';
 import { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import clsx from 'clsx';
 
 import Dashboard from './pages/Dashboard';
@@ -10,8 +11,10 @@ import EntryGraph from './pages/EntryGraph';
 import IndexingDashboard from './pages/IndexingDashboard';
 import AdminPage from './pages/AdminPage';
 import MCPDocs from './pages/MCPDocs';
+import { ProjectList, ProjectDetail } from './pages/projects';
 import { Header } from './components/Header';
 import { Footer } from './components/Footer';
+import { projectApi } from './api/projectClient';
 
 // Redirect component for /patterns/:id to /entries/:id
 function PatternRedirect() {
@@ -19,35 +22,38 @@ function PatternRedirect() {
   return <Navigate to={`/entries/${id}`} replace />;
 }
 
-// Navigation organized by sections
-const navSections = [
-  {
-    name: 'Projects',
-    icon: FolderKanban,
-    items: [],
-  },
-  {
-    name: 'Knowledge',
-    icon: BookOpen,
-    items: [
-      { name: 'Dashboard', href: '/', icon: LayoutDashboard },
-      { name: 'Indexing', href: '/indexing', icon: Zap },
-      { name: 'Entries', href: '/entries', icon: Grid },
-      { name: 'Graph', href: '/graph', icon: Network },
-    ],
-  },
-  {
-    name: 'AI',
-    icon: Sparkles,
-    items: [
-      { name: 'MCP', href: '/config/mcp', icon: Plug2 },
-    ],
-  },
-];
+// Static navigation sections (Projects section is dynamic)
+const knowledgeSection = {
+  name: 'Knowledge',
+  icon: BookOpen,
+  items: [
+    { name: 'Dashboard', href: '/', icon: LayoutDashboard },
+    { name: 'Indexing', href: '/indexing', icon: Zap },
+    { name: 'Entries', href: '/entries', icon: Grid },
+    { name: 'Graph', href: '/graph', icon: Network },
+  ],
+};
+
+const aiSection = {
+  name: 'AI',
+  icon: Sparkles,
+  items: [
+    { name: 'MCP', href: '/config/mcp', icon: Plug2 },
+  ],
+};
 
 function Sidebar() {
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
+
+  // Fetch projects for dynamic navigation
+  const { data: projectsData } = useQuery({
+    queryKey: ['projects'],
+    queryFn: () => projectApi.listProjects({ limit: 10 }),
+    staleTime: 30000, // 30 seconds
+  });
+
+  const projects = projectsData?.projects || [];
 
   return (
     <>
@@ -69,45 +75,133 @@ function Sidebar() {
         <div className="flex flex-col h-full">
           {/* Sectioned Navigation */}
           <nav className="flex-1 px-3 py-4 space-y-6 overflow-y-auto scrollbar-thin">
-            {navSections.map((section) => (
-              <div key={section.name}>
-                {/* Section Header */}
-                <div className="flex items-center gap-2 px-2 mb-2">
-                  <section.icon className="w-3.5 h-3.5 text-slate-500" />
-                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-                    {section.name}
-                  </span>
-                  <div className="flex-1 h-px bg-gradient-to-r from-slate-700/50 to-transparent ml-2" />
-                </div>
-                {/* Section Items */}
-                <div className="space-y-0.5">
-                  {section.items.length > 0 ? (
-                    section.items.map((item) => {
-                      const isActive = location.pathname === item.href ||
-                        (item.href !== '/' && location.pathname.startsWith(item.href));
+            {/* Projects Section (Dynamic) */}
+            <div>
+              <div className="flex items-center gap-2 px-2 mb-2">
+                <FolderKanban className="w-3.5 h-3.5 text-slate-500" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                  Projects
+                </span>
+                <div className="flex-1 h-px bg-gradient-to-r from-slate-700/50 to-transparent ml-2" />
+              </div>
+              <div className="space-y-0.5">
+                {projects.length > 0 ? (
+                  <>
+                    {projects.slice(0, 5).map((project) => {
+                      const isActive = location.pathname === `/projects/${project.id}`;
                       return (
                         <NavLink
-                          key={item.name}
-                          to={item.href}
+                          key={project.id}
+                          to={`/projects/${project.id}`}
                           onClick={() => setMobileOpen(false)}
                           className={clsx(
                             'nav-link',
                             isActive && 'nav-link-active'
                           )}
                         >
-                          <item.icon className="w-5 h-5" />
-                          <span className="font-medium">{item.name}</span>
+                          <div
+                            className="w-2 h-2 rounded-full flex-shrink-0"
+                            style={{ backgroundColor: project.color }}
+                          />
+                          <span className="font-medium truncate">{project.name}</span>
                         </NavLink>
                       );
-                    })
-                  ) : (
-                    <div className="px-4 py-2 text-xs text-slate-600 italic">
-                      No items yet
-                    </div>
+                    })}
+                    {projects.length > 5 && (
+                      <NavLink
+                        to="/projects"
+                        onClick={() => setMobileOpen(false)}
+                        className="nav-link text-slate-500 hover:text-slate-300"
+                      >
+                        <span className="text-xs">+{projects.length - 5} more</span>
+                      </NavLink>
+                    )}
+                  </>
+                ) : (
+                  <NavLink
+                    to="/projects"
+                    onClick={() => setMobileOpen(false)}
+                    className="nav-link text-slate-500 hover:text-cyan-400"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span className="text-sm">Create project</span>
+                  </NavLink>
+                )}
+                <NavLink
+                  to="/projects"
+                  onClick={() => setMobileOpen(false)}
+                  className={clsx(
+                    'nav-link text-xs',
+                    location.pathname === '/projects' ? 'nav-link-active' : 'text-slate-500'
                   )}
-                </div>
+                >
+                  <Grid className="w-3.5 h-3.5" />
+                  <span>All projects</span>
+                </NavLink>
               </div>
-            ))}
+            </div>
+
+            {/* Knowledge Section */}
+            <div>
+              <div className="flex items-center gap-2 px-2 mb-2">
+                <knowledgeSection.icon className="w-3.5 h-3.5 text-slate-500" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                  {knowledgeSection.name}
+                </span>
+                <div className="flex-1 h-px bg-gradient-to-r from-slate-700/50 to-transparent ml-2" />
+              </div>
+              <div className="space-y-0.5">
+                {knowledgeSection.items.map((item) => {
+                  const isActive = location.pathname === item.href ||
+                    (item.href !== '/' && location.pathname.startsWith(item.href));
+                  return (
+                    <NavLink
+                      key={item.name}
+                      to={item.href}
+                      onClick={() => setMobileOpen(false)}
+                      className={clsx(
+                        'nav-link',
+                        isActive && 'nav-link-active'
+                      )}
+                    >
+                      <item.icon className="w-5 h-5" />
+                      <span className="font-medium">{item.name}</span>
+                    </NavLink>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* AI Section */}
+            <div>
+              <div className="flex items-center gap-2 px-2 mb-2">
+                <aiSection.icon className="w-3.5 h-3.5 text-slate-500" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                  {aiSection.name}
+                </span>
+                <div className="flex-1 h-px bg-gradient-to-r from-slate-700/50 to-transparent ml-2" />
+              </div>
+              <div className="space-y-0.5">
+                {aiSection.items.map((item) => {
+                  const isActive = location.pathname === item.href ||
+                    (item.href !== '/' && location.pathname.startsWith(item.href));
+                  return (
+                    <NavLink
+                      key={item.name}
+                      to={item.href}
+                      onClick={() => setMobileOpen(false)}
+                      className={clsx(
+                        'nav-link',
+                        isActive && 'nav-link-active'
+                      )}
+                    >
+                      <item.icon className="w-5 h-5" />
+                      <span className="font-medium">{item.name}</span>
+                    </NavLink>
+                  );
+                })}
+              </div>
+            </div>
           </nav>
 
           {/* Administration Link */}
@@ -158,6 +252,9 @@ function AppContent() {
               <Route path="/indexing" element={<IndexingDashboard />} />
               <Route path="/entries" element={<EntryBrowser />} />
               <Route path="/entries/:id" element={<EntryDetail />} />
+              {/* Project Management Routes */}
+              <Route path="/projects" element={<ProjectList />} />
+              <Route path="/projects/:id" element={<ProjectDetail />} />
               {/* Backward compatibility redirects for old URLs */}
               <Route path="/patterns" element={<Navigate to="/entries" replace />} />
               <Route path="/patterns/:id" element={<PatternRedirect />} />

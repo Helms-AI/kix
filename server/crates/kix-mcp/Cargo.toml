@@ -11,6 +11,7 @@ kix-embeddings = { path = "../kix-embeddings" }
 kix-parser = { path = "../kix-parser" }
 kix-crawler = { path = "../kix-crawler" }
 kix-jobs = { path = "../kix-jobs" }
+kix-projects = { path = "../kix-projects" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -22,6 +23,8 @@ reqwest = { version = "0.12", features = ["json"] }
 url = "2.5"
 sha2 = "0.10"
 uuid = { version = "1.11", features = ["v4"] }
+chrono = { workspace = true }
+schemars = "1.2"
 
 [dev-dependencies]
 tempfile = "3"

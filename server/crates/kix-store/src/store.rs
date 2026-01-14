@@ -1,42 +1,787 @@
-//! Main Knowledge Indexer store implementation using LanceDB.
-
-use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
-    UInt32Array,
-};
-use arrow_schema::{ArrowError, DataType, Field, Schema};
-use lancedb::index::scalar::FtsIndexBuilder;
-use lancedb::index::vector::IvfHnswSqIndexBuilder;
-use lancedb::index::Index;
-use lancedb::{connect, Connection, Table};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tracing::{info, warn};
-
-use kix_parser::{Entry, EntryChunk};
+//! KIX Unified Store
+//!
+//! This module provides the `KixStore` which combines:
+//! - **SQLite** (via kix-sqlite) for structured data (entries, pages, projects, issues, tokens, jobs)
+//! - **SQLite + sqlite-vec** (via kix-vectors) for vector embeddings (chunks with vectors)
+//!
+//! ## Directory Structure
+//!
+//! ```text
+//! data/
+//! └── sqlite/
+//!     ├── kix.db          # Structured data (entries, pages, projects, etc.)
+//!     └── vectors.db      # Vector embeddings (chunks with vectors)
+//! ```
+//!
+//! ## Usage
+//!
+//! ```rust,ignore
+//! let store = KixStore::new(Path::new("data")).await?;
+//! store.init().await?;
+//!
+//! // Store entries in SQLite
+//! store.insert_entry(&entry).await?;
+//!
+//! // Store chunks with vectors in vectors.db
+//! store.insert_chunks(&chunks, &embeddings).await?;
+//!
+//! // Hybrid search combines FTS (SQLite) + vector search (sqlite-vec)
+//! let results = store.hybrid_search("query", &embedding, 10, &filters).await?;
+//! ```
 
 use crate::error::StoreError;
-use crate::pages::{PageRecord, PageStore};
-use crate::schema::page_schema;
+use crate::search::{PatternSummary, SearchFilters, SearchResult};
+use kix_parser::{Entry, EntryChunk};
+use kix_sqlite::{
+    EntryRecord, IssueRecord, JobRecord, PageRecord, ProjectEntryRecord, ProjectRecord,
+    SqliteStore, TokenRecord,
+};
+use kix_vectors::{SearchFilter, VectorSearchResult, VectorStore};
+use std::collections::HashMap;
+use std::path::Path;
+use tracing::info;
 
 /// Default embedding dimensions (768 for bge-base-en-v1.5).
-/// Can be overridden via KIX_EMBEDDING_DIM environment variable.
-pub const DEFAULT_EMBEDDING_DIM: i32 = 768;
+pub const DEFAULT_EMBEDDING_DIM: usize = 768;
 
-/// Returns the configured embedding dimensions.
+/// Unified KIX store using SQLite for all storage.
 ///
-/// Reads from KIX_EMBEDDING_DIM environment variable, or uses default (768).
-/// Supported models:
-/// - bge-base-en-v1.5: 768 dimensions (default, recommended)
-/// - bge-small-en-v1.5: 384 dimensions
-/// - bge-large-en-v1.5: 1024 dimensions
-/// - all-MiniLM-L6-v2: 384 dimensions (legacy)
-pub fn get_embedding_dim() -> i32 {
+/// - Structured data (entries, pages, projects, etc.) stored in kix.db via kix-sqlite
+/// - Vector embeddings stored in vectors.db via kix-vectors (sqlite-vec)
+pub struct KixStore {
+    /// SQLite store for structured data (kix.db)
+    pub sqlite: SqliteStore,
+    /// Vector store for embeddings (vectors.db)
+    pub vectors: VectorStore,
+    /// Embedding dimensions
+    embedding_dim: usize,
+}
+
+impl KixStore {
+    /// Create a new KIX store at the given data directory.
+    ///
+    /// Creates the directory structure:
+    /// - `data_dir/sqlite/kix.db` - Structured data
+    /// - `data_dir/sqlite/vectors.db` - Vector embeddings
+    pub async fn new(data_dir: &Path) -> Result<Self, StoreError> {
+        Self::new_with_dim(data_dir, get_embedding_dim()).await
+    }
+
+    /// Create a new KIX store with specified embedding dimensions.
+    pub async fn new_with_dim(data_dir: &Path, embedding_dim: usize) -> Result<Self, StoreError> {
+        // Create directory
+        let sqlite_dir = data_dir.join("sqlite");
+
+        std::fs::create_dir_all(&sqlite_dir)
+            .map_err(|e| StoreError::Database(format!("Failed to create sqlite dir: {}", e)))?;
+
+        let sqlite_path = sqlite_dir.join("kix.db");
+        let vectors_path = sqlite_dir.join("vectors.db");
+
+        info!(
+            "Creating unified store: SQLite={}, Vectors={} (embedding_dim={})",
+            sqlite_path.display(),
+            vectors_path.display(),
+            embedding_dim
+        );
+
+        // Initialize SQLite (async)
+        let sqlite = SqliteStore::new(&sqlite_path).await.map_err(|e| {
+            StoreError::Database(format!("Failed to create SQLite store: {}", e))
+        })?;
+
+        // Initialize VectorStore (sync, but fast)
+        let vectors = VectorStore::new(&vectors_path, embedding_dim).map_err(|e| {
+            StoreError::Database(format!("Failed to create Vector store: {}", e))
+        })?;
+
+        Ok(Self {
+            sqlite,
+            vectors,
+            embedding_dim,
+        })
+    }
+
+    /// Initialize all tables (called automatically by new()).
+    pub async fn init(&mut self) -> Result<(), StoreError> {
+        // Both stores auto-initialize tables on creation
+        info!("KIX store initialized (unified SQLite architecture)");
+        Ok(())
+    }
+
+    /// Compatibility alias for init() - kept for backward compatibility.
+    pub async fn init_tables(&mut self) -> Result<(), StoreError> {
+        self.init().await
+    }
+
+    /// Returns the embedding dimensions for this store.
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
+    /// Get reference to SQLite store.
+    pub fn sqlite(&self) -> &SqliteStore {
+        &self.sqlite
+    }
+
+    /// Get reference to Vector store.
+    pub fn vectors(&self) -> &VectorStore {
+        &self.vectors
+    }
+
+    /// Get reference to page store (for backward compatibility, returns self since pages are in SQLite).
+    pub fn page_store(&self) -> &Self {
+        self
+    }
+
+    // =========================================================================
+    // Entry Operations (SQLite)
+    // =========================================================================
+
+    /// Insert an entry into SQLite.
+    pub async fn insert_entry(&self, entry: &EntryRecord) -> Result<(), StoreError> {
+        self.sqlite
+            .insert_entry(entry)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get an entry by ID from SQLite.
+    pub async fn get_entry(&self, id: &str) -> Result<Option<EntryRecord>, StoreError> {
+        self.sqlite
+            .get_entry(id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Delete an entry from SQLite (also deletes associated chunks).
+    pub async fn delete_entry(&self, id: &str) -> Result<bool, StoreError> {
+        // Delete chunks from vector store first
+        let _ = self.vectors.delete_chunks_by_entry(id);
+
+        self.sqlite
+            .delete_entry(id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// List entries from SQLite.
+    pub async fn list_entries(
+        &self,
+        entry_type: Option<&str>,
+        source_domain: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<EntryRecord>, StoreError> {
+        self.sqlite
+            .list_entries(entry_type, source_domain, limit, offset)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get entry count from SQLite.
+    pub async fn entry_count(&self) -> Result<usize, StoreError> {
+        self.sqlite
+            .entry_count()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    // =========================================================================
+    // Document Operations (Backward Compatibility Aliases)
+    // =========================================================================
+
+    /// Check if a document/entry exists by ID.
+    pub async fn document_exists(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.get_entry(id).await?.is_some())
+    }
+
+    /// Insert multiple documents/entries.
+    pub async fn insert_documents(&self, entries: &[EntryRecord]) -> Result<(), StoreError> {
+        for entry in entries {
+            self.insert_entry(entry).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete a document/entry by ID (alias for delete_entry).
+    pub async fn delete_document(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_entry(id).await
+    }
+
+    /// Delete chunks by document ID (alias for delete_chunks_by_entry).
+    pub fn delete_chunks_by_document(&self, entry_id: &str) -> Result<usize, StoreError> {
+        self.delete_chunks_by_entry(entry_id)
+    }
+
+    /// Insert documents from kix_parser Entry type (with automatic conversion).
+    pub async fn insert_documents_from_entries(&self, entries: &[Entry]) -> Result<(), StoreError> {
+        for entry in entries {
+            let record = entry_to_record(entry);
+            self.insert_entry(&record).await?;
+        }
+        Ok(())
+    }
+
+    // =========================================================================
+    // Page Operations (SQLite)
+    // =========================================================================
+
+    /// Insert a page into SQLite.
+    pub async fn insert_page(&self, page: &PageRecord) -> Result<(), StoreError> {
+        self.sqlite
+            .insert_page(page)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get a page by ID from SQLite.
+    pub async fn get_page(&self, page_id: &str) -> Result<Option<PageRecord>, StoreError> {
+        self.sqlite
+            .get_page(page_id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get page count from SQLite.
+    pub async fn page_count(&self) -> Result<usize, StoreError> {
+        self.sqlite
+            .page_count()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Delete pages by source entry ID.
+    pub async fn delete_pages_by_source(&self, source_id: &str) -> Result<usize, StoreError> {
+        self.sqlite
+            .delete_pages_by_source(source_id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    // =========================================================================
+    // Chunk Operations (VectorStore)
+    // =========================================================================
+
+    /// Insert chunks with embeddings into the vector store.
+    pub fn insert_chunks(
+        &self,
+        chunks: &[EntryChunk],
+        embeddings: &[Vec<f32>],
+    ) -> Result<(), StoreError> {
+        self.vectors
+            .insert_chunks(chunks, embeddings)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Delete chunks by entry ID from vector store.
+    pub fn delete_chunks_by_entry(&self, entry_id: &str) -> Result<usize, StoreError> {
+        self.vectors
+            .delete_chunks_by_entry(entry_id)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get chunk count from vector store.
+    pub fn chunk_count(&self) -> Result<usize, StoreError> {
+        self.vectors
+            .chunk_count()
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    // =========================================================================
+    // Two-Layer Storage
+    // =========================================================================
+
+    /// Store a page (SQLite) and its chunks (VectorStore) together.
+    pub async fn store_page_with_chunks(
+        &self,
+        page: &PageRecord,
+        chunks: &[EntryChunk],
+        embeddings: &[Vec<f32>],
+    ) -> Result<(), StoreError> {
+        // Store page in SQLite
+        self.insert_page(page).await?;
+
+        // Store chunks in VectorStore
+        self.insert_chunks(chunks, embeddings)?;
+
+        info!(
+            "Stored page {} (SQLite) with {} chunks (VectorStore)",
+            page.page_id,
+            chunks.len()
+        );
+        Ok(())
+    }
+
+    /// Get page for a chunk (RAG context retrieval).
+    pub async fn get_page_for_chunk(&self, page_id: &str) -> Result<Option<PageRecord>, StoreError> {
+        self.get_page(page_id).await
+    }
+
+    // =========================================================================
+    // Hybrid Search
+    // =========================================================================
+
+    /// Perform hybrid search combining vector search and FTS.
+    ///
+    /// Uses Reciprocal Rank Fusion to combine results from both sources.
+    pub async fn hybrid_search(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        filters: &SearchFilters,
+    ) -> Result<Vec<SearchResult>, StoreError> {
+        // 1. Vector search in VectorStore
+        let vec_filter = filters_to_vec_filter(filters);
+        let vector_results = self
+            .vectors
+            .vector_search(query_embedding, limit * 2, vec_filter.as_ref())
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // 2. FTS search in SQLite
+        let fts_results = self
+            .sqlite
+            .search_entries(query_text, limit * 2)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // 3. Combine using Reciprocal Rank Fusion
+        let combined = reciprocal_rank_fusion(&vector_results, &fts_results, limit);
+
+        Ok(combined)
+    }
+
+    /// Perform vector-only search.
+    pub fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        filters: &SearchFilters,
+    ) -> Result<Vec<SearchResult>, StoreError> {
+        let vec_filter = filters_to_vec_filter(filters);
+        let results = self
+            .vectors
+            .vector_search(query_embedding, limit, vec_filter.as_ref())
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(vec_results_to_search_results(&results))
+    }
+
+    // =========================================================================
+    // Project Operations (SQLite)
+    // =========================================================================
+
+    /// Insert a project.
+    pub async fn insert_project(&self, project: &ProjectRecord) -> Result<(), StoreError> {
+        self.sqlite
+            .insert_project(project)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get a project by ID.
+    pub async fn get_project(&self, id: &str) -> Result<Option<ProjectRecord>, StoreError> {
+        self.sqlite
+            .get_project(id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// List all projects.
+    pub async fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectRecord>, StoreError> {
+        self.sqlite
+            .list_projects(include_archived)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Update a project.
+    pub async fn update_project(&self, project: &ProjectRecord) -> Result<bool, StoreError> {
+        self.sqlite
+            .update_project(project)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Delete a project.
+    pub async fn delete_project(&self, id: &str) -> Result<bool, StoreError> {
+        self.sqlite
+            .delete_project(id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get a project by slug.
+    pub async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectRecord>, StoreError> {
+        self.sqlite
+            .get_project_by_slug(slug)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    // =========================================================================
+    // Issue Operations (SQLite)
+    // =========================================================================
+
+    /// Insert an issue.
+    pub async fn insert_issue(&self, issue: &IssueRecord) -> Result<(), StoreError> {
+        self.sqlite
+            .insert_issue(issue)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get an issue by ID.
+    pub async fn get_issue(&self, id: &str) -> Result<Option<IssueRecord>, StoreError> {
+        self.sqlite
+            .get_issue(id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// List issues for a project.
+    pub async fn list_issues(
+        &self,
+        project_id: &str,
+        state: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IssueRecord>, StoreError> {
+        self.sqlite
+            .list_issues(project_id, state, limit, offset)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Update an issue.
+    pub async fn update_issue(&self, issue: &IssueRecord) -> Result<bool, StoreError> {
+        self.sqlite
+            .update_issue(issue)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Delete an issue.
+    pub async fn delete_issue(&self, id: &str) -> Result<bool, StoreError> {
+        self.sqlite
+            .delete_issue(id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get an issue by number within a project.
+    pub async fn get_issue_by_number(
+        &self,
+        project_id: &str,
+        number: u32,
+    ) -> Result<Option<IssueRecord>, StoreError> {
+        self.sqlite
+            .get_issue_by_number(project_id, number)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get the next issue number for a project.
+    pub async fn next_issue_number(&self, project_id: &str) -> Result<u32, StoreError> {
+        self.sqlite
+            .next_issue_number(project_id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Count issues for a project.
+    pub async fn issue_count(&self, project_id: &str) -> Result<usize, StoreError> {
+        self.sqlite
+            .issue_count(project_id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    // =========================================================================
+    // Token Operations (SQLite)
+    // =========================================================================
+
+    /// Store a token.
+    pub async fn store_token(&self, token: &TokenRecord) -> Result<(), StoreError> {
+        self.sqlite
+            .store_token(token)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get a token by scope.
+    pub async fn get_token(&self, scope: &str) -> Result<Option<TokenRecord>, StoreError> {
+        self.sqlite
+            .get_token(scope)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    // =========================================================================
+    // Job Operations (SQLite)
+    // =========================================================================
+
+    /// Insert a job record.
+    pub async fn insert_job(&self, job: &JobRecord) -> Result<(), StoreError> {
+        self.sqlite
+            .insert_job(job)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get a job by ID.
+    pub async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StoreError> {
+        self.sqlite
+            .get_job(job_id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// List jobs.
+    pub async fn list_jobs(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<JobRecord>, StoreError> {
+        self.sqlite
+            .list_jobs(status, limit, offset)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    // =========================================================================
+    // Project Entry Links (SQLite)
+    // =========================================================================
+
+    /// Link an entry to a project.
+    pub async fn link_entry_to_project(
+        &self,
+        project_id: &str,
+        entry_id: &str,
+        relevance: Option<f64>,
+        notes: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let link = ProjectEntryRecord::new(project_id, entry_id)
+            .with_relevance(relevance.unwrap_or(1.0))
+            .with_notes(notes.unwrap_or(""));
+        self.sqlite
+            .link_entry(&link)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Unlink an entry from a project.
+    pub async fn unlink_entry_from_project(
+        &self,
+        project_id: &str,
+        entry_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.sqlite
+            .unlink_entry(project_id, entry_id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// List entries linked to a project.
+    pub async fn list_project_entries(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProjectEntryRecord>, StoreError> {
+        self.sqlite
+            .list_project_entries(project_id)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    // =========================================================================
+    // Utility Methods
+    // =========================================================================
+
+    /// Alias for entry_count (backward compatibility).
+    pub async fn document_count(&self) -> Result<usize, StoreError> {
+        self.entry_count().await
+    }
+
+    /// Clear all data from the store (use with caution!).
+    pub async fn clear_all(&self) -> Result<(), StoreError> {
+        // Clear SQLite tables
+        self.sqlite
+            .clear_all()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // Clear vector store
+        self.vectors
+            .clear_all()
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        info!("Cleared all data from KIX store");
+        Ok(())
+    }
+
+    // =========================================================================
+    // Backward Compatibility Aliases
+    // =========================================================================
+
+    /// Get entry by ID (alias for get_entry).
+    pub async fn get_entry_by_id(&self, id: &str) -> Result<Option<EntryRecord>, StoreError> {
+        self.get_entry(id).await
+    }
+
+    /// Get entry by ID (alias for get_entry, for "pattern" naming convention).
+    pub async fn get_pattern_by_id(&self, id: &str) -> Result<Option<PatternSummary>, StoreError> {
+        self.get_entry(id).await.map(|opt| opt.map(PatternSummary::from))
+    }
+
+    /// Check if an entry exists (alias for document_exists).
+    pub async fn entry_exists(&self, id: &str) -> Result<bool, StoreError> {
+        self.document_exists(id).await
+    }
+
+    /// List all entries (alias for list_entries with large limit).
+    pub async fn list_all_entries(&self) -> Result<Vec<EntryRecord>, StoreError> {
+        self.list_entries(None, None, 100000, 0).await
+    }
+
+    /// List all patterns (alias for list_entries with large limit).
+    pub async fn list_all_patterns(&self) -> Result<Vec<PatternSummary>, StoreError> {
+        let entries = self.list_entries(None, None, 100000, 0).await?;
+        Ok(entries.into_iter().map(PatternSummary::from).collect())
+    }
+
+    /// List patterns by category (uses entry_type as category proxy).
+    pub async fn list_by_category(&self, category: &str) -> Result<Vec<PatternSummary>, StoreError> {
+        // Category maps to entry_type for filtering
+        let entries = self.list_entries(Some(category), None, 100000, 0).await?;
+        Ok(entries.into_iter().map(PatternSummary::from).collect())
+    }
+
+    /// List patterns by entry type.
+    pub async fn list_by_pattern_type(&self, entry_type: &str) -> Result<Vec<PatternSummary>, StoreError> {
+        let entries = self.list_entries(Some(entry_type), None, 100000, 0).await?;
+        Ok(entries.into_iter().map(PatternSummary::from).collect())
+    }
+
+    /// Get chunks by entry ID from vector store (returns chunk metadata).
+    pub fn get_chunks_by_entry_id(&self, entry_id: &str) -> Result<Vec<VectorSearchResult>, StoreError> {
+        self.vectors
+            .get_chunks_by_entry(entry_id)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+}
+
+/// Convert SearchFilters to VectorStore SearchFilter.
+fn filters_to_vec_filter(filters: &SearchFilters) -> Option<SearchFilter> {
+    if filters.entry_type.is_none()
+        && filters.chunk_type.is_none()
+        && filters.source_domain.is_none()
+        && filters.tag.is_none()
+    {
+        return None;
+    }
+
+    let mut filter = SearchFilter::new();
+    if let Some(ref et) = filters.entry_type {
+        filter = filter.with_entry_type(et.clone());
+    }
+    if let Some(ref ct) = filters.chunk_type {
+        filter = filter.with_chunk_type(ct.clone());
+    }
+    if let Some(ref sd) = filters.source_domain {
+        filter = filter.with_source_domain(sd.clone());
+    }
+    if let Some(ref t) = filters.tag {
+        filter = filter.with_tag(t.clone());
+    }
+    Some(filter)
+}
+
+/// Convert VectorSearchResults to SearchResults.
+fn vec_results_to_search_results(vec_results: &[VectorSearchResult]) -> Vec<SearchResult> {
+    vec_results
+        .iter()
+        .map(|r| SearchResult {
+            chunk_id: r.chunk_id.clone(),
+            entry_id: r.entry_id.clone(),
+            page_id: r.page_id.clone(),
+            entry_title: r.entry_title.clone(),
+            text: r.text.clone(),
+            score: r.score,
+            entry_type: r.entry_type.clone(),
+            tags: r.tags.clone(),
+            chunk_type: Some(r.chunk_type.clone()),
+            source_domain: r.source_domain.clone(),
+        })
+        .collect()
+}
+
+/// Reciprocal Rank Fusion to combine vector and FTS results.
+fn reciprocal_rank_fusion(
+    vector_results: &[VectorSearchResult],
+    fts_results: &[kix_sqlite::search::FtsResult],
+    limit: usize,
+) -> Vec<SearchResult> {
+    const K: f32 = 60.0; // RRF constant
+
+    let mut scores: HashMap<String, f32> = HashMap::new();
+    let mut result_data: HashMap<String, SearchResult> = HashMap::new();
+
+    // Add vector search scores
+    for (rank, result) in vector_results.iter().enumerate() {
+        let rrf_score = 1.0 / (K + rank as f32);
+        *scores.entry(result.chunk_id.clone()).or_insert(0.0) += rrf_score;
+        result_data.entry(result.chunk_id.clone()).or_insert_with(|| {
+            SearchResult {
+                chunk_id: result.chunk_id.clone(),
+                entry_id: result.entry_id.clone(),
+                page_id: result.page_id.clone(),
+                entry_title: result.entry_title.clone(),
+                text: result.text.clone(),
+                score: result.score,
+                entry_type: result.entry_type.clone(),
+                tags: result.tags.clone(),
+                chunk_type: Some(result.chunk_type.clone()),
+                source_domain: result.source_domain.clone(),
+            }
+        });
+    }
+
+    // Add FTS scores (FTS results are entry-level, we boost chunks from those entries)
+    for (rank, fts_result) in fts_results.iter().enumerate() {
+        let rrf_score = 1.0 / (K + rank as f32);
+        // Find chunks belonging to this entry and boost them
+        for result in vector_results.iter() {
+            if result.entry_id == fts_result.id {
+                *scores.entry(result.chunk_id.clone()).or_insert(0.0) += rrf_score;
+            }
+        }
+    }
+
+    // Sort by combined score
+    let mut scored: Vec<_> = scores.into_iter().collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Return top results with updated scores
+    scored
+        .into_iter()
+        .take(limit)
+        .filter_map(|(id, score)| {
+            result_data.remove(&id).map(|mut r| {
+                r.score = score;
+                r
+            })
+        })
+        .collect()
+}
+
+/// Returns the configured embedding dimensions from environment.
+pub fn get_embedding_dim() -> usize {
     std::env::var("KIX_EMBEDDING_DIM")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
-            // Auto-detect from model name if set
             if let Ok(model) = std::env::var("KIX_EMBEDDING_MODEL") {
                 match model.to_lowercase().as_str() {
                     s if s.contains("large") => 1024,
@@ -50,727 +795,115 @@ pub fn get_embedding_dim() -> i32 {
         })
 }
 
-/// The main Knowledge Indexer store for entry and chunk storage.
-pub struct KixStore {
-    db: Connection,
-    entries_table: Option<Table>,
-    chunks_table: Option<Table>,
-    /// Pages table for two-layer storage (RAG context retrieval)
-    pages_table: Option<Table>,
-    /// Flag to track if indexes have been created
-    indexes_created: AtomicBool,
-    /// Embedding dimensions for this store
-    embedding_dim: i32,
+/// Convert a kix_parser Entry to kix_sqlite EntryRecord.
+fn entry_to_record(entry: &Entry) -> EntryRecord {
+    let tags_json = if entry.tags.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&entry.tags).ok()
+    };
+
+    let collection_ids_json = if entry.collection_ids.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&entry.collection_ids).ok()
+    };
+
+    // Extract source_domain from source_path if it's a URL
+    let source_domain = if entry.source_path.starts_with("http") {
+        url::Url::parse(&entry.source_path)
+            .ok()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+    } else {
+        None
+    };
+
+    EntryRecord {
+        id: entry.id.clone(),
+        title: entry.title.clone(),
+        description: if entry.description.is_empty() { None } else { Some(entry.description.clone()) },
+        content: if entry.content.is_empty() { None } else { Some(entry.content.clone()) },
+        tags: tags_json,
+        collection_ids: collection_ids_json,
+        entry_type: format!("{:?}", entry.entry_type).to_lowercase(),
+        source_type: format!("{:?}", entry.source_type).to_lowercase(),
+        source_path: entry.source_path.clone(),
+        source_domain,
+        source_hash: entry.source_hash.clone(),
+        slug: entry.slug.clone(),
+        created_at: entry.created_at.to_rfc3339(),
+        updated_at: entry.updated_at.to_rfc3339(),
+    }
 }
 
-impl KixStore {
-    /// Creates a new Knowledge Indexer store at the given path.
-    pub async fn new(db_path: &str) -> Result<Self, StoreError> {
-        Self::new_with_dim(db_path, get_embedding_dim()).await
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_kix_store_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = KixStore::new(temp_dir.path()).await.unwrap();
+        store.init().await.unwrap();
+
+        // Verify directory structure
+        assert!(temp_dir.path().join("sqlite/kix.db").exists());
+        assert!(temp_dir.path().join("sqlite/vectors.db").exists());
     }
 
-    /// Creates a new Knowledge Indexer store with specified embedding dimensions.
-    pub async fn new_with_dim(db_path: &str, embedding_dim: i32) -> Result<Self, StoreError> {
-        info!("Connecting to LanceDB at: {} (embedding_dim={})", db_path, embedding_dim);
-
-        let db = connect(db_path)
-            .execute()
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        Ok(Self {
-            db,
-            entries_table: None,
-            chunks_table: None,
-            pages_table: None,
-            indexes_created: AtomicBool::new(false),
-            embedding_dim,
-        })
-    }
-
-    /// Returns the embedding dimensions for this store.
-    pub fn embedding_dim(&self) -> i32 {
-        self.embedding_dim
-    }
-
-    /// Initializes tables, creating them if they don't exist.
-    pub async fn init_tables(&mut self) -> Result<(), StoreError> {
-        // Try to open existing tables or create new ones
-        self.entries_table = Some(self.get_or_create_entries_table().await?);
-        self.chunks_table = Some(self.get_or_create_chunks_table().await?);
-        self.pages_table = Some(self.get_or_create_pages_table().await?);
-
-        info!("Tables initialized successfully (entries, chunks, pages)");
-        Ok(())
-    }
-
-    /// Refresh all table handles to see the latest data.
-    ///
-    /// LanceDB uses immutable versioning - table handles opened at one point
-    /// don't automatically see data written by other processes. This method
-    /// calls `checkout_latest()` on all tables to refresh to the current version.
-    ///
-    /// Call this before searches if data may have been written by other processes
-    /// (e.g., by the JobExecutor or MCP server).
-    pub async fn refresh_tables(&self) -> Result<(), StoreError> {
-        if let Some(ref table) = self.entries_table {
-            table
-                .checkout_latest()
-                .await
-                .map_err(|e| StoreError::Database(format!("Failed to refresh entries table: {}", e)))?;
-        }
-        if let Some(ref table) = self.chunks_table {
-            table
-                .checkout_latest()
-                .await
-                .map_err(|e| StoreError::Database(format!("Failed to refresh chunks table: {}", e)))?;
-        }
-        if let Some(ref table) = self.pages_table {
-            table
-                .checkout_latest()
-                .await
-                .map_err(|e| StoreError::Database(format!("Failed to refresh pages table: {}", e)))?;
-        }
-        Ok(())
-    }
-
-    /// Gets or creates the entries table.
-    async fn get_or_create_entries_table(&self) -> Result<Table, StoreError> {
-        let table_names = self
-            .db
-            .table_names()
-            .execute()
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        if table_names.contains(&"entries".to_string()) {
-            info!("Opening existing entries table");
-            self.db
-                .open_table("entries")
-                .execute()
-                .await
-                .map_err(|e| StoreError::Database(e.to_string()))
-        } else {
-            info!("Creating new entries table");
-            let schema = Self::entries_schema();
-            self.db
-                .create_empty_table("entries", schema)
-                .execute()
-                .await
-                .map_err(|e| StoreError::Database(e.to_string()))
-        }
-    }
-
-    /// Gets or creates the chunks table.
-    ///
-    /// Includes schema migration: if the existing table is missing the `page_id` field
-    /// (added for two-layer storage), the table is dropped and recreated.
-    async fn get_or_create_chunks_table(&self) -> Result<Table, StoreError> {
-        let table_names = self
-            .db
-            .table_names()
-            .execute()
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        if table_names.contains(&"chunks".to_string()) {
-            info!("Opening existing chunks table");
-            let table = self.db
-                .open_table("chunks")
-                .execute()
-                .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
-
-            // Check if schema has page_id field (required for two-layer storage)
-            let schema = table.schema().await
-                .map_err(|e| StoreError::Database(format!("Failed to get chunks schema: {}", e)))?;
-
-            let has_page_id = schema.fields.iter().any(|f| f.name() == "page_id");
-
-            if !has_page_id {
-                warn!("Chunks table missing page_id field, migrating to new schema...");
-                // Drop old table and recreate with new schema
-                self.db
-                    .drop_table("chunks", &[])
-                    .await
-                    .map_err(|e| StoreError::Database(format!("Failed to drop old chunks table: {}", e)))?;
-
-                info!("Creating new chunks table with page_id field (embedding_dim={})", self.embedding_dim);
-                let schema = Self::chunks_schema_with_dim(self.embedding_dim);
-                return self.db
-                    .create_empty_table("chunks", schema)
-                    .execute()
-                    .await
-                    .map_err(|e| StoreError::Database(e.to_string()));
-            }
-
-            Ok(table)
-        } else {
-            info!("Creating new chunks table (embedding_dim={})", self.embedding_dim);
-            let schema = Self::chunks_schema_with_dim(self.embedding_dim);
-            self.db
-                .create_empty_table("chunks", schema)
-                .execute()
-                .await
-                .map_err(|e| StoreError::Database(e.to_string()))
-        }
-    }
-
-    /// Gets or creates the pages table (two-layer storage for RAG context).
-    async fn get_or_create_pages_table(&self) -> Result<Table, StoreError> {
-        let table_names = self
-            .db
-            .table_names()
-            .execute()
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        if table_names.contains(&"pages".to_string()) {
-            info!("Opening existing pages table");
-            self.db
-                .open_table("pages")
-                .execute()
-                .await
-                .map_err(|e| StoreError::Database(e.to_string()))
-        } else {
-            info!("Creating new pages table");
-            self.db
-                .create_empty_table("pages", page_schema())
-                .execute()
-                .await
-                .map_err(|e| StoreError::Database(e.to_string()))
-        }
-    }
-
-    /// Returns the schema for the entries table.
-    fn entries_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("title", DataType::Utf8, false),
-            Field::new("description", DataType::Utf8, true),
-            Field::new("content", DataType::Utf8, true),
-            Field::new("tags", DataType::Utf8, true),            // JSON array as string
-            Field::new("collection_ids", DataType::Utf8, true),  // JSON array as string
-            Field::new("entry_type", DataType::Utf8, false),
-            Field::new("source_type", DataType::Utf8, false),
-            Field::new("source_path", DataType::Utf8, false),
-            Field::new("slug", DataType::Utf8, false),
-            Field::new("source_hash", DataType::Utf8, false),
-            Field::new("created_at", DataType::Utf8, false),
-            Field::new("updated_at", DataType::Utf8, false),
-        ]))
-    }
-
-    /// Returns the schema for the chunks table with specified embedding dimensions.
-    fn chunks_schema_with_dim(embedding_dim: i32) -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("chunk_id", DataType::Utf8, false),
-            Field::new("entry_id", DataType::Utf8, false),
-            Field::new("page_id", DataType::Utf8, true),  // FK to pages table (two-layer storage)
-            Field::new("chunk_index", DataType::UInt32, false),
-            Field::new("chunk_type", DataType::Utf8, false),
-            Field::new("text", DataType::Utf8, false),
-            Field::new("entry_title", DataType::Utf8, false),
-            Field::new("entry_type", DataType::Utf8, false),
-            Field::new("tags", DataType::Utf8, true),  // JSON array as string
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    embedding_dim,
-                ),
-                false,
-            ),
-        ]))
-    }
-
-    /// Inserts entries into the store.
-    pub async fn insert_entries(&self, entries: &[Entry]) -> Result<(), StoreError> {
-        let table = self
-            .entries_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Entries table not initialized".to_string()))?;
-
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let batch = Self::entries_to_batch(entries)?;
-        let schema = batch.schema();
-        let batches: Vec<Result<RecordBatch, ArrowError>> = vec![Ok(batch)];
-        let reader = RecordBatchIterator::new(batches, schema);
-
-        table
-            .add(Box::new(reader))
-            .execute()
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        info!("Inserted {} entries", entries.len());
-        Ok(())
-    }
-
-    /// Converts entries to a RecordBatch.
-    fn entries_to_batch(entries: &[Entry]) -> Result<RecordBatch, StoreError> {
-        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
-        let descriptions: Vec<&str> = entries.iter().map(|e| e.description.as_str()).collect();
-        let contents: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
-        let tags: Vec<String> = entries
-            .iter()
-            .map(|e| serde_json::to_string(&e.tags).unwrap_or_default())
-            .collect();
-        let collection_ids: Vec<String> = entries
-            .iter()
-            .map(|e| serde_json::to_string(&e.collection_ids).unwrap_or_default())
-            .collect();
-        let entry_types: Vec<&str> = entries
-            .iter()
-            .map(|e| e.entry_type.as_str())
-            .collect();
-        let source_types: Vec<String> = entries
-            .iter()
-            .map(|e| e.source_type.to_string())
-            .collect();
-        let source_paths: Vec<&str> = entries.iter().map(|e| e.source_path.as_str()).collect();
-        let slugs: Vec<&str> = entries.iter().map(|e| e.slug.as_str()).collect();
-        let hashes: Vec<&str> = entries.iter().map(|e| e.source_hash.as_str()).collect();
-        let created_ats: Vec<String> = entries
-            .iter()
-            .map(|e| e.created_at.to_rfc3339())
-            .collect();
-        let updated_ats: Vec<String> = entries
-            .iter()
-            .map(|e| e.updated_at.to_rfc3339())
-            .collect();
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(ids)),
-            Arc::new(StringArray::from(titles)),
-            Arc::new(StringArray::from(descriptions)),
-            Arc::new(StringArray::from(contents)),
-            Arc::new(StringArray::from(tags.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(collection_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(entry_types)),
-            Arc::new(StringArray::from(source_types.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(source_paths)),
-            Arc::new(StringArray::from(slugs)),
-            Arc::new(StringArray::from(hashes)),
-            Arc::new(StringArray::from(created_ats.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(updated_ats.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
-        ];
-
-        RecordBatch::try_new(Self::entries_schema(), columns)
-            .map_err(|e| StoreError::Serialization(e.to_string()))
-    }
-
-    /// Inserts chunks with embeddings into the store.
-    pub async fn insert_chunks(
-        &self,
-        chunks: &[EntryChunk],
-        embeddings: &[Vec<f32>],
-    ) -> Result<(), StoreError> {
-        let table = self
-            .chunks_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Chunks table not initialized".to_string()))?;
-
-        if chunks.is_empty() || embeddings.is_empty() {
-            return Ok(());
-        }
-
-        if chunks.len() != embeddings.len() {
-            return Err(StoreError::Serialization(format!(
-                "Chunks ({}) and embeddings ({}) count mismatch",
-                chunks.len(),
-                embeddings.len()
-            )));
-        }
-
-        let batch = Self::chunks_to_batch(chunks, embeddings, self.embedding_dim)?;
-        let schema = batch.schema();
-        let batches: Vec<Result<RecordBatch, ArrowError>> = vec![Ok(batch)];
-        let reader = RecordBatchIterator::new(batches, schema);
-
-        table
-            .add(Box::new(reader))
-            .execute()
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        info!("Inserted {} chunks with embeddings", chunks.len());
-
-        // Create indexes on first insertion
-        self.ensure_indexes().await;
-
-        Ok(())
-    }
-
-    /// Ensures indexes are created (called after first data insertion).
-    async fn ensure_indexes(&self) {
-        // Use compare_exchange to ensure only one thread creates indexes
-        if self
-            .indexes_created
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            info!("Creating indexes on first data insertion...");
-            if let Err(e) = self.create_indexes().await {
-                warn!("Index creation had issues: {}", e);
-                // Reset flag so we try again next time
-                self.indexes_created.store(false, Ordering::SeqCst);
-            }
-        }
-    }
-
-    /// Converts chunks and embeddings to a RecordBatch.
-    fn chunks_to_batch(
-        chunks: &[EntryChunk],
-        embeddings: &[Vec<f32>],
-        embedding_dim: i32,
-    ) -> Result<RecordBatch, StoreError> {
-        let chunk_ids: Vec<&str> = chunks.iter().map(|c| c.chunk_id.as_str()).collect();
-        let entry_ids: Vec<&str> = chunks.iter().map(|c| c.entry_id.as_str()).collect();
-        let page_ids: Vec<Option<&str>> = chunks
-            .iter()
-            .map(|c| c.page_id.as_deref())
-            .collect();
-        let indices: Vec<u32> = chunks.iter().map(|c| c.chunk_index).collect();
-        let chunk_types: Vec<&str> = chunks.iter().map(|c| c.chunk_type.as_str()).collect();
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let entry_titles: Vec<&str> = chunks
-            .iter()
-            .map(|c| c.metadata.entry_title.as_str())
-            .collect();
-        let entry_types: Vec<&str> = chunks
-            .iter()
-            .map(|c| c.metadata.entry_type.as_str())
-            .collect();
-        let tags: Vec<String> = chunks
-            .iter()
-            .map(|c| serde_json::to_string(&c.metadata.tags).unwrap_or_default())
-            .collect();
-
-        // Create fixed size list array for vectors
-        let flat_vectors: Vec<f32> = embeddings.iter().flatten().copied().collect();
-        let values = Arc::new(Float32Array::from(flat_vectors)) as ArrayRef;
-        let field = Arc::new(Field::new("item", DataType::Float32, true));
-        let vector_array = FixedSizeListArray::try_new(field, embedding_dim, values, None)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(chunk_ids)),
-            Arc::new(StringArray::from(entry_ids)),
-            Arc::new(StringArray::from(page_ids)),
-            Arc::new(UInt32Array::from(indices)),
-            Arc::new(StringArray::from(chunk_types)),
-            Arc::new(StringArray::from(texts)),
-            Arc::new(StringArray::from(entry_titles)),
-            Arc::new(StringArray::from(entry_types)),
-            Arc::new(StringArray::from(tags.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
-            Arc::new(vector_array),
-        ];
-
-        RecordBatch::try_new(Self::chunks_schema_with_dim(embedding_dim), columns)
-            .map_err(|e| StoreError::Serialization(e.to_string()))
-    }
-
-    /// Creates indexes for efficient search.
-    /// Uses IVF-HNSW-SQ index for better performance than default IVF-PQ.
-    pub async fn create_indexes(&self) -> Result<(), StoreError> {
-        let chunks_table = self
-            .chunks_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Chunks table not initialized".to_string()))?;
-
-        // Get row count to determine optimal index parameters
-        let row_count = chunks_table
-            .count_rows(None)
-            .await
-            .unwrap_or(1000);
-
-        // Create optimized vector index using IVF-HNSW-SQ
-        // - IVF partitions data for faster search on large datasets
-        // - HNSW provides high recall with low latency
-        // - SQ (Scalar Quantization) reduces memory while maintaining accuracy
-        info!("Creating optimized IVF-HNSW-SQ vector index on chunks table...");
-
-        // Calculate optimal number of IVF partitions based on dataset size
-        // Rule of thumb: sqrt(n) partitions, but at least 8 and at most 1024
-        let num_partitions = ((row_count as f64).sqrt() as u32).clamp(8, 1024);
-
-        let index_builder = IvfHnswSqIndexBuilder::default()
-            // Number of IVF partitions - more = faster search, fewer = better recall
-            .num_partitions(num_partitions)
-            // HNSW parameters for the graph within each partition
-            // num_edges = max connections per node (higher = better recall, more memory)
-            .num_edges(32)
-            // ef_construction = search width during build (higher = better quality, slower build)
-            .ef_construction(200);
-
-        match chunks_table
-            .create_index(&["vector"], Index::IvfHnswSq(index_builder))
-            .execute()
-            .await
-        {
-            Ok(_) => info!(
-                "IVF-HNSW-SQ vector index created successfully (partitions: {}, m: 32, ef_construction: 200)",
-                num_partitions
-            ),
-            Err(e) => warn!("Vector index creation skipped or failed: {}", e),
-        }
-
-        // Create FTS index on text
-        info!("Creating FTS index on text column...");
-        match chunks_table
-            .create_index(&["text"], Index::FTS(FtsIndexBuilder::default()))
-            .execute()
-            .await
-        {
-            Ok(_) => info!("FTS index created successfully"),
-            Err(e) => warn!("FTS index creation skipped or failed: {}", e),
-        }
-
-        // Create FTS index on entry_title
-        info!("Creating FTS index on entry_title column...");
-        match chunks_table
-            .create_index(&["entry_title"], Index::FTS(FtsIndexBuilder::default()))
-            .execute()
-            .await
-        {
-            Ok(_) => info!("Entry title FTS index created successfully"),
-            Err(e) => warn!("Entry title FTS index creation skipped or failed: {}", e),
-        }
-
-        Ok(())
-    }
-
-    /// Clears all data from the tables.
-    pub async fn clear_tables(&mut self) -> Result<(), StoreError> {
-        info!("Clearing all tables...");
-
-        // Drop and recreate tables
-        let table_names = self
-            .db
-            .table_names()
-            .execute()
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        for name in ["entries", "chunks", "pages"] {
-            if table_names.contains(&name.to_string()) {
-                self.db
-                    .drop_table(name, &[])
-                    .await
-                    .map_err(|e| StoreError::Database(e.to_string()))?;
-            }
-        }
-
-        // Reinitialize tables
-        self.init_tables().await?;
-
-        info!("Tables cleared successfully");
-        Ok(())
-    }
-
-    /// Returns the entries table reference.
-    pub fn entries_table(&self) -> Option<&Table> {
-        self.entries_table.as_ref()
-    }
-
-    /// Returns the chunks table reference.
-    pub fn chunks_table(&self) -> Option<&Table> {
-        self.chunks_table.as_ref()
-    }
-
-    /// Returns the pages table reference (two-layer storage for RAG context).
-    pub fn pages_table(&self) -> Option<&Table> {
-        self.pages_table.as_ref()
-    }
-
-    /// Gets entry count.
-    pub async fn entry_count(&self) -> Result<usize, StoreError> {
-        let table = self
-            .entries_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Entries table not initialized".to_string()))?;
-
-        let count = table
-            .count_rows(None)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        Ok(count)
-    }
-
-    /// Gets chunk count.
-    pub async fn chunk_count(&self) -> Result<usize, StoreError> {
-        let table = self
-            .chunks_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Chunks table not initialized".to_string()))?;
-
-        let count = table
-            .count_rows(None)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        Ok(count)
-    }
-
-    /// Deletes an entry by ID.
-    pub async fn delete_entry(&self, id: &str) -> Result<(), StoreError> {
-        let table = self
-            .entries_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Entries table not initialized".to_string()))?;
-
-        let filter = format!("id = '{}'", id.replace('\'', "''"));
-        table
-            .delete(&filter)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        info!("Deleted entry: {}", id);
-        Ok(())
-    }
-
-    /// Deletes all chunks belonging to an entry.
-    pub async fn delete_chunks_by_entry(&self, entry_id: &str) -> Result<(), StoreError> {
-        let table = self
-            .chunks_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Chunks table not initialized".to_string()))?;
-
-        let filter = format!("entry_id = '{}'", entry_id.replace('\'', "''"));
-        table
-            .delete(&filter)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        info!("Deleted chunks for entry: {}", entry_id);
-        Ok(())
-    }
-
-    /// Checks if an entry exists by ID.
-    pub async fn entry_exists(&self, id: &str) -> Result<bool, StoreError> {
-        let table = self
-            .entries_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Entries table not initialized".to_string()))?;
-
-        let filter = format!("id = '{}'", id.replace('\'', "''"));
-        let count = table
-            .count_rows(Some(filter))
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        Ok(count > 0)
-    }
-
-    // ========================================================================
-    // Two-Layer Storage Methods
-    // ========================================================================
-
-    /// Stores a page and its associated chunks atomically.
-    ///
-    /// This is the primary method for two-layer storage pattern:
-    /// - Pages store full content for RAG context retrieval
-    /// - Chunks store smaller pieces with embeddings for vector search
-    pub async fn store_page_with_chunks(
-        &self,
-        page: &PageRecord,
-        chunks: &[EntryChunk],
-        embeddings: &[Vec<f32>],
-    ) -> Result<(), StoreError> {
-        // Store page first
-        let pages_table = self
-            .pages_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Pages table not initialized".to_string()))?;
-
-        let page_store = PageStore::new(pages_table.clone());
-        page_store.insert_pages(&[page.clone()]).await?;
-
-        // Store chunks with page_id reference
-        self.insert_chunks(chunks, embeddings).await?;
-
-        info!(
-            "Stored page {} with {} chunks",
-            page.page_id,
-            chunks.len()
+    #[tokio::test]
+    async fn test_entry_operations() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = KixStore::new(temp_dir.path()).await.unwrap();
+        store.init().await.unwrap();
+
+        // Insert entry
+        let entry = EntryRecord::new(
+            "test-1",
+            "Test Entry",
+            "document",
+            "url",
+            "https://example.com",
+            "hash123",
         );
-        Ok(())
+        store.insert_entry(&entry).await.unwrap();
+
+        // Retrieve entry
+        let retrieved = store.get_entry("test-1").await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().title, "Test Entry");
+
+        // Count
+        assert_eq!(store.entry_count().await.unwrap(), 1);
     }
 
-    /// Retrieves the full page context for a given chunk.
-    ///
-    /// Used for RAG context retrieval - when a vector search finds a relevant
-    /// chunk, use this to get the full page content for better context.
-    pub async fn get_page_for_chunk(&self, page_id: &str) -> Result<Option<PageRecord>, StoreError> {
-        let pages_table = self
-            .pages_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Pages table not initialized".to_string()))?;
+    #[tokio::test]
+    async fn test_page_operations() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut store = KixStore::new(temp_dir.path()).await.unwrap();
+        store.init().await.unwrap();
 
-        let page_store = PageStore::new(pages_table.clone());
-        page_store.get_page(page_id).await
-    }
+        // Create entry first
+        let entry = EntryRecord::new(
+            "entry-1",
+            "Entry",
+            "document",
+            "url",
+            "https://example.com",
+            "hash",
+        );
+        store.insert_entry(&entry).await.unwrap();
 
-    /// Gets the PageStore for direct page operations.
-    pub fn page_store(&self) -> Result<PageStore, StoreError> {
-        let pages_table = self
-            .pages_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Pages table not initialized".to_string()))?;
+        // Insert page
+        let page = PageRecord::new("entry-1", "https://example.com/page", "# Content");
+        store.insert_page(&page).await.unwrap();
 
-        Ok(PageStore::new(pages_table.clone()))
-    }
+        // Retrieve page
+        let retrieved = store.get_page(&page.page_id).await.unwrap();
+        assert!(retrieved.is_some());
 
-    /// Gets page count.
-    pub async fn page_count(&self) -> Result<usize, StoreError> {
-        let table = self
-            .pages_table
-            .as_ref()
-            .ok_or_else(|| StoreError::Database("Pages table not initialized".to_string()))?;
-
-        table
-            .count_rows(None)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))
-    }
-
-    // Backward compatibility aliases
-    /// Alias for insert_entries (backward compatibility).
-    pub async fn insert_documents(&self, entries: &[Entry]) -> Result<(), StoreError> {
-        self.insert_entries(entries).await
-    }
-
-    /// Alias for entries_table (backward compatibility).
-    pub fn documents_table(&self) -> Option<&Table> {
-        self.entries_table()
-    }
-
-    /// Alias for entry_count (backward compatibility).
-    pub async fn document_count(&self) -> Result<usize, StoreError> {
-        self.entry_count().await
-    }
-
-    /// Alias for delete_entry (backward compatibility).
-    pub async fn delete_document(&self, id: &str) -> Result<(), StoreError> {
-        self.delete_entry(id).await
-    }
-
-    /// Alias for delete_chunks_by_entry (backward compatibility).
-    pub async fn delete_chunks_by_document(&self, entry_id: &str) -> Result<(), StoreError> {
-        self.delete_chunks_by_entry(entry_id).await
-    }
-
-    /// Alias for entry_exists (backward compatibility).
-    pub async fn document_exists(&self, id: &str) -> Result<bool, StoreError> {
-        self.entry_exists(id).await
+        // Count
+        assert_eq!(store.page_count().await.unwrap(), 1);
     }
 }
-
-/// Backward compatibility alias for KixStore.
-pub type EipStore = KixStore;

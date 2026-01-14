@@ -60,19 +60,21 @@ cargo build --release --features onnx-coreml --manifest-path server/Cargo.toml
 
 ## Architecture
 
-### Rust Workspace (9 crates)
+### Rust Workspace (11 crates)
 
 ```
 server/crates/
 ├── kix-cli/         # Main CLI binary - orchestrates all other crates
 ├── kix-parser/      # Document parsing, smart chunking, code validation
 ├── kix-embeddings/  # Embedding generation (fastembed) with contextual support
-├── kix-store/       # LanceDB two-layer storage (pages + chunks)
-├── kix-mcp-server/  # MCP server with search/indexing tools (rmcp crate)
+├── kix-store/       # LanceDB two-layer storage (pages + chunks + projects)
+├── kix-mcp/         # MCP server with search/indexing/project tools (rmcp crate)
 ├── kix-api/         # Axum REST API for dashboard
 ├── kix-crawler/     # URL discovery, crawling strategies, code extraction
 ├── kix-jobs/        # Job queue, executor, and content processor
-└── kix-sse/         # Server-Sent Events for real-time progress updates
+├── kix-sse/         # Server-Sent Events for real-time progress updates
+├── kix-projects/    # AI-powered project management with GitHub integration
+└── kix-auth/        # OAuth 2.1 authentication for MCP server
 ```
 
 ### kix-crawler Submodules
@@ -110,8 +112,27 @@ kix-parser/
 kix-store/
 ├── store.rs          # KixStore with init_tables(), store_page_with_chunks()
 ├── pages.rs          # PageStore for full page content (RAG context)
+├── projects.rs       # ProjectStore for project/issue/link storage
 ├── search.rs         # Hybrid search (vector + full-text)
-└── schema.rs         # LanceDB schemas for entries, chunks, pages
+└── schema.rs         # LanceDB schemas for entries, chunks, pages, projects
+```
+
+### kix-projects Module
+
+```
+kix-projects/
+├── project.rs        # Project data model and configuration
+├── issue.rs          # Issue data model and CRUD
+├── knowledge.rs      # Project-entry linking
+├── templates.rs      # GitHub Project V2 templates (Kanban, Sprint, etc.)
+├── planning.rs       # AI planning data structures
+├── search.rs         # Project-scoped search (issues + knowledge)
+├── events.rs         # Real-time event bus (MCP → UI)
+└── github/
+    ├── rest_client.rs    # GitHub REST API (issues)
+    ├── graphql_client.rs # GitHub GraphQL API (Projects V2)
+    ├── sync.rs           # Issue sync service
+    └── tokens.rs         # Secure token storage (AES-256-GCM)
 ```
 
 ### Key Dependencies
@@ -188,9 +209,14 @@ KIX uses intelligent chunking optimized for documentation and code content:
 | finalization | 95-100% | Cleanup and completion |
 
 ### MCP Tools (exposed to AI assistants)
-Search: `search_patterns`, `get_pattern`, `list_patterns`, `find_related`, `search_by_problem`, `search_by_technology`
-Analysis: `explain_pattern`, `compare_patterns`, `get_category_overview`, `suggest_architecture`, `pattern_sequence`
-Indexing: `index_document`, `index_batch`, `delete_document`, `get_index_status`
+**Search**: `search_patterns`, `get_pattern`, `list_patterns`, `find_related`, `search_by_problem`, `search_by_technology`
+**Analysis**: `explain_pattern`, `compare_patterns`, `get_category_overview`, `suggest_architecture`, `pattern_sequence`
+**Indexing**: `index_document`, `index_batch`, `delete_document`, `get_index_status`
+**Projects**: `create_project`, `list_projects`, `get_project`, `update_project`, `delete_project`
+**Issues**: `create_issue`, `list_issues`, `get_issue`, `update_issue`, `delete_issue`
+**GitHub**: `set_github_token`, `sync_github_issues`, `create_github_project`, `add_issue_to_project`
+**Knowledge Links**: `link_entry`, `unlink_entry`, `list_project_entries`
+**AI Planning**: `plan_project`, `suggest_tasks`, `breakdown_task`, `get_project_context`
 
 ## Client Frontend
 
@@ -198,16 +224,31 @@ React + TypeScript + Vite + TailwindCSS
 
 ```
 client/src/
-├── pages/           # Route components (Dashboard, SearchPage, IndexingDashboard, etc.)
-├── api/             # API client hooks
-├── hooks/           # Custom React hooks
-├── components/      # Shared components
-└── types/           # TypeScript types
+├── pages/
+│   ├── Dashboard.tsx          # Main dashboard
+│   ├── EntryBrowser.tsx       # Entry listing and search
+│   ├── EntryDetail.tsx        # Entry details
+│   ├── IndexingDashboard.tsx  # Indexing status
+│   └── projects/
+│       ├── ProjectList.tsx    # Project listing
+│       └── ProjectDetail.tsx  # Project detail with issues tab
+├── api/
+│   ├── client.ts              # Main API client
+│   ├── projectClient.ts       # Project management API
+│   └── indexingClient.ts      # Indexing API
+├── hooks/
+│   ├── useSSE.ts              # SSE connection hook
+│   └── useProjectEvents.ts    # Project SSE events hook
+├── components/                # Shared components
+└── types/
+    ├── index.ts               # General types
+    └── project.ts             # Project/Issue types
 ```
 
 Vite proxy configuration:
 - `/api` → `http://127.0.0.1:3001` (REST API)
-- `/api/indexing/sse` → SSE-specific proxy settings
+- `/api/indexing/sse` → SSE-specific proxy settings for indexing events
+- `/api/projects/events` → SSE-specific proxy settings for project events
 - `/mcp` → `http://127.0.0.1:3002` (MCP HTTP server)
 
 ## Port Allocation
@@ -220,13 +261,14 @@ Vite proxy configuration:
 
 ## Testing
 
-Tests are colocated with source files using `#[cfg(test)]` modules. **95+ tests across core crates.**
+Tests are colocated with source files using `#[cfg(test)]` modules. **170+ tests across core crates.**
 
 ### Unit Tests
 ```bash
-cargo test --release -p kix-crawler    # 45 tests (discovery, code, strategies, etc.)
+cargo test --release -p kix-crawler    # 59 tests (discovery, code, strategies, etc.)
 cargo test --release -p kix-parser     # 40 tests (chunker, validator, parsers)
-cargo test --release -p kix-store      # 10 tests (pages, search, schema)
+cargo test --release -p kix-store      # 28 tests (pages, search, schema, projects)
+cargo test --release -p kix-projects   # 47 tests (project, issue, github, events)
 ```
 
 ### Integration Tests
@@ -242,3 +284,37 @@ cargo test --release -p kix-jobs --test pipeline_integration  # Full pipeline te
 - `kix-store/src/pages.rs` - Two-layer storage
 - `kix-store/src/search.rs` - Hybrid search functionality
 - `kix-jobs/tests/pipeline_integration.rs` - End-to-end pipeline tests
+- `kix-projects/src/events.rs` - Event bus for real-time updates
+- `kix-projects/src/github/` - GitHub integration (REST + GraphQL)
+
+## Project Management System
+
+KIX includes an AI-powered project management system with GitHub integration:
+
+### Features
+- **Projects**: Bounded containers connecting to GitHub repositories
+- **Issues**: Local issue tracking with GitHub sync (bidirectional)
+- **Knowledge Links**: Connect knowledge base entries to projects
+- **GitHub Projects V2**: Create Kanban, Sprint Planning, Bug Tracking boards
+- **AI Planning**: Use knowledge base context to help plan projects
+
+### Templates (GitHub Projects V2)
+| Template | Fields | Views |
+|----------|--------|-------|
+| **Kanban** | Status (Todo/In Progress/Done) | Board |
+| **Bug Tracking** | Status, Priority, Severity | Board + Table |
+| **Sprint Planning** | Status, Sprint, Story Points | Board + Table |
+| **Feature Roadmap** | Status, Quarter, Team | Roadmap |
+
+### Security
+- GitHub tokens encrypted at rest with AES-256-GCM
+- Per-project tokens with global fallback
+- Encryption key from `KIX_ENCRYPTION_KEY` environment variable
+
+### REST API Endpoints
+- `GET/POST /api/projects` - List/create projects
+- `GET/PUT/DELETE /api/projects/:id` - Project CRUD
+- `GET/POST /api/projects/:id/issues` - Issue management
+- `GET/POST /api/projects/:id/entries` - Knowledge links
+- `POST /api/projects/:id/github/sync` - Sync with GitHub
+- `GET /api/projects/events` - SSE for real-time updates

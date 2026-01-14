@@ -29,6 +29,22 @@ export default defineConfig({
           });
         },
       },
+      // Project SSE events endpoint
+      '/api/projects/events': {
+        target: 'http://127.0.0.1:3001',
+        changeOrigin: true,
+        // SSE requires these settings to prevent buffering
+        configure: (proxy, _options) => {
+          proxy.on('proxyReq', (proxyReq, _req, _res) => {
+            proxyReq.setHeader('Accept', 'text/event-stream');
+          });
+          proxy.on('proxyRes', (proxyRes, _req, res) => {
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.setHeader('Cache-Control', 'no-cache, no-transform');
+            res.setHeader('Connection', 'keep-alive');
+          });
+        },
+      },
       '/api': {
         target: 'http://127.0.0.1:3001',
         changeOrigin: true,

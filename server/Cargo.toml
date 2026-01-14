@@ -11,6 +11,9 @@ members = [
     "crates/kix-crawler",
     "crates/kix-jobs",
     "crates/kix-auth",
+    "crates/kix-projects",
+    "crates/kix-sqlite",
+    "crates/kix-vectors",
 ]
 
 [workspace.package]
@@ -46,11 +49,6 @@ pdf-extract = "0.7"
 
 # Embeddings
 fastembed = "5"
-
-# Vector database
-lancedb = "0.23"
-arrow-array = "56"
-arrow-schema = "56"
 
 # Web API
 axum = { version = "0.7", features = ["macros"] }

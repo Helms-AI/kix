@@ -98,3 +98,6 @@ export interface ChunksResponse {
   chunks: Chunk[];
   total: number;
 }
+
+// Re-export project types
+export * from './project';

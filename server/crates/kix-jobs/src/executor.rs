@@ -16,7 +16,7 @@ use url::Url;
 use kix_crawler::crawler::{CrawlResult, Crawler, CrawlerConfig};
 use kix_sse::event::{Event, EventType, SourceType};
 use kix_sse::ConnectionManager;
-use kix_store::{JobItemRecord, JobRecord, JobStats, JobStore, KixStore};
+use kix_store::{JobItemRecord, JobRecord, JobStore, KixStore};
 
 use crate::job::{Job, JobResult, JobType};
 use crate::processor::{ContentProcessor, ProcessorConfig};
@@ -63,9 +63,9 @@ pub struct ExecutorConfig {
     pub worker_count: usize,
     /// Maximum memory per job (bytes)
     pub max_memory_per_job: usize,
-    /// Database path for LanceDB storage
+    /// Database path for SQLite storage
     pub db_path: String,
-    /// Path for job history persistence (jobs.lance)
+    /// Path for job history persistence
     pub jobs_db_path: Option<String>,
     /// Content processor configuration
     pub processor_config: ProcessorConfig,
@@ -87,8 +87,8 @@ impl Default for ExecutorConfig {
             max_concurrent: 8,   // Increased from 4 for higher throughput
             worker_count: 8,     // Increased from 4 to match concurrent jobs
             max_memory_per_job: 512 * 1024 * 1024, // 512MB
-            db_path: "./data/eip.lance".to_string(),
-            jobs_db_path: Some("./data/lancedb/jobs.lance".to_string()),
+            db_path: "./data".to_string(),
+            jobs_db_path: Some("./data/sqlite/kix.db".to_string()),
             processor_config: ProcessorConfig::default(),
             on_job_complete: None,
             shared_store: None,
@@ -366,27 +366,24 @@ impl JobExecutor {
         // Get actual discovered count from context
         let items_discovered = ctx.items_discovered.load(Ordering::Relaxed) as u32;
 
-        let job_record = JobRecord {
-            job_id: job.id.to_string(),
-            job_type: job_type_str.to_string(),
-            status: status.to_string(),
-            created_at: job.created_at,
-            started_at: Some(Utc::now() - chrono::Duration::milliseconds(result.duration_ms as i64)),
-            completed_at: Utc::now(),
-            source_url,
-            source_domain,
-            config,
-            stats: JobStats {
-                items_processed: result.items_processed as u32,
-                items_discovered: items_discovered.max(result.items_processed as u32),
-                chunks_created: result.chunks_created as u32,
-                embeddings_generated: result.embeddings_generated as u32,
-                error_count: result.errors.len() as u32,
-                duration_ms: result.duration_ms,
-                processing_rate: rate,
-            },
-            errors: result.errors.clone(),
-        };
+        let mut job_record = JobRecord::new(&job.id.to_string(), job_type_str);
+        job_record.status = status.to_string();
+        job_record.created_at = job.created_at.to_rfc3339();
+        job_record.started_at = Some((Utc::now() - chrono::Duration::milliseconds(result.duration_ms as i64)).to_rfc3339());
+        job_record.completed_at = Utc::now().to_rfc3339();
+        job_record.source_url = source_url;
+        job_record.source_domain = source_domain;
+        job_record.config = config.to_string();
+        job_record.items_processed = result.items_processed as i64;
+        job_record.items_discovered = items_discovered.max(result.items_processed as u32) as i64;
+        job_record.chunks_created = result.chunks_created as i64;
+        job_record.embeddings_generated = result.embeddings_generated as i64;
+        job_record.error_count = result.errors.len() as i64;
+        job_record.duration_ms = result.duration_ms as i64;
+        job_record.processing_rate = rate;
+        if !result.errors.is_empty() {
+            job_record.set_errors(result.errors.clone());
+        }
 
         // Get collected items as Vec
         let items_map = ctx.items.read().await;
@@ -399,7 +396,7 @@ impl JobExecutor {
             "Persisting job with items"
         );
 
-        store.save_job(&job_record, &items).await
+        store.save_job_with_items(&job_record, &items).await
     }
 
     /// Execute a single job
@@ -749,7 +746,7 @@ impl JobExecutor {
                     let item = items.entry(result.url.clone()).or_insert_with(|| {
                         JobItemRecord::new_page(job_id.to_string(), result.url.clone())
                     });
-                    item.mark_completed(result.chunks as u32, result.embeddings as u32, 0);
+                    item.mark_completed(result.chunks as i64, result.embeddings as i64, 0);
                 }
             }
 
@@ -996,7 +993,7 @@ impl JobExecutor {
                 {
                     let mut items = ctx.items.write().await;
                     if let Some(item) = items.get_mut(&result.name) {
-                        item.mark_completed(result.chunks as u32, result.embeddings as u32, 0);
+                        item.mark_completed(result.chunks as i64, result.embeddings as i64, 0);
                     }
                 }
             }

@@ -12,6 +12,7 @@ kix-parser = { path = "../kix-parser" }
 kix-sse = { path = "../kix-sse" }
 kix-jobs = { path = "../kix-jobs" }
 kix-crawler = { path = "../kix-crawler" }
+kix-projects = { path = "../kix-projects" }
 axum = { workspace = true }
 axum-extra = { workspace = true }
 tower-http.workspace = true
@@ -25,6 +26,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = { workspace = true }
 futures-util = { workspace = true }
+futures = "0.3"
 base64 = "0.22"
 
 [dev-dependencies]

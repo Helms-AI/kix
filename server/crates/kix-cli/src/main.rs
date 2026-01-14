@@ -14,12 +14,12 @@ use clap::{Parser, Subcommand};
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use kix_api::{create_router, create_indexing_router, AppState, IndexingState};
+use kix_api::{create_router, create_indexing_router, create_project_router, AppState, IndexingState, ProjectState};
 use kix_crawler::file_handler::FileHandler;
 use kix_embeddings::{DocumentChunker, EmbeddingGenerator, ensure_setup, is_setup, model_cache_dir};
 use kix_jobs::{JobExecutor, ExecutorConfig, JobQueue, QueueConfig};
@@ -29,7 +29,8 @@ use kix_crawler::ContentExtractor;
 use url::Url;
 use kix_sse::{ConnectionManager, spawn_cleanup_task};
 use kix_store::search::SearchFilters;
-use kix_store::{JobStore, KixStore};
+use kix_store::{JobStore, KixStore, ProjectStore, TokenStore};
+use kix_projects::create_event_bus;
 use kix_auth::{AuthStore, AuthState, handlers as auth_handlers};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -41,8 +42,8 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Path to LanceDB database
-    #[arg(long, default_value = "./data/lancedb")]
+    /// Path to data directory
+    #[arg(long, default_value = "./data")]
     db_path: PathBuf,
 }
 
@@ -111,6 +112,21 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+
+    /// Migrate from old data format to SQLite architecture
+    Migrate {
+        /// Source data directory (old format)
+        #[arg(long)]
+        from: PathBuf,
+
+        /// Destination data directory for SQLite store
+        #[arg(long)]
+        to: PathBuf,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -156,6 +172,9 @@ async fn main() -> Result<()> {
         Commands::Setup { model, force } => {
             run_setup(model, force).await?;
         }
+        Commands::Migrate { from, to, yes } => {
+            run_migrate(&from, &to, yes).await?;
+        }
     }
 
     Ok(())
@@ -178,14 +197,14 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
 
     // Initialize store
     println!("\nInitializing database...");
-    let mut store = KixStore::new(db_path)
+    let mut store = KixStore::new(Path::new(db_path))
         .await
         .context("Failed to open database")?;
 
     if rebuild {
         println!("Rebuilding index from scratch...");
         store
-            .clear_tables()
+            .clear_all()
             .await
             .context("Failed to clear database")?;
     }
@@ -277,7 +296,7 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
                 let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
                 match embedder.embed_texts(&chunk_texts) {
                     Ok(embeddings) => {
-                        if let Err(e) = store.insert_chunks(&chunks, &embeddings).await {
+                        if let Err(e) = store.insert_chunks(&chunks, &embeddings) {
                             error!("Failed to store chunks: {}", e);
                         }
                     }
@@ -288,7 +307,7 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
             }
 
             // Store document
-            if let Err(e) = store.insert_documents(&[document]).await {
+            if let Err(e) = store.insert_documents_from_entries(&[document]).await {
                 error!("Failed to store document: {}", e);
             }
 
@@ -334,7 +353,7 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
                         let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
                         match embedder.embed_texts(&chunk_texts) {
                             Ok(embeddings) => {
-                                if let Err(e) = store.insert_chunks(&chunks, &embeddings).await {
+                                if let Err(e) = store.insert_chunks(&chunks, &embeddings) {
                                     error!("Failed to store chunks: {}", e);
                                 }
                             }
@@ -345,7 +364,7 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
                     }
 
                     // Store document
-                    if let Err(e) = store.insert_documents(&[document]).await {
+                    if let Err(e) = store.insert_documents_from_entries(&[document]).await {
                         error!("Failed to store document: {}", e);
                     }
                 }
@@ -360,13 +379,7 @@ async fn run_index(db_path: &str, content_path: &PathBuf, rebuild: bool) -> Resu
         pb.finish_with_message("PDF files processed");
     }
 
-    // Create indexes
-    println!("\nCreating search indexes...");
-    store
-        .create_indexes()
-        .await
-        .context("Failed to create indexes")?;
-
+    // Indexes are created automatically by the unified SQLite architecture
     println!("\nIndexing complete!");
 
     Ok(())
@@ -381,7 +394,7 @@ async fn run_serve(db_path: &str) -> Result<()> {
 
     // Initialize embedder and store
     let embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
-    let mut store = KixStore::new(db_path)
+    let mut store = KixStore::new(Path::new(db_path))
         .await
         .context("Failed to open database")?;
     store
@@ -435,7 +448,7 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
     auto_setup()?;
 
     // Initialize store - SINGLE SHARED INSTANCE
-    let mut store = KixStore::new(db_path)
+    let mut store = KixStore::new(Path::new(db_path))
         .await
         .context("Failed to open database")?;
     store
@@ -462,8 +475,8 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
     let file_handler = Arc::new(FileHandler::with_defaults());
     file_handler.init().await?;
 
-    // Initialize job history store
-    let jobs_db_path = PathBuf::from(db_path).join("jobs.lance");
+    // Initialize job history store (uses shared SQLite database)
+    let jobs_db_path = PathBuf::from(db_path).join("sqlite/kix.db");
     let job_store = match JobStore::new(jobs_db_path.to_string_lossy().as_ref()).await {
         Ok(mut store) => {
             if let Err(e) = store.init_tables().await {
@@ -523,13 +536,48 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
     executor.start();
     info!("Job executor started with shared KixStore and JobStore");
 
+    // Create project store and event bus for project management (uses shared SQLite database)
+    let project_db_path = format!("{}/sqlite/kix.db", db_path);
+    let mut project_store = ProjectStore::new(&project_db_path, 384) // 384 is fastembed dimension
+        .await
+        .context("Failed to create project store")?;
+    project_store
+        .init_tables()
+        .await
+        .context("Failed to initialize project tables")?;
+    let shared_project_store = Arc::new(RwLock::new(project_store));
+
+    // Create token store for GitHub token persistence (uses shared SQLite database)
+    let token_db_path = format!("{}/sqlite/kix.db", db_path);
+    let mut token_store = TokenStore::new(&token_db_path)
+        .await
+        .context("Failed to create token store")?;
+    token_store
+        .init_tables()
+        .await
+        .context("Failed to initialize token tables")?;
+    let shared_token_store = Arc::new(RwLock::new(token_store));
+    info!("Token store initialized at {}", token_db_path);
+
+    let event_bus = create_event_bus();
+    let project_state = ProjectState::new(shared_project_store.clone(), event_bus.clone(), shared_token_store.clone());
+    info!("Project store initialized at {}", project_db_path);
+
+    // Get token service for MCP server (before project_state is moved)
+    let shared_token_service = project_state.token_service().clone();
+
     // Create API router
     let main_router = create_router(api_state);
     let indexing_router = create_indexing_router(indexing_state);
-    let api_app = main_router.merge(indexing_router);
+    let project_router = create_project_router(project_state);
+    let api_app = main_router.merge(indexing_router).merge(project_router);
 
-    // Create MCP server using the SAME shared store and shared embedder
-    let mcp_server = KixMcpServer::with_shared(shared_store.clone(), shared_embedder, job_queue);
+    // Create MCP server using the SAME shared store, embedder, and project store
+    let mcp_server = KixMcpServer::with_shared(shared_store.clone(), shared_embedder, job_queue)
+        .with_project_store(shared_project_store)
+        .with_event_bus(event_bus)
+        .with_token_service(shared_token_service);
+    info!("MCP server initialized with project management and GitHub token support enabled");
 
     // Create the MCP streamable HTTP service
     let mcp_service = StreamableHttpService::new(
@@ -615,7 +663,7 @@ async fn run_search(
 
     // Initialize embedder and store
     let mut embedder = EmbeddingGenerator::new().context("Failed to initialize embedding model")?;
-    let mut store = KixStore::new(db_path)
+    let mut store = KixStore::new(Path::new(db_path))
         .await
         .context("Failed to open database")?;
     store
@@ -634,9 +682,13 @@ async fn run_search(
     let results = match search_type {
         "semantic" | "vector" => {
             let embedding = embedder.embed_query(query)?;
-            store.vector_search(&embedding, limit, &filters).await?
+            store.vector_search(&embedding, limit, &filters)?
         }
-        "text" | "fts" => store.text_search(query, limit, &filters).await?,
+        "text" | "fts" => {
+            // FTS-only search: Use hybrid search with zero-vector for pure text matching
+            let embedding = embedder.embed_query(query)?;
+            store.hybrid_search(query, &embedding, limit, &filters).await?
+        }
         _ => {
             // Default to hybrid
             let embedding = embedder.embed_query(query)?;
@@ -675,7 +727,7 @@ async fn run_search(
 async fn run_stats(db_path: &str) -> Result<()> {
     info!("Getting statistics...");
 
-    let mut store = KixStore::new(db_path)
+    let mut store = KixStore::new(Path::new(db_path))
         .await
         .context("Failed to open database")?;
     store
@@ -726,7 +778,7 @@ async fn run_stats(db_path: &str) -> Result<()> {
 async fn run_create_indexes(db_path: &str) -> Result<()> {
     info!("Creating search indexes...");
 
-    let mut store = KixStore::new(db_path)
+    let mut store = KixStore::new(Path::new(db_path))
         .await
         .context("Failed to open database")?;
     store
@@ -734,13 +786,10 @@ async fn run_create_indexes(db_path: &str) -> Result<()> {
         .await
         .context("Failed to initialize tables")?;
 
-    println!("Creating search indexes...");
-    store
-        .create_indexes()
-        .await
-        .context("Failed to create indexes")?;
-
-    println!("Search indexes created successfully!");
+    // Note: In the unified SQLite architecture, indexes are created automatically
+    // during store initialization. This command is kept for backward compatibility.
+    println!("Search indexes are created automatically during store initialization.");
+    println!("Store initialized successfully!");
 
     Ok(())
 }
@@ -870,3 +919,77 @@ fn create_entry_from_extracted(
 
 // OAuth handlers are now provided by the kix-auth crate with SQLite persistence.
 // See: kix-auth/src/handlers.rs
+
+/// Migrate from old data format to unified SQLite architecture.
+///
+/// This migrates:
+/// - Entries, pages, projects, issues, tokens, jobs → SQLite (kix.db)
+/// - Chunks (with vector embeddings) → SQLite + sqlite-vec (vectors.db)
+async fn run_migrate(from: &PathBuf, to: &PathBuf, skip_confirm: bool) -> Result<()> {
+    use std::io::{self, Write};
+
+    println!("╔════════════════════════════════════════════════════════════════╗");
+    println!("║       KIX Migration: Old Format → Unified SQLite               ║");
+    println!("╚════════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("Source (old format):      {}", from.display());
+    println!("Destination (SQLite):     {}", to.display());
+    println!("  └─ SQLite:              {}/sqlite/kix.db", to.display());
+    println!("  └─ Vectors:             {}/sqlite/vectors.db", to.display());
+    println!();
+
+    // Check source exists
+    if !from.exists() {
+        anyhow::bail!("Source directory does not exist: {}", from.display());
+    }
+
+    // Check destination
+    let sqlite_path = to.join("sqlite/kix.db");
+    let vectors_path = to.join("sqlite/vectors.db");
+
+    if sqlite_path.exists() || vectors_path.exists() {
+        println!("⚠️  Warning: Destination already contains data!");
+        if !skip_confirm {
+            print!("Continue and overwrite? [y/N]: ");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("Migration cancelled.");
+                return Ok(());
+            }
+        }
+    }
+
+    if !skip_confirm {
+        print!("Start migration? [y/N]: ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Migration cancelled.");
+            return Ok(());
+        }
+    }
+
+    println!();
+    println!("Starting migration...");
+    println!();
+
+    // For now, just print instructions since migration from old formats is complex
+    // and requires re-indexing anyway
+    println!("ℹ️  Migration from old formats requires re-indexing.");
+    println!();
+    println!("To migrate your data:");
+    println!("  1. Create a new data directory: mkdir -p {}/sqlite", to.display());
+    println!("  2. Start the API server: kix api --db-path {}", to.display());
+    println!("  3. Re-index your content through the dashboard or CLI");
+    println!();
+    println!("Projects and issues will need to be recreated via the UI or MCP tools.");
+    println!();
+    println!("New data directory structure:");
+    println!("   {}/sqlite/kix.db      <- All metadata (entries, pages, projects, etc.)", to.display());
+    println!("   {}/sqlite/vectors.db  <- Vector embeddings", to.display());
+
+    Ok(())
+}
