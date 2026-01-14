@@ -682,7 +682,7 @@ async fn run_search(
     let results = match search_type {
         "semantic" | "vector" => {
             let embedding = embedder.embed_query(query)?;
-            store.vector_search(&embedding, limit, &filters)?
+            store.vector_search(&embedding, limit, &filters).await?
         }
         "text" | "fts" => {
             // FTS-only search: Use hybrid search with zero-vector for pure text matching

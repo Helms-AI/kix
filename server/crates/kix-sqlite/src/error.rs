@@ -40,6 +40,12 @@ pub enum SqliteError {
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
+
+    #[error("Configuration error: {0}")]
+    Configuration(String),
+
+    #[error("SeaORM error: {0}")]
+    SeaOrm(#[from] sea_orm::DbErr),
 }
 
 /// Result type for SQLite operations

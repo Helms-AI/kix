@@ -28,4 +28,8 @@ pub enum StoreError {
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Internal error (e.g., spawn_blocking failures).
+    #[error("Internal error: {0}")]
+    Internal(String),
 }

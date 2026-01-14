@@ -53,7 +53,7 @@ use kix_embeddings::{DocumentChunker, EmbeddingGenerator};
 use kix_jobs::{Job, JobConfig, JobQueue, JobState, JobType};
 use kix_parser::{Entry, EntryType, PdfParser, SourceType};
 use kix_crawler::ContentExtractor;
-use kix_store::search::SearchFilters;
+use kix_services::{self, Pagination};
 use kix_store::{KixStore, ProjectRecord, IssueRecord, ProjectEntryRecord};
 use kix_store::projects::ProjectStore;
 use kix_projects::{
@@ -534,6 +534,7 @@ impl KixMcpServer {
     // =========================================================================
 
     /// Unified search across all indexed content.
+    /// Uses shared service layer for consistency with REST API.
     #[tool(description = "Search the knowledge base using natural language. Returns relevant chunks with scores. Use 'get_context' with page_id to retrieve full page content for RAG synthesis.")]
     async fn search(
         &self,
@@ -542,61 +543,37 @@ impl KixMcpServer {
         let query = &params.0.query;
         info!("Search: {}", query);
 
-        let limit = params.0.limit.unwrap_or(10).min(100);
-        let offset = params.0.offset.unwrap_or(0);
-        let mode = params.0.mode.clone().unwrap_or_default();
+        // Convert local types to shared service types
+        let mode = match params.0.mode.clone().unwrap_or_default() {
+            SearchMode::Hybrid => kix_services::SearchMode::Hybrid,
+            SearchMode::Vector => kix_services::SearchMode::Vector,
+            SearchMode::Text => kix_services::SearchMode::Text,
+        };
 
-        // Convert QueryFilters to SearchFilters
-        let filters = params.0.filters.as_ref().map(|f| SearchFilters {
+        let filters = params.0.filters.as_ref().map(|f| kix_services::QueryFilters {
             entry_type: f.entry_type.clone(),
             chunk_type: f.chunk_type.clone(),
             tag: f.tag.clone(),
             source_domain: f.source_domain.clone(),
         }).unwrap_or_default();
 
-        // Generate embedding for vector/hybrid search
-        let embedding = match mode {
-            SearchMode::Text => vec![], // Not needed for text-only
-            _ => {
-                let mut embedder = self.embedder.write().await;
-                embedder
-                    .embed_query(query)
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            }
-        };
+        let pagination = Pagination::new(params.0.limit, params.0.offset);
 
-        // Perform search based on mode
-        let store = self.store.read().await;
-        let results = match mode {
-            SearchMode::Hybrid => {
-                store
-                    .hybrid_search(query, &embedding, limit + offset, &filters)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            }
-            SearchMode::Vector => {
-                // vector_search is sync (sqlite-vec)
-                store
-                    .vector_search(&embedding, limit + offset, &filters)
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            }
-            SearchMode::Text => {
-                // Text-only mode: use hybrid search (includes FTS) as fallback
-                // Pure text search is part of hybrid search
-                store
-                    .hybrid_search(query, &embedding, limit + offset, &filters)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            }
-        };
+        // Use shared service for search
+        let results = kix_services::search_knowledge(
+            &self.store,
+            &self.embedder,
+            query,
+            mode,
+            filters,
+            pagination,
+        )
+        .await
+        .map_err(|e| McpError::from(e))?;
 
-        // Apply pagination
-        let total_count = results.len();
-        let paginated: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
-        let has_more = total_count > offset + limit;
-
-        // Convert to response format
-        let items: Vec<SearchResultItem> = paginated
+        // Convert to MCP response format
+        let items: Vec<SearchResultItem> = results
+            .results
             .into_iter()
             .map(|r| SearchResultItem {
                 chunk_id: r.chunk_id,
@@ -605,14 +582,14 @@ impl KixMcpServer {
                 text: r.text,
                 score: r.score,
                 entry_title: r.entry_title,
-                source_url: r.source_domain.map(|d| format!("https://{}", d)),
+                source_url: r.source_url,
             })
             .collect();
 
         let response = SearchResponse {
             results: items,
-            total_count,
-            has_more,
+            total_count: results.total_count,
+            has_more: results.has_more,
         };
 
         let json = serde_json::to_string_pretty(&response)
@@ -711,9 +688,10 @@ impl KixMcpServer {
             Some(e) => {
                 // Optionally get chunks
                 let chunks = if params.0.include_chunks.unwrap_or(false) {
-                    // get_chunks_by_entry_id is sync (sqlite-vec)
+                    // get_chunks_by_entry_id is now async (uses spawn_blocking internally)
                     let chunk_list = store
                         .get_chunks_by_entry_id(&params.0.id)
+                        .await
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
                     Some(
@@ -842,8 +820,7 @@ impl KixMcpServer {
         // If replacing, delete existing first
         if exists {
             let store = self.store.write().await;
-            // delete_chunks_by_entry is sync (sqlite-vec)
-            store.delete_chunks_by_entry(&entry.id).ok();
+            // delete_entry handles chunk deletion internally
             store.delete_entry(&entry.id).await.ok();
         }
 
@@ -1136,8 +1113,8 @@ impl KixMcpServer {
             let store = self.store.read().await;
             for id in &ids_to_delete {
                 if store.entry_exists(id).await.unwrap_or(false) {
-                    // get_chunks_by_entry_id is sync (sqlite-vec)
-                    let chunks = store.get_chunks_by_entry_id(id).unwrap_or_default();
+                    // get_chunks_by_entry_id is now async (uses spawn_blocking internally)
+                    let chunks = store.get_chunks_by_entry_id(id).await.unwrap_or_default();
                     chunks_deleted += chunks.len();
                     actually_deleted.push(id.clone());
                 }
@@ -1147,12 +1124,11 @@ impl KixMcpServer {
             let store = self.store.write().await;
             for id in &ids_to_delete {
                 if store.entry_exists(id).await.unwrap_or(false) {
-                    // get_chunks_by_entry_id is sync (sqlite-vec)
-                    let chunks = store.get_chunks_by_entry_id(id).unwrap_or_default();
+                    // get_chunks_by_entry_id is now async (uses spawn_blocking internally)
+                    let chunks = store.get_chunks_by_entry_id(id).await.unwrap_or_default();
                     chunks_deleted += chunks.len();
 
-                    // delete_chunks_by_entry is sync (sqlite-vec)
-                    store.delete_chunks_by_entry(id).ok();
+                    // delete_entry handles chunk deletion internally
                     store.delete_entry(id).await.ok();
                     actually_deleted.push(id.clone());
                 }

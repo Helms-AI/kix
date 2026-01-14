@@ -12,6 +12,7 @@ kix-parser = { path = "../kix-parser" }
 kix-crawler = { path = "../kix-crawler" }
 kix-jobs = { path = "../kix-jobs" }
 kix-projects = { path = "../kix-projects" }
+kix-services = { path = "../kix-services" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

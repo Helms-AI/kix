@@ -1,10 +1,12 @@
 //! SQLite connection pool and migrations
 
 use crate::error::{Result, SqliteError};
+use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 use tracing::{debug, info};
 
 /// Initial migration SQL
@@ -129,6 +131,54 @@ fn parse_sql_statements(sql: &str) -> Vec<String> {
     }
 
     statements
+}
+
+/// Create a SeaORM database connection
+///
+/// Creates a new SeaORM connection to the same database.
+/// This is used alongside the sqlx pool for ORM-based operations.
+pub async fn create_sea_orm_connection(db_path: &Path) -> Result<DatabaseConnection> {
+    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    debug!("Creating SeaORM connection to: {}", db_url);
+
+    let mut opt = ConnectOptions::new(&db_url);
+    opt.max_connections(10)
+        .min_connections(1)
+        .connect_timeout(Duration::from_secs(30))
+        .idle_timeout(Duration::from_secs(300))
+        .sqlx_logging(false); // Reduce noise in logs
+
+    let db = Database::connect(opt).await.map_err(|e| {
+        SqliteError::Configuration(format!("Failed to create SeaORM connection: {}", e))
+    })?;
+
+    // Set SQLite pragmas for performance and reliability
+    use sea_orm::ConnectionTrait;
+    db.execute_unprepared("PRAGMA journal_mode = WAL")
+        .await
+        .map_err(|e| SqliteError::Configuration(format!("Failed to set WAL mode: {}", e)))?;
+    db.execute_unprepared("PRAGMA synchronous = NORMAL")
+        .await
+        .map_err(|e| SqliteError::Configuration(format!("Failed to set synchronous: {}", e)))?;
+    db.execute_unprepared("PRAGMA foreign_keys = ON")
+        .await
+        .map_err(|e| SqliteError::Configuration(format!("Failed to enable foreign keys: {}", e)))?;
+    db.execute_unprepared("PRAGMA busy_timeout = 30000")
+        .await
+        .map_err(|e| SqliteError::Configuration(format!("Failed to set busy timeout: {}", e)))?;
+    // Performance optimizations
+    db.execute_unprepared("PRAGMA cache_size = -64000") // 64MB page cache (default 2MB)
+        .await
+        .map_err(|e| SqliteError::Configuration(format!("Failed to set cache size: {}", e)))?;
+    db.execute_unprepared("PRAGMA mmap_size = 268435456") // 256MB memory-mapped I/O
+        .await
+        .map_err(|e| SqliteError::Configuration(format!("Failed to set mmap size: {}", e)))?;
+    db.execute_unprepared("PRAGMA temp_store = MEMORY") // Temp tables in RAM
+        .await
+        .map_err(|e| SqliteError::Configuration(format!("Failed to set temp store: {}", e)))?;
+
+    info!("SeaORM connection created at: {}", db_path.display());
+    Ok(db)
 }
 
 /// Get the current database version/schema info

@@ -425,8 +425,8 @@ impl ContentProcessor {
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document and chunks (sync operation)
-                store.delete_chunks_by_document(&doc_id)
+                // Delete existing document and chunks
+                store.delete_chunks_by_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
@@ -700,8 +700,8 @@ impl ContentProcessor {
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document and chunks (sync operation)
-                store.delete_chunks_by_document(&doc_id)
+                // Delete existing document and chunks
+                store.delete_chunks_by_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;
@@ -953,8 +953,8 @@ impl ContentProcessor {
                 .map_err(|e| JobError::Processing(format!("Failed to check document: {}", e)))?;
 
             if exists {
-                // Delete existing document, chunks, and pages (sync operation for chunks)
-                store.delete_chunks_by_document(&doc_id)
+                // Delete existing document, chunks, and pages
+                store.delete_chunks_by_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old chunks: {}", e)))?;
                 store.delete_document(&doc_id).await
                     .map_err(|e| JobError::Processing(format!("Failed to delete old document: {}", e)))?;

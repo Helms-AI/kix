@@ -17,7 +17,8 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, error};
 
 use kix_embeddings::EmbeddingGenerator;
-use kix_store::search::{PatternSummary, SearchFilters, SearchResult, EntryChunk};
+use kix_services::{self, Pagination, QueryFilters, SearchMode};
+use kix_store::search::{PatternSummary, SearchResult, EntryChunk};
 use kix_store::KixStore;
 
 /// Application state shared across all routes.
@@ -62,6 +63,11 @@ impl AppState {
     /// Get a reference to the store (for read operations use .read().await).
     pub fn store(&self) -> &Arc<RwLock<KixStore>> {
         &self.store
+    }
+
+    /// Get a reference to the embedder.
+    pub fn embedder(&self) -> &Arc<RwLock<EmbeddingGenerator>> {
+        &self.embedder
     }
 }
 
@@ -430,11 +436,14 @@ async fn get_entry(
 ) -> Result<Json<EntryResponse>, StatusCode> {
     info!("Getting entry: {}", id);
 
-    let store = state.store.read().await;
-    let pattern = store
-        .get_pattern_by_id(&id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let pattern = {
+        let store = state.store.read().await;
+        store
+            .get_pattern_by_id(&id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        // Lock released here at end of block
+    };
 
     match pattern {
         Some(p) => Ok(Json(EntryResponse::from(p))),
@@ -449,9 +458,17 @@ async fn get_entry_chunks(
 ) -> Result<Json<ChunksResponse>, StatusCode> {
     info!("Getting chunks for entry: {}", id);
 
-    let store = state.store.read().await;
-    let chunks = store
-        .get_chunks_by_entry_id(&id)
+    // Clone vectors reference, releasing RwLock immediately to avoid blocking
+    let vectors = state.store.read().await.vectors.clone();
+
+    // spawn_blocking WITHOUT holding RwLock - prevents cascading blocks
+    let entry_id = id.clone();
+    let chunks = tokio::task::spawn_blocking(move || vectors.get_chunks_by_entry(&entry_id))
+        .await
+        .map_err(|e| {
+            error!("Join error getting chunks for entry '{}': {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .map_err(|e| {
             error!("Failed to get chunks for entry '{}': {}", id, e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -464,77 +481,48 @@ async fn get_entry_chunks(
 }
 
 /// GET /api/entries-related/:id - Get related entries.
+///
+/// Uses the shared service layer for consistency with MCP.
+/// Optimized to use cached embeddings when available (avoiding Ollama calls).
 async fn get_related_entries(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<EntryListResponse>, StatusCode> {
     info!("Getting related entries for: {}", id);
 
-    let store = state.store.read().await;
-    let pattern = store
-        .get_pattern_by_id(&id)
-        .await
-        .map_err(|e| {
-            error!("Failed to get entry by id '{}': {}", id, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // Use shared service for finding related entries
+    // This handles cached embedding lookup with Ollama fallback
+    let related = kix_services::find_related(
+        state.store(),
+        state.embedder(),
+        &id,
+        5, // limit
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to find related entries for '{}': {}", id, e);
+        StatusCode::from(&e)
+    })?;
 
-    match pattern {
-        Some(p) => {
-            // Use semantic search to find related entries
-            let query = format!("entries related to {} {}", p.title, p.description);
-            drop(store); // Release read lock before embedding
+    // Convert to API response format
+    let entries: Vec<EntryResponse> = related
+        .into_iter()
+        .map(|r| EntryResponse {
+            id: r.id,
+            title: r.title,
+            entry_type: r.entry_type,
+            tags: r.tags,
+            description: r.description,
+            source_type: None,
+            source_domain: r.source_domain,
+            source_path: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .collect();
 
-            let embedding = {
-                let mut embedder = state.embedder.write().await;
-                embedder
-                    .embed_query(&query)
-                    .map_err(|e| {
-                        error!("Failed to generate embedding for related entries: {}", e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?
-            };
-
-            let store = state.store.read().await;
-            let filters = SearchFilters {
-                entry_type: Some(p.entry_type.clone()),
-                ..Default::default()
-            };
-            let results = store
-                .vector_search(&embedding, 6, &filters)
-                .map_err(|e| {
-                    error!("Vector search for related entries failed: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
-            // Filter out the original entry and convert to responses
-            let mut related: Vec<EntryResponse> = Vec::new();
-            for result in results {
-                if result.entry_id != id {
-                    // Create a simple response from search result
-                    related.push(EntryResponse {
-                        id: result.entry_id,
-                        title: result.entry_title,
-                        entry_type: result.entry_type,
-                        tags: result.tags,
-                        description: result.text,
-                        source_type: None,
-                        source_domain: result.source_domain,
-                        source_path: None,
-                        created_at: None,
-                        updated_at: None,
-                    });
-                }
-            }
-            let total = related.len();
-
-            Ok(Json(EntryListResponse {
-                entries: related.into_iter().take(5).collect(),
-                total,
-            }))
-        }
-        None => Err(StatusCode::NOT_FOUND),
-    }
+    let total = entries.len();
+    Ok(Json(EntryListResponse { entries, total }))
 }
 
 /// GET /api/categories - List all categories.
@@ -575,45 +563,54 @@ async fn list_categories(
 }
 
 /// GET /api/search - Search entries (real-time, no caching).
+/// Uses shared service layer for consistency with MCP.
 async fn search_entries(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, StatusCode> {
-    let limit = query.limit.unwrap_or(10);
-    let filters = SearchFilters {
+    let filters = QueryFilters {
         entry_type: query.entry_type.clone(),
         tag: query.category.clone(),
         chunk_type: None,
         source_domain: query.source_domain.clone(),
     };
+    let pagination = Pagination::new(query.limit, None);
 
-    info!("Executing real-time search for: {}", query.q);
-
-    // Generate embedding for the query
-    let mut embedder = state.embedder.write().await;
-    let embedding = embedder.embed_query(&query.q).map_err(|e| {
-        error!("Failed to generate embedding for search query: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+    // Use shared service for search
+    let results = kix_services::search_knowledge(
+        state.store(),
+        state.embedder(),
+        &query.q,
+        SearchMode::Hybrid,
+        filters,
+        pagination,
+    )
+    .await
+    .map_err(|e| {
+        error!("Search failed: {}", e);
+        StatusCode::from(&e)
     })?;
-    drop(embedder);
 
-    // Perform hybrid search (tables are refreshed internally to see latest data)
-    let store = state.store.read().await;
-    let results = store
-        .hybrid_search(&query.q, &embedding, limit, &filters)
-        .await
-        .map_err(|e| {
-            error!("Hybrid search failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let total = results.len();
-    let results: Vec<SearchResultResponse> =
-        results.into_iter().map(SearchResultResponse::from).collect();
+    // Convert to API response format
+    let api_results: Vec<SearchResultResponse> = results
+        .results
+        .into_iter()
+        .map(|r| SearchResultResponse {
+            id: r.chunk_id,
+            entry_id: r.entry_id,
+            entry_title: r.entry_title,
+            entry_type: r.entry_type,
+            tags: r.tags,
+            chunk_type: None,
+            source_domain: r.source_url.map(|u| u.replace("https://", "")),
+            text: r.text,
+            score: r.score,
+        })
+        .collect();
 
     Ok(Json(SearchResponse {
-        results,
-        total,
+        results: api_results,
+        total: results.total_count,
         query: query.q,
     }))
 }
@@ -679,6 +676,7 @@ async fn get_entry_graph(
         let filters = kix_store::search::SearchFilters::default();
         let results = match store
             .vector_search(&embedding, neighbors_per_entry + 1, &filters)
+            .await
         {
             Ok(r) => r,
             Err(e) => {

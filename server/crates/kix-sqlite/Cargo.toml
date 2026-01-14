@@ -7,6 +7,8 @@ description = "SQLite storage for Knowledge Indexer - structured data and FTS"
 
 [dependencies]
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros"] }
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

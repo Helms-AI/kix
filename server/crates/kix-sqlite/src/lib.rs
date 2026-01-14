@@ -1,27 +1,28 @@
 //! KIX SQLite Store
 //!
 //! SQLite storage for structured data in the hybrid KIX architecture.
-//! Vector embeddings are stored in LanceDB; all other data is stored here.
+//! Vector embeddings are stored separately; all other data is stored here.
 //!
 //! ## Tables
 //!
 //! - `entries` - Document metadata
 //! - `pages` - Full page content for RAG context
 //! - `projects` - Project management
-//! - `issues` - Issue tracking (vectors stored in LanceDB)
+//! - `issues` - Issue tracking
 //! - `project_entries` - Knowledge links
 //! - `github_tokens` - Encrypted token storage
 //! - `jobs` - Job history
 //! - `job_items` - Per-item job details
 //!
-//! ## Full-Text Search
+//! ## Architecture
 //!
-//! FTS5 virtual tables provide efficient keyword search:
-//! - `entries_fts` - Search entries by title, description, content
-//! - `pages_fts` - Search pages by title, full_content
-//! - `issues_fts` - Search issues by title, body
+//! This crate uses a hybrid approach:
+//! - **SeaORM** for type-safe CRUD operations
+//! - **Tantivy** for full-text search (via kix-search crate)
+//! - **sqlite-vec** for vector search (via kix-vectors crate)
 
 pub mod entries;
+pub mod entities;
 pub mod error;
 pub mod issues;
 pub mod jobs;
@@ -29,12 +30,14 @@ pub mod links;
 pub mod pages;
 pub mod pool;
 pub mod projects;
-pub mod search;
 pub mod sync_state;
 pub mod tokens;
 
+// Note: Full-text search is now provided by kix-search crate (Tantivy).
+// The deprecated search module has been removed.
+
 pub use error::{Result, SqliteError};
-pub use pool::{create_pool, run_migrations, DbInfo};
+pub use pool::{create_pool, create_sea_orm_connection, run_migrations, DbInfo};
 
 // Re-export record types
 pub use entries::EntryRecord;
@@ -46,6 +49,7 @@ pub use projects::ProjectRecord;
 pub use tokens::TokenRecord;
 pub use sync_state::{SyncStateRecord, SyncStateStore, SyncStats, SyncHistoryRecord, SyncHistoryStats};
 
+use sea_orm::DatabaseConnection;
 use sqlx::SqlitePool;
 use std::path::Path;
 use tracing::info;
@@ -54,9 +58,21 @@ use tracing::info;
 ///
 /// This is the main interface for SQLite operations in KIX.
 /// It manages the connection pool and provides access to all tables.
+///
+/// ## Architecture
+///
+/// The store uses sqlx for SQL queries and SeaORM for type-safe CRUD:
+/// - `pool` - sqlx pool for raw SQL queries
+/// - `db` - SeaORM connection for ORM operations
+///
+/// ## Full-Text Search
+///
+/// Full-text search is provided by Tantivy via the `kix-search` crate.
+/// See `kix_search::SearchEngine` for search operations.
 #[derive(Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    db: DatabaseConnection,
 }
 
 impl SqliteStore {
@@ -67,18 +83,38 @@ impl SqliteStore {
     pub async fn new(db_path: &Path) -> Result<Self> {
         let pool = pool::create_pool(db_path).await?;
         pool::run_migrations(&pool).await?;
+        let db = pool::create_sea_orm_connection(db_path).await?;
         info!("SQLite store initialized at: {}", db_path.display());
-        Ok(Self { pool })
+        Ok(Self { pool, db })
+    }
+
+    /// Create a store from existing connections (for testing or sharing).
+    pub fn from_connections(pool: SqlitePool, db: DatabaseConnection) -> Self {
+        Self { pool, db }
     }
 
     /// Create a store from an existing pool (for testing or sharing pools).
+    /// Note: This creates a new SeaORM connection using the pool's URL.
+    #[deprecated(note = "Use from_connections() instead for full control")]
     pub fn from_pool(pool: SqlitePool) -> Self {
-        Self { pool }
+        // This is a legacy method - we can't easily extract the path from SqlitePool
+        // For now, create without SeaORM (will panic if SeaORM operations are used)
+        Self {
+            pool,
+            db: DatabaseConnection::Disconnected,
+        }
     }
 
-    /// Get a reference to the connection pool.
+    /// Get a reference to the sqlx connection pool.
+    /// Used for FTS5 queries and raw SQL operations.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Get a reference to the SeaORM database connection.
+    /// Used for type-safe ORM operations.
+    pub fn db(&self) -> &DatabaseConnection {
+        &self.db
     }
 
     /// Get database statistics.
@@ -86,9 +122,10 @@ impl SqliteStore {
         pool::get_db_info(&self.pool).await
     }
 
-    /// Close the connection pool.
+    /// Close both connection pools.
     pub async fn close(&self) {
         self.pool.close().await;
+        self.db.clone().close().await.ok();
     }
 
     // =========================================================================
@@ -355,39 +392,6 @@ impl SqliteStore {
     /// Get job items for a job.
     pub async fn get_job_items(&self, job_id: &str) -> Result<Vec<JobItemRecord>> {
         jobs::get_job_items(&self.pool, job_id).await
-    }
-
-    // =========================================================================
-    // Search Operations
-    // =========================================================================
-
-    /// Full-text search across entries.
-    pub async fn search_entries(&self, query: &str, limit: usize) -> Result<Vec<search::FtsResult>> {
-        search::search_entries(&self.pool, query, limit).await
-    }
-
-    /// Full-text search across pages.
-    pub async fn search_pages(&self, query: &str, limit: usize) -> Result<Vec<search::FtsResult>> {
-        search::search_pages(&self.pool, query, limit).await
-    }
-
-    /// Full-text search across issues.
-    pub async fn search_issues(
-        &self,
-        query: &str,
-        project_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<search::FtsResult>> {
-        search::search_issues(&self.pool, query, project_id, limit).await
-    }
-
-    /// Combined full-text search across all tables.
-    pub async fn search_all(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<search::FtsResult>> {
-        search::search_all(&self.pool, query, limit).await
     }
 
     // =========================================================================

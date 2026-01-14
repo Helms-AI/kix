@@ -27,7 +27,10 @@ pub use error::StoreError;
 pub use job_store::{JobAggregateStats, JobStats, JobStore};
 pub use projects::ProjectStore;
 pub use search::{EntryChunk, PatternSummary, SearchFilters, SearchResult};
-pub use store::{get_embedding_dim, KixStore, DEFAULT_EMBEDDING_DIM};
+pub use store::{get_embedding_dim, KixStore, SearchReindexStats, DEFAULT_EMBEDDING_DIM};
+
+// Re-export kix-search types for full-text search
+pub use kix_search::{SearchEngine, SearchStats, TextSearchResult};
 pub use tokens::{EncryptedTokenData, TokenStore};
 
 // Re-export types and SqliteStore from kix-sqlite for convenience

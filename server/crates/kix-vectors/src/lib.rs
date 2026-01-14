@@ -70,6 +70,7 @@ pub struct VectorSearchResult {
 }
 
 /// Vector store using SQLite + sqlite-vec.
+#[derive(Clone)]
 pub struct VectorStore {
     /// SQLite connection (rusqlite)
     conn: Arc<Mutex<Connection>>,
@@ -94,6 +95,17 @@ impl VectorStore {
         }
 
         let conn = Connection::open(&db_path)?;
+
+        // SQLite performance tuning (consistent with other KIX databases)
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 30000;
+             PRAGMA cache_size = -64000;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;"
+        )?;
 
         // Verify sqlite-vec is loaded
         let vec_version: String = conn.query_row("SELECT vec_version()", [], |row| row.get(0))?;
@@ -121,7 +133,7 @@ impl VectorStore {
         // Create virtual table for vector search using vec0
         // Note: vec0 uses float[N] syntax for vector dimensions
         let create_vec_sql = format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(
                 chunk_id TEXT PRIMARY KEY,
                 embedding float[{}]
             )",
@@ -204,10 +216,10 @@ impl VectorStore {
         conn.execute("BEGIN TRANSACTION", [])?;
 
         for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
-            // Insert into vec_chunks (vector table)
+            // Insert into chunk_vectors (vector table)
             // sqlite-vec expects vectors as raw bytes
             conn.execute(
-                "INSERT OR REPLACE INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO chunk_vectors(chunk_id, embedding) VALUES (?, ?)",
                 params![chunk.chunk_id, embedding.as_bytes()],
             )?;
 
@@ -279,7 +291,7 @@ impl VectorStore {
             format!("AND {}", clause)
         };
 
-        // Use vec_chunks MATCH for KNN search with k constraint, then join with metadata
+        // Use chunk_vectors MATCH for KNN search with k constraint, then join with metadata
         // sqlite-vec requires 'k = ?' constraint in the WHERE clause for KNN queries
         let sql = format!(
             "SELECT
@@ -294,7 +306,7 @@ impl VectorStore {
                 m.source_domain,
                 m.tags,
                 v.distance
-            FROM vec_chunks v
+            FROM chunk_vectors v
             JOIN chunk_metadata m ON v.chunk_id = m.chunk_id
             WHERE v.embedding MATCH ?1
             AND v.k = ?2
@@ -375,9 +387,9 @@ impl VectorStore {
 
         conn.execute("BEGIN TRANSACTION", [])?;
 
-        // Delete from vec_chunks
+        // Delete from chunk_vectors
         for chunk_id in &chunk_ids {
-            conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", [chunk_id])?;
+            conn.execute("DELETE FROM chunk_vectors WHERE chunk_id = ?", [chunk_id])?;
         }
 
         // Delete from metadata
@@ -407,9 +419,9 @@ impl VectorStore {
 
         conn.execute("BEGIN TRANSACTION", [])?;
 
-        // Delete from vec_chunks
+        // Delete from chunk_vectors
         for chunk_id in &chunk_ids {
-            conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", [chunk_id])?;
+            conn.execute("DELETE FROM chunk_vectors WHERE chunk_id = ?", [chunk_id])?;
         }
 
         // Delete from metadata
@@ -446,7 +458,7 @@ impl VectorStore {
         let conn = self.conn.lock().unwrap();
 
         conn.execute("BEGIN TRANSACTION", [])?;
-        conn.execute("DELETE FROM vec_chunks", [])?;
+        conn.execute("DELETE FROM chunk_vectors", [])?;
         conn.execute("DELETE FROM chunk_metadata", [])?;
         conn.execute("COMMIT", [])?;
 
@@ -525,6 +537,68 @@ impl VectorStore {
 
         Ok(results)
     }
+
+    /// Get the representative embedding for an entry.
+    ///
+    /// Returns the first chunk's embedding (chunk_index = 0), which typically
+    /// represents the title/introduction and is most representative of the entry.
+    /// Returns None if the entry has no chunks.
+    ///
+    /// This is used to avoid regenerating embeddings when finding related entries,
+    /// since the embedding already exists from indexing.
+    pub fn get_entry_embedding(&self, entry_id: &str) -> Result<Option<Vec<f32>>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Get first chunk's embedding (chunk_index = 0 is usually the title/intro)
+        // Join chunk_vectors with chunk_metadata to get embedding for first chunk
+        let result: std::result::Result<Vec<u8>, rusqlite::Error> = conn.query_row(
+            "SELECT v.embedding FROM chunk_vectors v
+             JOIN chunk_metadata m ON v.chunk_id = m.chunk_id
+             WHERE m.entry_id = ?
+             ORDER BY m.chunk_index ASC
+             LIMIT 1",
+            [entry_id],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(blob) => {
+                // Convert bytes back to Vec<f32>
+                // sqlite-vec stores embeddings as raw f32 bytes
+                let embedding = deserialize_embedding(&blob, self.embedding_dim);
+                debug!(
+                    entry_id = %entry_id,
+                    embedding_len = embedding.len(),
+                    "Retrieved cached embedding for entry"
+                );
+                Ok(Some(embedding))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                debug!(entry_id = %entry_id, "No cached embedding found for entry");
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Deserialize embedding from raw bytes.
+///
+/// sqlite-vec stores embeddings as raw f32 bytes (little-endian).
+fn deserialize_embedding(blob: &[u8], expected_dim: usize) -> Vec<f32> {
+    // Each f32 is 4 bytes
+    let num_floats = blob.len() / 4;
+    if num_floats != expected_dim {
+        tracing::warn!(
+            expected = expected_dim,
+            actual = num_floats,
+            "Embedding dimension mismatch during deserialization"
+        );
+    }
+
+    blob.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }
 
 /// Search filter for vector queries.
@@ -774,5 +848,53 @@ mod tests {
 
         store.clear_all().unwrap();
         assert_eq!(store.chunk_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_get_entry_embedding() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("vectors.db");
+        let dim = 4;
+
+        let store = VectorStore::new(&db_path, dim).unwrap();
+
+        // Create chunks with different chunk_indexes
+        let mut chunk0 = create_test_chunk("c1", "e1", "First chunk (index 0)");
+        chunk0.chunk_index = 0;
+        let mut chunk1 = create_test_chunk("c2", "e1", "Second chunk (index 1)");
+        chunk1.chunk_index = 1;
+
+        let chunks = vec![chunk0, chunk1];
+        let embeddings = vec![
+            vec![0.1, 0.2, 0.3, 0.4], // chunk_index 0
+            vec![0.5, 0.6, 0.7, 0.8], // chunk_index 1
+        ];
+
+        store.insert_chunks(&chunks, &embeddings).unwrap();
+
+        // Should return the first chunk's embedding (chunk_index = 0)
+        let result = store.get_entry_embedding("e1").unwrap();
+        assert!(result.is_some());
+
+        let embedding = result.unwrap();
+        assert_eq!(embedding.len(), dim);
+        // Verify it's the first chunk's embedding
+        assert!((embedding[0] - 0.1).abs() < 0.001);
+        assert!((embedding[1] - 0.2).abs() < 0.001);
+        assert!((embedding[2] - 0.3).abs() < 0.001);
+        assert!((embedding[3] - 0.4).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_get_entry_embedding_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("vectors.db");
+        let dim = 4;
+
+        let store = VectorStore::new(&db_path, dim).unwrap();
+
+        // No chunks inserted
+        let result = store.get_entry_embedding("nonexistent").unwrap();
+        assert!(result.is_none());
     }
 }

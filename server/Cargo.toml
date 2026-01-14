@@ -14,6 +14,8 @@ members = [
     "crates/kix-projects",
     "crates/kix-sqlite",
     "crates/kix-vectors",
+    "crates/kix-services",
+    "crates/kix-search",
 ]
 
 [workspace.package]
@@ -103,3 +105,10 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Caching
 moka = { version = "0.12", features = ["future"] }
+
+# Full-text search
+tantivy = "0.22"
+
+# ORM
+sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-native-tls", "macros"] }
+sea-orm-migration = "1.1"

@@ -36,6 +36,9 @@ use kix_sqlite::{
     EntryRecord, IssueRecord, JobRecord, PageRecord, ProjectEntryRecord, ProjectRecord,
     SqliteStore, TokenRecord,
 };
+use kix_search::{
+    EntryDocument, EntrySearchFilters, IssueDocument, PageDocument, SearchEngine,
+};
 use kix_vectors::{SearchFilter, VectorSearchResult, VectorStore};
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,10 +47,36 @@ use tracing::info;
 /// Default embedding dimensions (768 for bge-base-en-v1.5).
 pub const DEFAULT_EMBEDDING_DIM: usize = 768;
 
+/// Statistics from a full reindex operation.
+#[derive(Debug, Clone, Default)]
+pub struct SearchReindexStats {
+    /// Number of entries indexed.
+    pub entries_indexed: usize,
+    /// Number of pages indexed.
+    pub pages_indexed: usize,
+    /// Number of issues indexed.
+    pub issues_indexed: usize,
+    /// Errors encountered during reindex.
+    pub errors: Vec<String>,
+}
+
+impl SearchReindexStats {
+    /// Total documents indexed.
+    pub fn total(&self) -> usize {
+        self.entries_indexed + self.pages_indexed + self.issues_indexed
+    }
+
+    /// Whether the reindex had any errors.
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+}
+
 /// Unified KIX store using SQLite for all storage.
 ///
 /// - Structured data (entries, pages, projects, etc.) stored in kix.db via kix-sqlite
 /// - Vector embeddings stored in vectors.db via kix-vectors (sqlite-vec)
+/// - Full-text search via Tantivy (kix-search)
 pub struct KixStore {
     /// SQLite store for structured data (kix.db)
     pub sqlite: SqliteStore,
@@ -55,6 +84,8 @@ pub struct KixStore {
     pub vectors: VectorStore,
     /// Embedding dimensions
     embedding_dim: usize,
+    /// Tantivy search engine for full-text search
+    search: SearchEngine,
 }
 
 impl KixStore {
@@ -95,10 +126,18 @@ impl KixStore {
             StoreError::Database(format!("Failed to create Vector store: {}", e))
         })?;
 
+        // Initialize Tantivy search engine
+        let search_path = data_dir.join("search");
+        info!("Creating Tantivy search index at {}", search_path.display());
+        let search = SearchEngine::new(&search_path).map_err(|e| {
+            StoreError::Database(format!("Failed to create search engine: {}", e))
+        })?;
+
         Ok(Self {
             sqlite,
             vectors,
             embedding_dim,
+            search,
         })
     }
 
@@ -129,6 +168,11 @@ impl KixStore {
         &self.vectors
     }
 
+    /// Get reference to Tantivy search engine.
+    pub fn search(&self) -> &SearchEngine {
+        &self.search
+    }
+
     /// Get reference to page store (for backward compatibility, returns self since pages are in SQLite).
     pub fn page_store(&self) -> &Self {
         self
@@ -138,12 +182,20 @@ impl KixStore {
     // Entry Operations (SQLite)
     // =========================================================================
 
-    /// Insert an entry into SQLite.
+    /// Insert an entry into SQLite and Tantivy search index.
     pub async fn insert_entry(&self, entry: &EntryRecord) -> Result<(), StoreError> {
         self.sqlite
             .insert_entry(entry)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // Sync to Tantivy search index
+        let doc = entry_record_to_document(entry);
+        self.search
+            .index_entry(&doc)
+            .map_err(|e| StoreError::Database(format!("Search sync failed: {}", e)))?;
+
+        Ok(())
     }
 
     /// Get an entry by ID from SQLite.
@@ -154,10 +206,20 @@ impl KixStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    /// Delete an entry from SQLite (also deletes associated chunks).
+    /// Delete an entry from SQLite and Tantivy (also deletes associated chunks).
     pub async fn delete_entry(&self, id: &str) -> Result<bool, StoreError> {
-        // Delete chunks from vector store first
-        let _ = self.vectors.delete_chunks_by_entry(id);
+        // Delete chunks from vector store first (via spawn_blocking)
+        let vectors = self.vectors.clone();
+        let id_owned = id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            vectors.delete_chunks_by_entry(&id_owned)
+        })
+        .await;
+
+        // Delete from Tantivy search index
+        self.search
+            .delete_entry(id)
+            .map_err(|e| StoreError::Database(format!("Search delete failed: {}", e)))?;
 
         self.sqlite
             .delete_entry(id)
@@ -210,8 +272,8 @@ impl KixStore {
     }
 
     /// Delete chunks by document ID (alias for delete_chunks_by_entry).
-    pub fn delete_chunks_by_document(&self, entry_id: &str) -> Result<usize, StoreError> {
-        self.delete_chunks_by_entry(entry_id)
+    pub async fn delete_chunks_by_document(&self, entry_id: &str) -> Result<usize, StoreError> {
+        self.delete_chunks_by_entry(entry_id).await
     }
 
     /// Insert documents from kix_parser Entry type (with automatic conversion).
@@ -227,12 +289,20 @@ impl KixStore {
     // Page Operations (SQLite)
     // =========================================================================
 
-    /// Insert a page into SQLite.
+    /// Insert a page into SQLite and Tantivy search index.
     pub async fn insert_page(&self, page: &PageRecord) -> Result<(), StoreError> {
         self.sqlite
             .insert_page(page)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // Sync to Tantivy search index
+        let doc = page_record_to_document(page);
+        self.search
+            .index_page(&doc)
+            .map_err(|e| StoreError::Database(format!("Search sync failed: {}", e)))?;
+
+        Ok(())
     }
 
     /// Get a page by ID from SQLite.
@@ -275,10 +345,18 @@ impl KixStore {
     }
 
     /// Delete chunks by entry ID from vector store.
-    pub fn delete_chunks_by_entry(&self, entry_id: &str) -> Result<usize, StoreError> {
-        self.vectors
-            .delete_chunks_by_entry(entry_id)
-            .map_err(|e| StoreError::Database(e.to_string()))
+    ///
+    /// Uses spawn_blocking to avoid blocking the async runtime.
+    pub async fn delete_chunks_by_entry(&self, entry_id: &str) -> Result<usize, StoreError> {
+        let vectors = self.vectors.clone();
+        let entry_id = entry_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            vectors.delete_chunks_by_entry(&entry_id)
+        })
+        .await
+        .map_err(|e| StoreError::Internal(format!("spawn_blocking failed: {}", e)))?
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Get chunk count from vector store.
@@ -322,9 +400,10 @@ impl KixStore {
     // Hybrid Search
     // =========================================================================
 
-    /// Perform hybrid search combining vector search and FTS.
+    /// Perform hybrid search combining vector search and Tantivy full-text search.
     ///
     /// Uses Reciprocal Rank Fusion to combine results from both sources.
+    /// Vector search uses spawn_blocking to avoid blocking the async runtime.
     pub async fn hybrid_search(
         &self,
         query_text: &str,
@@ -332,19 +411,28 @@ impl KixStore {
         limit: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<SearchResult>, StoreError> {
-        // 1. Vector search in VectorStore
+        // 1. Vector search in VectorStore (via spawn_blocking)
+        let vectors = self.vectors.clone();
         let vec_filter = filters_to_vec_filter(filters);
-        let vector_results = self
-            .vectors
-            .vector_search(query_embedding, limit * 2, vec_filter.as_ref())
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let query_embedding = query_embedding.to_vec();
+        let vector_limit = limit * 2;
 
-        // 2. FTS search in SQLite
-        let fts_results = self
-            .sqlite
-            .search_entries(query_text, limit * 2)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let vector_results = tokio::task::spawn_blocking(move || {
+            vectors.vector_search(&query_embedding, vector_limit, vec_filter.as_ref())
+        })
+        .await
+        .map_err(|e| StoreError::Internal(format!("spawn_blocking failed: {}", e)))?
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // 2. Tantivy full-text search
+        let tantivy_filters = EntrySearchFilters {
+            entry_type: filters.entry_type.clone(),
+            source_domain: filters.source_domain.clone(),
+            tag: filters.tag.clone(),
+        };
+        let fts_results = self.search
+            .search_entries(query_text, limit * 2, &tantivy_filters)
+            .map_err(|e| StoreError::Database(format!("Tantivy search failed: {}", e)))?;
 
         // 3. Combine using Reciprocal Rank Fusion
         let combined = reciprocal_rank_fusion(&vector_results, &fts_results, limit);
@@ -353,17 +441,25 @@ impl KixStore {
     }
 
     /// Perform vector-only search.
-    pub fn vector_search(
+    ///
+    /// Uses spawn_blocking to avoid blocking the async runtime,
+    /// since VectorStore uses a blocking mutex internally.
+    pub async fn vector_search(
         &self,
         query_embedding: &[f32],
         limit: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<SearchResult>, StoreError> {
+        let vectors = self.vectors.clone();
         let vec_filter = filters_to_vec_filter(filters);
-        let results = self
-            .vectors
-            .vector_search(query_embedding, limit, vec_filter.as_ref())
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let query_embedding = query_embedding.to_vec();
+
+        let results = tokio::task::spawn_blocking(move || {
+            vectors.vector_search(&query_embedding, limit, vec_filter.as_ref())
+        })
+        .await
+        .map_err(|e| StoreError::Internal(format!("spawn_blocking failed: {}", e)))?
+        .map_err(|e| StoreError::Database(e.to_string()))?;
 
         Ok(vec_results_to_search_results(&results))
     }
@@ -424,12 +520,20 @@ impl KixStore {
     // Issue Operations (SQLite)
     // =========================================================================
 
-    /// Insert an issue.
+    /// Insert an issue into SQLite and Tantivy search index.
     pub async fn insert_issue(&self, issue: &IssueRecord) -> Result<(), StoreError> {
         self.sqlite
             .insert_issue(issue)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // Sync to Tantivy search index
+        let doc = issue_record_to_document(issue);
+        self.search
+            .index_issue(&doc)
+            .map_err(|e| StoreError::Database(format!("Search sync failed: {}", e)))?;
+
+        Ok(())
     }
 
     /// Get an issue by ID.
@@ -454,16 +558,31 @@ impl KixStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    /// Update an issue.
+    /// Update an issue in SQLite and Tantivy search index.
     pub async fn update_issue(&self, issue: &IssueRecord) -> Result<bool, StoreError> {
-        self.sqlite
+        let result = self.sqlite
             .update_issue(issue)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        // Sync to Tantivy search index
+        if result {
+            let doc = issue_record_to_document(issue);
+            self.search
+                .index_issue(&doc)
+                .map_err(|e| StoreError::Database(format!("Search sync failed: {}", e)))?;
+        }
+
+        Ok(result)
     }
 
-    /// Delete an issue.
+    /// Delete an issue from SQLite and Tantivy search index.
     pub async fn delete_issue(&self, id: &str) -> Result<bool, StoreError> {
+        // Delete from Tantivy search index first
+        self.search
+            .delete_issue(id)
+            .map_err(|e| StoreError::Database(format!("Search delete failed: {}", e)))?;
+
         self.sqlite
             .delete_issue(id)
             .await
@@ -617,8 +736,98 @@ impl KixStore {
             .clear_all()
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
+        // Clear Tantivy search indexes
+        self.search
+            .clear_all()
+            .map_err(|e| StoreError::Database(format!("Failed to clear search: {}", e)))?;
+
         info!("Cleared all data from KIX store");
         Ok(())
+    }
+
+    // =========================================================================
+    // Tantivy Search Operations (when feature enabled)
+    // =========================================================================
+
+    /// Full reindex of all entries, pages, and issues from SQLite to Tantivy.
+    ///
+    /// This is useful when rebuilding the search index.
+    pub async fn full_reindex(&self) -> Result<SearchReindexStats, StoreError> {
+        use tracing::warn;
+
+        info!("Starting full reindex to Tantivy search");
+
+        // Clear existing indexes
+        self.search
+            .clear_all()
+            .map_err(|e| StoreError::Database(format!("Failed to clear search: {}", e)))?;
+
+        let mut stats = SearchReindexStats::default();
+
+        // Reindex entries
+        let entries = self.list_entries(None, None, 100000, 0).await?;
+        info!("Reindexing {} entries", entries.len());
+        for entry in &entries {
+            let doc = entry_record_to_document(entry);
+            match self.search.index_entry(&doc) {
+                Ok(_) => stats.entries_indexed += 1,
+                Err(e) => {
+                    warn!(entry_id = %entry.id, error = %e, "Failed to index entry");
+                    stats.errors.push(format!("Entry {}: {}", entry.id, e));
+                }
+            }
+        }
+
+        // Reindex pages (via entries)
+        info!("Reindexing pages for {} entries", entries.len());
+        for entry in &entries {
+            let pages = self.sqlite.get_pages_by_source(&entry.id).await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            for page in &pages {
+                let doc = page_record_to_document(page);
+                match self.search.index_page(&doc) {
+                    Ok(_) => stats.pages_indexed += 1,
+                    Err(e) => {
+                        warn!(page_id = %page.page_id, error = %e, "Failed to index page");
+                        stats.errors.push(format!("Page {}: {}", page.page_id, e));
+                    }
+                }
+            }
+        }
+
+        // Reindex issues (for all projects)
+        let projects = self.list_projects(true).await?;
+        for project in &projects {
+            let issues = self.list_issues(&project.id, None, 100000, 0).await?;
+            info!("Reindexing {} issues for project {}", issues.len(), project.id);
+            for issue in &issues {
+                let doc = issue_record_to_document(issue);
+                match self.search.index_issue(&doc) {
+                    Ok(_) => stats.issues_indexed += 1,
+                    Err(e) => {
+                        warn!(issue_id = %issue.id, error = %e, "Failed to index issue");
+                        stats.errors.push(format!("Issue {}: {}", issue.id, e));
+                    }
+                }
+            }
+        }
+
+        info!(
+            entries = stats.entries_indexed,
+            pages = stats.pages_indexed,
+            issues = stats.issues_indexed,
+            errors = stats.errors.len(),
+            "Full reindex complete"
+        );
+
+        Ok(stats)
+    }
+
+    /// Get Tantivy search index statistics.
+    pub fn search_stats(&self) -> Result<kix_search::SearchStats, StoreError> {
+        self.search
+            .stats()
+            .map_err(|e| StoreError::Database(format!("Failed to get search stats: {}", e)))
     }
 
     // =========================================================================
@@ -665,10 +874,43 @@ impl KixStore {
     }
 
     /// Get chunks by entry ID from vector store (returns chunk metadata).
-    pub fn get_chunks_by_entry_id(&self, entry_id: &str) -> Result<Vec<VectorSearchResult>, StoreError> {
-        self.vectors
-            .get_chunks_by_entry(entry_id)
-            .map_err(|e| StoreError::Database(e.to_string()))
+    ///
+    /// Uses spawn_blocking to avoid blocking the async runtime,
+    /// since VectorStore uses a blocking mutex internally.
+    pub async fn get_chunks_by_entry_id(&self, entry_id: &str) -> Result<Vec<VectorSearchResult>, StoreError> {
+        let vectors = self.vectors.clone();
+        let entry_id = entry_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            vectors.get_chunks_by_entry(&entry_id)
+        })
+        .await
+        .map_err(|e| StoreError::Internal(format!("spawn_blocking failed: {}", e)))?
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get the cached embedding for an entry.
+    ///
+    /// Returns the first chunk's embedding (chunk_index = 0), which is typically
+    /// the most representative of the entry's content. This avoids regenerating
+    /// embeddings via Ollama when finding related entries.
+    ///
+    /// Uses spawn_blocking to avoid blocking the async runtime.
+    ///
+    /// # Returns
+    /// - `Ok(Some(embedding))` - Cached embedding found
+    /// - `Ok(None)` - Entry has no chunks (fallback to generation needed)
+    /// - `Err(...)` - Database error
+    pub async fn get_entry_embedding(&self, entry_id: &str) -> Result<Option<Vec<f32>>, StoreError> {
+        let vectors = self.vectors.clone();
+        let entry_id = entry_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            vectors.get_entry_embedding(&entry_id)
+        })
+        .await
+        .map_err(|e| StoreError::Internal(format!("spawn_blocking failed: {}", e)))?
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 }
 
@@ -717,10 +959,10 @@ fn vec_results_to_search_results(vec_results: &[VectorSearchResult]) -> Vec<Sear
         .collect()
 }
 
-/// Reciprocal Rank Fusion to combine vector and FTS results.
+/// Reciprocal Rank Fusion to combine vector and Tantivy full-text search results.
 fn reciprocal_rank_fusion(
     vector_results: &[VectorSearchResult],
-    fts_results: &[kix_sqlite::search::FtsResult],
+    tantivy_results: &[kix_search::TextSearchResult],
     limit: usize,
 ) -> Vec<SearchResult> {
     const K: f32 = 60.0; // RRF constant
@@ -748,12 +990,12 @@ fn reciprocal_rank_fusion(
         });
     }
 
-    // Add FTS scores (FTS results are entry-level, we boost chunks from those entries)
-    for (rank, fts_result) in fts_results.iter().enumerate() {
+    // Add Tantivy scores (Tantivy results are entry-level, we boost chunks from those entries)
+    for (rank, tantivy_result) in tantivy_results.iter().enumerate() {
         let rrf_score = 1.0 / (K + rank as f32);
         // Find chunks belonging to this entry and boost them
         for result in vector_results.iter() {
-            if result.entry_id == fts_result.id {
+            if result.entry_id == tantivy_result.id {
                 *scores.entry(result.chunk_id.clone()).or_insert(0.0) += rrf_score;
             }
         }
@@ -793,6 +1035,75 @@ pub fn get_embedding_dim() -> usize {
                 DEFAULT_EMBEDDING_DIM
             }
         })
+}
+
+// =========================================================================
+// Tantivy Search Integration
+// =========================================================================
+
+/// Convert EntryRecord to Tantivy EntryDocument.
+fn entry_record_to_document(entry: &EntryRecord) -> EntryDocument {
+    let tags: Vec<String> = entry
+        .tags
+        .as_ref()
+        .and_then(|t| serde_json::from_str(t).ok())
+        .unwrap_or_default();
+
+    let created_at = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    EntryDocument {
+        id: entry.id.clone(),
+        title: entry.title.clone(),
+        description: entry.description.clone(),
+        content: entry.content.clone(),
+        entry_type: entry.entry_type.clone(),
+        source_domain: entry.source_domain.clone(),
+        source_path: entry.source_path.clone(),
+        tags,
+        created_at,
+    }
+}
+
+/// Convert PageRecord to Tantivy PageDocument.
+fn page_record_to_document(page: &PageRecord) -> PageDocument {
+    let created_at = chrono::DateTime::parse_from_rfc3339(&page.created_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    PageDocument {
+        page_id: page.page_id.clone(),
+        entry_id: page.source_id.clone(),
+        url: page.url.clone(),
+        title: page.title.clone(),
+        content: page.full_content.clone(),
+        created_at,
+    }
+}
+
+/// Convert IssueRecord to Tantivy IssueDocument.
+fn issue_record_to_document(issue: &IssueRecord) -> IssueDocument {
+    let labels: Vec<String> = issue
+        .labels
+        .as_ref()
+        .and_then(|l| serde_json::from_str(l).ok())
+        .unwrap_or_default();
+
+    let created_at = chrono::DateTime::parse_from_rfc3339(&issue.created_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    IssueDocument {
+        id: issue.id.clone(),
+        project_id: issue.project_id.clone(),
+        number: issue.number,
+        title: issue.title.clone(),
+        body: issue.body.clone(),
+        state: issue.state.clone(),
+        labels,
+        created_at,
+    }
 }
 
 /// Convert a kix_parser Entry to kix_sqlite EntryRecord.

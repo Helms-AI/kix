@@ -73,6 +73,13 @@ impl AuthStore {
             .connect_with(options)
             .await?;
 
+        // Set additional performance PRAGMAs
+        sqlx::query("PRAGMA synchronous = NORMAL").execute(&pool).await?;
+        sqlx::query("PRAGMA cache_size = -64000").execute(&pool).await?; // 64MB
+        sqlx::query("PRAGMA mmap_size = 268435456").execute(&pool).await?; // 256MB
+        sqlx::query("PRAGMA temp_store = MEMORY").execute(&pool).await?;
+        sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await?;
+
         Ok(Self { pool })
     }
 

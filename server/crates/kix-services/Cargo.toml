@@ -1,0 +1,44 @@
+[package]
+name = "kix-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared service layer for KIX API and MCP server"
+
+[dependencies]
+# Internal crates
+kix-store = { path = "../kix-store" }
+kix-projects = { path = "../kix-projects" }
+kix-embeddings = { path = "../kix-embeddings" }
+kix-parser = { path = "../kix-parser" }
+kix-jobs = { path = "../kix-jobs" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# HTTP types for StatusCode mapping
+axum = { workspace = true }
+
+# MCP types for error mapping
+rmcp = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

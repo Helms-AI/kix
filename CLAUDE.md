@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 KIX (Knowledge Indexer) - A high-performance Rust-based semantic search and knowledge management system. Originally built for Enterprise Integration Patterns, now a general-purpose knowledge indexing system. It provides:
-- Vector storage with LanceDB for semantic search
+- SQLite storage with in-memory vectors for semantic search
+- Full-text search via Tantivy (BM25 ranking)
 - Multi-format document parsing (HTML, PDF, DOCX, Excel, CSV, Markdown)
 - MCP (Model Context Protocol) server for AI assistant integration
 - REST API for a React dashboard
@@ -24,9 +25,8 @@ cargo test --manifest-path server/Cargo.toml -p kix-parser      # Run tests for 
 
 ### CLI Usage
 ```bash
-./server/target/release/kix api --port 3001                     # Start REST API
-./server/target/release/kix serve                               # Start MCP server (stdio)
-./server/target/release/kix serve-http --port 3002              # Start MCP server (HTTP)
+./server/target/release/kix api --api-port 3001 --mcp-port 3002 # Start REST API
+./server/target/release/kix serve                               # Start MCP server (HTTP)
 ./server/target/release/kix search "query" --limit 5            # CLI search
 ./server/target/release/kix stats                               # Show index statistics
 ```
@@ -41,9 +41,9 @@ cd client && npm run lint             # Run ESLint
 ### Docker
 ```bash
 ./build.sh                            # Build all artifacts
-docker compose build                  # Build Docker images (with SIMD optimizations)
-docker compose up -d                  # Start services
-docker compose run --rm kix-tools     # Run utility commands
+nerdctl compose build                  # Build Docker images (with SIMD optimizations)
+nerdctl compose up -d                  # Start services
+nerdctl compose run --rm kix-tools     # Run utility commands
 ```
 
 ### Performance Builds
@@ -60,14 +60,17 @@ cargo build --release --features onnx-coreml --manifest-path server/Cargo.toml
 
 ## Architecture
 
-### Rust Workspace (11 crates)
+### Rust Workspace (14 crates)
 
 ```
 server/crates/
 ├── kix-cli/         # Main CLI binary - orchestrates all other crates
 ├── kix-parser/      # Document parsing, smart chunking, code validation
-├── kix-embeddings/  # Embedding generation (fastembed) with contextual support
-├── kix-store/       # LanceDB two-layer storage (pages + chunks + projects)
+├── kix-embeddings/  # Embedding generation via Ollama (GPU auto-detection)
+├── kix-sqlite/      # SQLite + SeaORM persistence layer (entities + migrations)
+├── kix-search/      # Tantivy full-text search engine (BM25 ranking)
+├── kix-store/       # SQLite two-layer storage (pages + chunks + projects)
+├── kix-services/    # Shared service layer for API and MCP (business logic)
 ├── kix-mcp/         # MCP server with search/indexing/project tools (rmcp crate)
 ├── kix-api/         # Axum REST API for dashboard
 ├── kix-crawler/     # URL discovery, crawling strategies, code extraction
@@ -106,6 +109,36 @@ kix-parser/
 └── ...               # PDF, DOCX, Excel, CSV, Markdown parsers
 ```
 
+### kix-sqlite (SeaORM Entities + Migrations)
+
+```
+kix-sqlite/
+├── lib.rs            # SqliteStore with pool and SeaORM connection
+├── entities/         # SeaORM entity definitions
+│   ├── entry.rs      # Entry (document metadata)
+│   ├── page.rs       # Page (full content for RAG)
+│   ├── project.rs    # Project (with GitHub config)
+│   ├── issue.rs      # Issue (local + GitHub sync)
+│   ├── job.rs        # Job (indexing jobs)
+│   └── ...           # Other entities (token, sync, etc.)
+├── migrations/       # SQL migration files
+├── entries.rs        # Entry CRUD operations
+├── pages.rs          # Page CRUD operations
+├── projects.rs       # Project CRUD operations
+└── issues.rs         # Issue CRUD operations
+```
+
+### kix-search (Tantivy Full-Text Search)
+
+```
+kix-search/
+├── lib.rs            # SearchEngine struct
+├── schema.rs         # Tantivy field definitions (entries, pages, issues)
+├── indexer.rs        # Index writer operations (batch, delete)
+├── searcher.rs       # Search query execution (BM25 ranking)
+└── sync.rs           # DB → Index synchronization
+```
+
 ### kix-store Two-Layer Storage
 
 ```
@@ -114,7 +147,7 @@ kix-store/
 ├── pages.rs          # PageStore for full page content (RAG context)
 ├── projects.rs       # ProjectStore for project/issue/link storage
 ├── search.rs         # Hybrid search (vector + full-text)
-└── schema.rs         # LanceDB schemas for entries, chunks, pages, projects
+└── schema.rs         # SQLite schemas for entries, chunks, pages, projects
 ```
 
 ### kix-projects Module
@@ -135,9 +168,25 @@ kix-projects/
     └── tokens.rs         # Secure token storage (AES-256-GCM)
 ```
 
+### kix-services Module (Shared Service Layer)
+
+```
+kix-services/
+├── lib.rs            # Module exports and re-exports
+├── error.rs          # ServiceError (maps to StatusCode + McpError)
+├── retrieval.rs      # Search, documents, context, semantic similarity
+├── projects.rs       # Project CRUD operations
+├── issues.rs         # Issue CRUD with GitHub sync
+├── github.rs         # Token management, user/org/repo queries
+├── indexing.rs       # Indexing types and job management types
+└── knowledge.rs      # Entry linking, project-scoped search
+```
+
 ### Key Dependencies
-- **fastembed**: Local embedding model (no external API calls)
-- **lancedb**: Vector database with hybrid search support
+- **Ollama**: Local embedding model server (GPU auto-detection)
+- **sea-orm**: Async ORM for SQLite database operations
+- **tantivy**: Full-text search engine with BM25 ranking
+- **rusqlite + sqlite-vec**: SQLite database with vector search
 - **rmcp**: Model Context Protocol server implementation
 - **axum**: Web framework for REST API
 - **tokio**: Async runtime
@@ -153,9 +202,10 @@ kix-projects/
 │  3. Processing     → Readability extraction → Markdown          │
 │  4. Code Extract   → 30+ patterns with multi-stage validation   │
 │  5. Smart Chunking → Code blocks → paragraphs → sentences       │
-│  6. Embeddings     → fastembed with optional page context       │
-│  7. Two-Layer Store→ Pages (full) + Chunks (searchable) in Lance│
-│  8. Search         → Hybrid (vector + FTS) with RAG context     │
+│  6. Embeddings     → Ollama with GPU auto-detection             │
+│  7. Two-Layer Store→ Pages (full) + Chunks (searchable) in SQLite│
+│  8. Tantivy Index  → Full-text search with BM25 ranking         │
+│  9. Search         → Hybrid (vector + Tantivy) with RAG context │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -179,6 +229,112 @@ kix-projects/
 - `CrawlerService` (kix-crawler): 9-stage crawl pipeline with progress and cancellation
 - `SmartChunker` (kix-parser): Smart chunking with consolidation
 - `CodeValidator` (kix-parser): Multi-stage validation (length, structure, prose ratio)
+
+## API/MCP Unification Architecture
+
+KIX uses a unified service layer to ensure consistency between the REST API and MCP server.
+
+### Architecture Pattern
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Unified Service Architecture                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  User ──────► REST API ──────┐                                   │
+│              (kix-api)        │                                   │
+│                               ├──► kix-services ◄── Store Layer  │
+│  MCP Client ► MCP Server ────┘    (shared logic)                 │
+│              (kix-mcp)                                            │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Design Principles
+
+1. **Every MCP tool MUST have a corresponding REST API endpoint**
+   - MCP tools live in `kix-mcp`, API endpoints live in `kix-api`
+   - Both call shared functions in `kix-services`
+
+2. **API Path Conventions**
+   - MCP-equivalent endpoints: `/api/mcp/*` (thin wrappers for MCP tools)
+   - Domain-specific endpoints: `/api/{domain}/*` (e.g., `/api/projects/*`, `/api/indexing/*`)
+   - API endpoints can have additional features beyond MCP (pagination, filtering, etc.)
+
+3. **Shared Service Layer (`kix-services`)**
+   - All business logic lives in `kix-services`
+   - Services are stateless, receive stores/event bus as parameters
+   - Services emit events through optional `SharedEventBus`
+
+4. **Event Centralization**
+   - Services receive optional `SharedEventBus`
+   - Events emit from services, not handlers
+   - Both API and MCP trigger the same events
+
+### Example: Creating an Issue
+
+```rust
+// kix-services/src/issues.rs (shared logic)
+pub async fn create_issue(
+    store: &ProjectStore,
+    event_bus: Option<&SharedEventBus>,
+    github_client: Option<&GitHubRestClient>,
+    project: &str,
+    data: CreateIssueData,
+    options: IssueOptions,
+) -> Result<Issue, ServiceError> {
+    // Business logic here (GitHub sync, validation, etc.)
+    // ...
+    if let Some(bus) = event_bus {
+        bus.emit(ProjectEvent::IssueCreated { ... });
+    }
+    Ok(issue)
+}
+
+// kix-api/src/project_routes.rs (thin handler)
+async fn create_issue_handler(...) -> impl IntoResponse {
+    let issue = kix_services::issues::create_issue(
+        &state.store, Some(&state.event_bus), ...
+    ).await?;
+    Json(IssueResponse::from(issue))
+}
+
+// kix-mcp/src/server.rs (thin tool)
+#[tool]
+async fn create_issue(&self, params: CreateIssueParams) -> Result<...> {
+    let issue = kix_services::issues::create_issue(
+        &self.store, Some(&self.event_bus), ...
+    ).await?;
+    Ok(CallToolResult::from(issue))
+}
+```
+
+### kix-services Module Structure
+
+```
+server/crates/kix-services/
+├── Cargo.toml
+└── src/
+    ├── lib.rs          # Module exports
+    ├── error.rs        # ServiceError (maps to StatusCode + McpError)
+    ├── retrieval.rs    # search, get_document, get_context, find_related
+    ├── projects.rs     # Project CRUD operations
+    ├── issues.rs       # Issue CRUD + GitHub sync
+    ├── github.rs       # Token management, user/org/repo queries
+    ├── indexing.rs     # URL/file indexing, job management
+    └── knowledge.rs    # Entry linking, project-scoped search
+```
+
+### Adding New Functionality Checklist
+
+When adding new functionality:
+
+1. [ ] Create service function in `kix-services`
+2. [ ] Add REST API endpoint in `kix-api` (at logical path)
+3. [ ] Add MCP tool in `kix-mcp`
+4. [ ] Ensure both call the shared service function
+5. [ ] Events emit from service, not handlers
+6. [ ] Update tests for service, API, and MCP
 
 ## Smart Chunking
 
@@ -204,7 +360,7 @@ KIX uses intelligent chunking optimized for documentation and code content:
 | crawling | 25-60% | Page fetching |
 | processing | 60-75% | HTML → Markdown |
 | source_creation | 75-80% | Entry creation |
-| document_storage | 80-90% | LanceDB storage |
+| document_storage | 80-90% | SQLite storage |
 | code_extraction | 90-95% | Code block extraction |
 | finalization | 95-100% | Cleanup and completion |
 
@@ -267,7 +423,9 @@ Tests are colocated with source files using `#[cfg(test)]` modules. **170+ tests
 ```bash
 cargo test --release -p kix-crawler    # 59 tests (discovery, code, strategies, etc.)
 cargo test --release -p kix-parser     # 40 tests (chunker, validator, parsers)
-cargo test --release -p kix-store      # 28 tests (pages, search, schema, projects)
+cargo test --release -p kix-sqlite     # 33 tests (entities, CRUD operations)
+cargo test --release -p kix-search     # 21 tests (Tantivy indexing, search)
+cargo test --release -p kix-store      # 3 tests (pages, hybrid search, projects)
 cargo test --release -p kix-projects   # 47 tests (project, issue, github, events)
 ```
 

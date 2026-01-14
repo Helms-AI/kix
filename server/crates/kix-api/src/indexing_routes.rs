@@ -614,9 +614,7 @@ async fn reindex_entry(
     // Delete existing entry and chunks
     {
         let store = state.app_state.store().write().await;
-        if let Err(e) = store.delete_chunks_by_entry(&id) {  // sync operation
-            error!(error = %e, "Failed to delete chunks for entry");
-        }
+        // delete_entry handles chunk deletion internally
         if let Err(e) = store.delete_entry(&id).await {
             error!(error = %e, "Failed to delete entry");
         }
@@ -698,9 +696,7 @@ async fn reindex_by_domain(
         // Delete existing entry and chunks
         {
             let store = state.app_state.store().write().await;
-            if let Err(e) = store.delete_chunks_by_entry(&entry_id) {  // sync operation
-                error!(error = %e, entry_id = %entry_id, "Failed to delete chunks");
-            }
+            // delete_entry handles chunk deletion internally
             if let Err(e) = store.delete_entry(&entry_id).await {
                 error!(error = %e, entry_id = %entry_id, "Failed to delete entry");
             }
