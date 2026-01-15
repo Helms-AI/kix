@@ -4,9 +4,9 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// A project is a user-created workspace for organizing knowledge and issues.
+/// A project is a user-created workspace for organizing knowledge and work items.
 ///
-/// Projects require a GitHub repository connection for issues and project board functionality.
+/// Projects are local-only containers for work items with Kanban board functionality.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Project {
     /// Unique identifier (UUID)
@@ -21,9 +21,6 @@ pub struct Project {
     /// Short description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-
-    /// GitHub repository configuration (required)
-    pub github: GitHubConfig,
 
     /// Project color for UI (hex without #, e.g., "4f46e5")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,125 +41,162 @@ pub struct Project {
     pub updated_at: DateTime<Utc>,
 }
 
-/// GitHub repository configuration for a project.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct GitHubConfig {
-    /// Repository owner (e.g., "anthropics")
-    pub owner: String,
-
-    /// Repository name (e.g., "claude-code")
-    pub repo: String,
-
-    /// Repository node ID (for GraphQL operations)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repository_id: Option<String>,
-
-    /// GitHub Project V2 configuration (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_v2: Option<GitHubProjectV2Config>,
-
-    /// Sync settings
-    #[serde(default)]
-    pub sync: GitHubSyncConfig,
-
-    /// Last successful sync timestamp
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_synced_at: Option<DateTime<Utc>>,
-
-    /// Last sync error (if any)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-}
-
-/// GitHub Project V2 board configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct GitHubProjectV2Config {
-    /// GitHub Project node ID (e.g., "PVT_...")
-    pub project_id: String,
-
-    /// Project number (human-readable)
-    pub project_number: u32,
-
-    /// Project URL
-    pub url: String,
-
-    /// Status field ID for updating item status
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status_field_id: Option<String>,
-
-    /// Status options mapped to field option IDs
-    #[serde(default)]
-    pub status_options: Vec<StatusOption>,
-
-    /// Custom field IDs for additional fields (Priority, Sprint, etc.)
-    #[serde(default)]
-    pub custom_fields: Vec<CustomFieldConfig>,
-}
-
-/// A status option in a GitHub Project.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct StatusOption {
-    /// Option name (e.g., "Todo", "In Progress", "Done")
-    pub name: String,
-
-    /// GitHub option ID
-    pub option_id: String,
-}
-
-/// A custom field in a GitHub Project.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CustomFieldConfig {
-    /// Field name (e.g., "Priority", "Sprint")
-    pub name: String,
-
-    /// GitHub field ID
-    pub field_id: String,
-
-    /// Field type
-    pub field_type: ProjectFieldType,
-
-    /// Options for single-select fields
-    #[serde(default)]
-    pub options: Vec<StatusOption>,
-}
-
-/// GitHub Project field types.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectFieldType {
-    Text,
-    Number,
-    Date,
-    SingleSelect,
-    Iteration,
-}
-
-/// GitHub sync configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct GitHubSyncConfig {
-    /// Enable automatic sync
-    #[serde(default)]
-    pub auto_sync: bool,
-
-    /// Sync interval in minutes (0 = manual only)
-    #[serde(default)]
-    pub interval_minutes: u32,
-
-    /// Issue labels to sync (empty = all)
-    #[serde(default)]
-    pub labels: Vec<String>,
-
-    /// Issue states to sync
-    #[serde(default)]
-    pub states: Vec<IssueState>,
-}
-
-/// Issue state.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+/// Issue type for hierarchy enforcement.
+///
+/// Hierarchy rules (flexible - any type can be created independently):
+/// - Epic → Story, Bug, Task
+/// - Story → Task, Subtask
+/// - Task → Subtask
+/// - Bug → Subtask
+/// - Subtask → (none)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum IssueState {
-    Open,
-    Closed,
+pub enum IssueType {
+    /// Top-level container for related work
+    Epic,
+    /// User story or feature request
+    Story,
+    /// Implementation task
+    #[default]
+    Task,
+    /// Sub-task under a task or story
+    Subtask,
+    /// Bug report or defect
+    Bug,
+}
+
+impl IssueType {
+    /// Check if this issue type can contain a child of the given type.
+    pub fn can_contain(&self, child: IssueType) -> bool {
+        match self {
+            IssueType::Epic => matches!(child, IssueType::Story | IssueType::Bug | IssueType::Task),
+            IssueType::Story => matches!(child, IssueType::Task | IssueType::Subtask),
+            IssueType::Task => matches!(child, IssueType::Subtask),
+            IssueType::Bug => matches!(child, IssueType::Subtask),
+            IssueType::Subtask => false,
+        }
+    }
+
+    /// Get all valid child types for this issue type.
+    pub fn valid_children(&self) -> Vec<IssueType> {
+        match self {
+            IssueType::Epic => vec![IssueType::Story, IssueType::Bug, IssueType::Task],
+            IssueType::Story => vec![IssueType::Task, IssueType::Subtask],
+            IssueType::Task => vec![IssueType::Subtask],
+            IssueType::Bug => vec![IssueType::Subtask],
+            IssueType::Subtask => vec![],
+        }
+    }
+
+    /// Get all valid parent types for this issue type.
+    pub fn valid_parents(&self) -> Vec<IssueType> {
+        match self {
+            IssueType::Epic => vec![], // Epics have no parents
+            IssueType::Story => vec![IssueType::Epic],
+            IssueType::Task => vec![IssueType::Epic, IssueType::Story],
+            IssueType::Subtask => vec![IssueType::Story, IssueType::Task, IssueType::Bug],
+            IssueType::Bug => vec![IssueType::Epic],
+        }
+    }
+
+    /// Convert from string representation.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "epic" => Some(IssueType::Epic),
+            "story" => Some(IssueType::Story),
+            "task" => Some(IssueType::Task),
+            "subtask" => Some(IssueType::Subtask),
+            "bug" => Some(IssueType::Bug),
+            _ => None,
+        }
+    }
+
+    /// Convert to string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IssueType::Epic => "epic",
+            IssueType::Story => "story",
+            IssueType::Task => "task",
+            IssueType::Subtask => "subtask",
+            IssueType::Bug => "bug",
+        }
+    }
+}
+
+impl std::fmt::Display for IssueType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Board column representing workflow state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardColumn {
+    #[default]
+    Backlog,
+    Todo,
+    InProgress,
+    InReview,
+    Testing,
+    Done,
+}
+
+impl BoardColumn {
+    /// All columns in workflow order.
+    pub fn all() -> Vec<BoardColumn> {
+        vec![
+            BoardColumn::Backlog,
+            BoardColumn::Todo,
+            BoardColumn::InProgress,
+            BoardColumn::InReview,
+            BoardColumn::Testing,
+            BoardColumn::Done,
+        ]
+    }
+
+    /// Convert from string representation.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "backlog" => Some(BoardColumn::Backlog),
+            "todo" => Some(BoardColumn::Todo),
+            "in_progress" => Some(BoardColumn::InProgress),
+            "in_review" => Some(BoardColumn::InReview),
+            "testing" => Some(BoardColumn::Testing),
+            "done" => Some(BoardColumn::Done),
+            _ => None,
+        }
+    }
+
+    /// Convert to string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BoardColumn::Backlog => "backlog",
+            BoardColumn::Todo => "todo",
+            BoardColumn::InProgress => "in_progress",
+            BoardColumn::InReview => "in_review",
+            BoardColumn::Testing => "testing",
+            BoardColumn::Done => "done",
+        }
+    }
+
+    /// Get display name for the column.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            BoardColumn::Backlog => "Backlog",
+            BoardColumn::Todo => "To Do",
+            BoardColumn::InProgress => "In Progress",
+            BoardColumn::InReview => "In Review",
+            BoardColumn::Testing => "Testing",
+            BoardColumn::Done => "Done",
+        }
+    }
+}
+
+impl std::fmt::Display for BoardColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
 }
 
 /// Cached project statistics for quick display.
@@ -183,7 +217,7 @@ pub struct ProjectStats {
 
 impl Project {
     /// Create a new project with required fields.
-    pub fn new(name: String, github_owner: String, github_repo: String) -> Self {
+    pub fn new(name: String) -> Self {
         let slug = slugify(&name);
         let now = Utc::now();
 
@@ -192,15 +226,6 @@ impl Project {
             name,
             slug,
             description: None,
-            github: GitHubConfig {
-                owner: github_owner,
-                repo: github_repo,
-                repository_id: None,
-                project_v2: None,
-                sync: GitHubSyncConfig::default(),
-                last_synced_at: None,
-                last_error: None,
-            },
             color: None,
             archived: false,
             stats: ProjectStats::default(),
@@ -209,9 +234,16 @@ impl Project {
         }
     }
 
-    /// Get the full GitHub repository string (owner/repo).
-    pub fn github_repo_full(&self) -> String {
-        format!("{}/{}", self.github.owner, self.github.repo)
+    /// Set description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set color.
+    pub fn with_color(mut self, color: impl Into<String>) -> Self {
+        self.color = Some(color.into());
+        self
     }
 }
 
@@ -233,18 +265,22 @@ mod tests {
 
     #[test]
     fn test_project_new() {
-        let project = Project::new(
-            "My Test Project".to_string(),
-            "anthropics".to_string(),
-            "claude-code".to_string(),
-        );
+        let project = Project::new("My Test Project".to_string());
 
         assert!(!project.id.is_empty());
         assert_eq!(project.name, "My Test Project");
         assert_eq!(project.slug, "my-test-project");
-        assert_eq!(project.github.owner, "anthropics");
-        assert_eq!(project.github.repo, "claude-code");
         assert!(!project.archived);
+    }
+
+    #[test]
+    fn test_project_with_description() {
+        let project = Project::new("Test".to_string())
+            .with_description("A test project")
+            .with_color("3b82f6");
+
+        assert_eq!(project.description, Some("A test project".to_string()));
+        assert_eq!(project.color, Some("3b82f6".to_string()));
     }
 
     #[test]
@@ -256,12 +292,53 @@ mod tests {
     }
 
     #[test]
-    fn test_github_repo_full() {
-        let project = Project::new(
-            "Test".to_string(),
-            "owner".to_string(),
-            "repo".to_string(),
-        );
-        assert_eq!(project.github_repo_full(), "owner/repo");
+    fn test_issue_type_hierarchy() {
+        // Epic can contain Story, Bug, and Task
+        assert!(IssueType::Epic.can_contain(IssueType::Story));
+        assert!(IssueType::Epic.can_contain(IssueType::Bug));
+        assert!(IssueType::Epic.can_contain(IssueType::Task));
+        assert!(!IssueType::Epic.can_contain(IssueType::Subtask));
+
+        // Story can contain Task and Subtask
+        assert!(IssueType::Story.can_contain(IssueType::Task));
+        assert!(IssueType::Story.can_contain(IssueType::Subtask));
+        assert!(!IssueType::Story.can_contain(IssueType::Epic));
+        assert!(!IssueType::Story.can_contain(IssueType::Bug));
+
+        // Task can only contain Subtask
+        assert!(IssueType::Task.can_contain(IssueType::Subtask));
+        assert!(!IssueType::Task.can_contain(IssueType::Task));
+
+        // Bug can only contain Subtask
+        assert!(IssueType::Bug.can_contain(IssueType::Subtask));
+        assert!(!IssueType::Bug.can_contain(IssueType::Task));
+
+        // Subtask cannot contain anything
+        assert!(!IssueType::Subtask.can_contain(IssueType::Subtask));
+        assert!(!IssueType::Subtask.can_contain(IssueType::Task));
+    }
+
+    #[test]
+    fn test_issue_type_from_str() {
+        assert_eq!(IssueType::from_str("epic"), Some(IssueType::Epic));
+        assert_eq!(IssueType::from_str("STORY"), Some(IssueType::Story));
+        assert_eq!(IssueType::from_str("Task"), Some(IssueType::Task));
+        assert_eq!(IssueType::from_str("subtask"), Some(IssueType::Subtask));
+        assert_eq!(IssueType::from_str("bug"), Some(IssueType::Bug));
+        assert_eq!(IssueType::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn test_board_column() {
+        // All columns in order
+        let columns = BoardColumn::all();
+        assert_eq!(columns.len(), 6);
+        assert_eq!(columns[0], BoardColumn::Backlog);
+        assert_eq!(columns[5], BoardColumn::Done);
+
+        // String conversion
+        assert_eq!(BoardColumn::from_str("in_progress"), Some(BoardColumn::InProgress));
+        assert_eq!(BoardColumn::InProgress.as_str(), "in_progress");
+        assert_eq!(BoardColumn::InProgress.display_name(), "In Progress");
     }
 }

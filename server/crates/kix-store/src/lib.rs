@@ -21,7 +21,6 @@ pub mod job_store;
 pub mod projects;
 pub mod search;
 pub mod store;
-pub mod tokens;
 
 pub use error::StoreError;
 pub use job_store::{JobAggregateStats, JobStats, JobStore};
@@ -31,12 +30,11 @@ pub use store::{get_embedding_dim, KixStore, SearchReindexStats, DEFAULT_EMBEDDI
 
 // Re-export kix-search types for full-text search
 pub use kix_search::{SearchEngine, SearchStats, TextSearchResult};
-pub use tokens::{EncryptedTokenData, TokenStore};
 
 // Re-export types and SqliteStore from kix-sqlite for convenience
 pub use kix_sqlite::{
-    EntryRecord, IssueRecord, JobRecord, JobItemRecord, PageRecord, ProjectEntryRecord, ProjectRecord,
-    SqliteStore, TokenRecord,
+    EntryRecord, JobRecord, JobItemRecord, PageRecord, ProjectEntryRecord, ProjectRecord,
+    SqliteStore, WorkItemRecord,
 };
 
 // Re-export types from kix-vectors

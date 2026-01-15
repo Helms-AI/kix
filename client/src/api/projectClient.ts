@@ -1,23 +1,22 @@
 import type {
   Project,
-  Issue,
+  WorkItem,
   ProjectEntry,
   ProjectListResponse,
-  IssueListResponse,
+  WorkItemListResponse,
   ProjectEntryListResponse,
   CreateProjectRequest,
   UpdateProjectRequest,
-  CreateIssueRequest,
-  UpdateIssueRequest,
+  CreateWorkItemRequest,
+  UpdateWorkItemRequest,
   LinkEntryRequest,
-  GitHubSyncResult,
-  GitHubTokenStatus,
-  SetGlobalTokenResponse,
-  GitHubUser,
-  GitHubOrgsResponse,
-  GitHubReposResponse,
-  VerifyAccessResponse,
-  ProjectTokenType,
+  // Board types
+  WorkItemType,
+  BoardResponse,
+  MoveCardRequest,
+  MoveCardResponse,
+  ColumnCountsResponse,
+  ChildWorkItemsResponse,
 } from '../types/project';
 
 const API_BASE = '/api/projects';
@@ -72,12 +71,13 @@ async function deleteRequest<T>(url: string): Promise<T> {
   return response.json();
 }
 
-// Issue filter params
-export interface IssueFilters {
+// Work item filter params
+export interface WorkItemFilters {
   state?: string;
   priority?: string;
   label?: string;
   assignee?: string;
+  item_type?: string;
   limit?: number;
   offset?: number;
 }
@@ -113,45 +113,46 @@ export const projectApi = {
     deleteRequest<{ status: string }>(`${API_BASE}/${encodeURIComponent(id)}`),
 
   // ============================================================================
-  // Issue Operations
+  // Work Item Operations
   // ============================================================================
 
-  // List issues for a project
-  listIssues: (projectId: string, filters?: IssueFilters) => {
+  // List work items for a project
+  listWorkItems: (projectId: string, filters?: WorkItemFilters) => {
     const searchParams = new URLSearchParams();
     if (filters?.state) searchParams.set('state', filters.state);
     if (filters?.priority) searchParams.set('priority', filters.priority);
     if (filters?.label) searchParams.set('label', filters.label);
     if (filters?.assignee) searchParams.set('assignee', filters.assignee);
+    if (filters?.item_type) searchParams.set('item_type', filters.item_type);
     if (filters?.limit) searchParams.set('limit', filters.limit.toString());
     if (filters?.offset) searchParams.set('offset', filters.offset.toString());
     const query = searchParams.toString();
-    return fetchJson<IssueListResponse>(
-      `${API_BASE}/${encodeURIComponent(projectId)}/issues${query ? `?${query}` : ''}`
+    return fetchJson<WorkItemListResponse>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/work-items${query ? `?${query}` : ''}`
     );
   },
 
-  // Get a single issue
-  getIssue: (projectId: string, issueId: string) =>
-    fetchJson<Issue>(
-      `${API_BASE}/${encodeURIComponent(projectId)}/issues/${encodeURIComponent(issueId)}`
+  // Get a single work item
+  getWorkItem: (projectId: string, itemId: string) =>
+    fetchJson<WorkItem>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(itemId)}`
     ),
 
-  // Create an issue
-  createIssue: (projectId: string, data: CreateIssueRequest) =>
-    postJson<Issue>(`${API_BASE}/${encodeURIComponent(projectId)}/issues`, data),
+  // Create a work item
+  createWorkItem: (projectId: string, data: CreateWorkItemRequest) =>
+    postJson<WorkItem>(`${API_BASE}/${encodeURIComponent(projectId)}/work-items`, data),
 
-  // Update an issue
-  updateIssue: (projectId: string, issueId: string, data: UpdateIssueRequest) =>
-    putJson<Issue>(
-      `${API_BASE}/${encodeURIComponent(projectId)}/issues/${encodeURIComponent(issueId)}`,
+  // Update a work item
+  updateWorkItem: (projectId: string, itemId: string, data: UpdateWorkItemRequest) =>
+    putJson<WorkItem>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(itemId)}`,
       data
     ),
 
-  // Delete an issue
-  deleteIssue: (projectId: string, issueId: string) =>
+  // Delete a work item
+  deleteWorkItem: (projectId: string, itemId: string) =>
     deleteRequest<{ status: string }>(
-      `${API_BASE}/${encodeURIComponent(projectId)}/issues/${encodeURIComponent(issueId)}`
+      `${API_BASE}/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(itemId)}`
     ),
 
   // ============================================================================
@@ -180,24 +181,36 @@ export const projectApi = {
     ),
 
   // ============================================================================
-  // GitHub Sync
+  // Board Operations
   // ============================================================================
 
-  // Sync issues with GitHub
-  syncGitHub: (projectId: string) =>
-    postJson<GitHubSyncResult>(`${API_BASE}/${encodeURIComponent(projectId)}/github/sync`, {}),
+  // Get board data with work items organized by column and swimlane
+  getBoard: (projectId: string, itemType?: WorkItemType) => {
+    const searchParams = new URLSearchParams();
+    if (itemType) searchParams.set('item_type', itemType);
+    const query = searchParams.toString();
+    return fetchJson<BoardResponse>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/board${query ? `?${query}` : ''}`
+    );
+  },
 
-  // Set GitHub token for a project
-  setGitHubToken: (projectId: string, token: string) =>
-    postJson<{ status: string }>(`${API_BASE}/${encodeURIComponent(projectId)}/github/token`, {
-      token,
-    }),
+  // Move a card to a new column and position (drag-drop)
+  moveCard: (projectId: string, request: MoveCardRequest) =>
+    postJson<MoveCardResponse>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/board/move`,
+      request
+    ),
 
-  // Link/create a GitHub Project V2 board
-  linkGitHubProject: (projectId: string, template: string) =>
-    postJson<{ success: boolean; github_project_v2_url?: string; warning?: string }>(
-      `${API_BASE}/${encodeURIComponent(projectId)}/github/link-project`,
-      { template }
+  // Get work item counts by column
+  getColumnCounts: (projectId: string) =>
+    fetchJson<ColumnCountsResponse>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/board/columns`
+    ),
+
+  // Get child work items for a parent
+  getChildWorkItems: (projectId: string, parentId: string) =>
+    fetchJson<ChildWorkItemsResponse>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(parentId)}/children`
     ),
 };
 
@@ -248,103 +261,58 @@ export function formatRelativeTime(dateString: string): string {
 }
 
 // ============================================================================
-// GitHub API Client
+// Board Utility Functions
 // ============================================================================
 
-const GITHUB_API_BASE = '/api/github';
+export function getWorkItemTypeColor(itemType: string): string {
+  switch (itemType) {
+    case 'epic':
+      return 'text-purple-400 bg-purple-400/10 border-purple-400/30';
+    case 'story':
+      return 'text-blue-400 bg-blue-400/10 border-blue-400/30';
+    case 'task':
+      return 'text-slate-400 bg-slate-400/10 border-slate-400/30';
+    case 'subtask':
+      return 'text-gray-400 bg-gray-400/10 border-gray-400/30';
+    case 'bug':
+      return 'text-red-400 bg-red-400/10 border-red-400/30';
+    default:
+      return 'text-slate-400 bg-slate-400/10 border-slate-400/30';
+  }
+}
 
-export const githubApi = {
-  // ============================================================================
-  // Global Token Management
-  // ============================================================================
+export function getBoardColumnColor(column: string): string {
+  switch (column) {
+    case 'backlog':
+      return 'text-slate-400 bg-slate-400/10';
+    case 'todo':
+      return 'text-blue-400 bg-blue-400/10';
+    case 'in_progress':
+      return 'text-amber-400 bg-amber-400/10';
+    case 'in_review':
+      return 'text-purple-400 bg-purple-400/10';
+    case 'testing':
+      return 'text-orange-400 bg-orange-400/10';
+    case 'done':
+      return 'text-emerald-400 bg-emerald-400/10';
+    default:
+      return 'text-slate-400 bg-slate-400/10';
+  }
+}
 
-  // Check if global token is configured
-  getTokenStatus: () =>
-    fetchJson<GitHubTokenStatus>(`${GITHUB_API_BASE}/token/status`),
-
-  // Set the global GitHub token
-  setGlobalToken: (token: string) =>
-    postJson<SetGlobalTokenResponse>(`${GITHUB_API_BASE}/token/global`, { token }),
-
-  // ============================================================================
-  // User and Organization Discovery
-  // ============================================================================
-
-  // Get authenticated user info
-  getUser: (token?: string) => {
-    const headers: HeadersInit = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    return fetch(`${GITHUB_API_BASE}/user`, { headers })
-      .then(async (response) => {
-        if (!response.ok) {
-          const errorBody = await response.text();
-          throw new Error(errorBody || `HTTP error! status: ${response.status}`);
-        }
-        return response.json() as Promise<GitHubUser>;
-      });
-  },
-
-  // List user's organizations (includes user as first item)
-  listOrgs: (token?: string) => {
-    const headers: HeadersInit = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    return fetch(`${GITHUB_API_BASE}/orgs`, { headers })
-      .then(async (response) => {
-        if (!response.ok) {
-          const errorBody = await response.text();
-          throw new Error(errorBody || `HTTP error! status: ${response.status}`);
-        }
-        return response.json() as Promise<GitHubOrgsResponse>;
-      });
-  },
-
-  // ============================================================================
-  // Repository Discovery
-  // ============================================================================
-
-  // List/search repositories for an owner
-  listRepos: (
-    owner: string,
-    options?: { search?: string; page?: number; per_page?: number; token?: string }
-  ) => {
-    const searchParams = new URLSearchParams();
-    searchParams.set('owner', owner);
-    if (options?.search) searchParams.set('search', options.search);
-    if (options?.page) searchParams.set('page', options.page.toString());
-    if (options?.per_page) searchParams.set('per_page', options.per_page.toString());
-
-    const headers: HeadersInit = {};
-    if (options?.token) headers['Authorization'] = `Bearer ${options.token}`;
-
-    return fetch(`${GITHUB_API_BASE}/repos?${searchParams.toString()}`, { headers })
-      .then(async (response) => {
-        if (!response.ok) {
-          const errorBody = await response.text();
-          throw new Error(errorBody || `HTTP error! status: ${response.status}`);
-        }
-        return response.json() as Promise<GitHubReposResponse>;
-      });
-  },
-
-  // ============================================================================
-  // Access Verification
-  // ============================================================================
-
-  // Verify token access to a repository
-  verifyAccess: (owner: string, repo: string, token?: string) =>
-    postJson<VerifyAccessResponse>(`${GITHUB_API_BASE}/verify-access`, {
-      owner,
-      repo,
-      token,
-    }),
-
-  // ============================================================================
-  // Project Token Management
-  // ============================================================================
-
-  // Get project's token configuration type
-  getProjectTokenStatus: (projectId: string) =>
-    fetchJson<ProjectTokenType>(
-      `${API_BASE}/${encodeURIComponent(projectId)}/github/token-status`
-    ),
-};
+export function getWorkItemTypeIcon(itemType: string): string {
+  switch (itemType) {
+    case 'epic':
+      return '⚡'; // Lightning bolt for epic
+    case 'story':
+      return '📝'; // Memo for story
+    case 'task':
+      return '✓'; // Checkmark for task
+    case 'subtask':
+      return '○'; // Circle for subtask
+    case 'bug':
+      return '🐛'; // Bug for bug
+    default:
+      return '•'; // Bullet for unknown
+  }
+}

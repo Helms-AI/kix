@@ -8,9 +8,9 @@
 //! - `entries` - Document metadata
 //! - `pages` - Full page content for RAG context
 //! - `projects` - Project management
-//! - `issues` - Issue tracking
+//! - `work_items` - Work item tracking (epics, stories, tasks, etc.)
 //! - `project_entries` - Knowledge links
-//! - `github_tokens` - Encrypted token storage
+//! - `board_config` - Kanban board configuration
 //! - `jobs` - Job history
 //! - `job_items` - Per-item job details
 //!
@@ -24,14 +24,12 @@
 pub mod entries;
 pub mod entities;
 pub mod error;
-pub mod issues;
 pub mod jobs;
 pub mod links;
 pub mod pages;
 pub mod pool;
 pub mod projects;
-pub mod sync_state;
-pub mod tokens;
+pub mod work_items;
 
 // Note: Full-text search is now provided by kix-search crate (Tantivy).
 // The deprecated search module has been removed.
@@ -41,13 +39,11 @@ pub use pool::{create_pool, create_sea_orm_connection, run_migrations, DbInfo};
 
 // Re-export record types
 pub use entries::EntryRecord;
-pub use issues::IssueRecord;
 pub use jobs::{JobItemRecord, JobRecord};
 pub use links::ProjectEntryRecord;
 pub use pages::PageRecord;
 pub use projects::ProjectRecord;
-pub use tokens::TokenRecord;
-pub use sync_state::{SyncStateRecord, SyncStateStore, SyncStats, SyncHistoryRecord, SyncHistoryStats};
+pub use work_items::WorkItemRecord;
 
 use sea_orm::DatabaseConnection;
 use sqlx::SqlitePool;
@@ -255,61 +251,105 @@ impl SqliteStore {
     }
 
     // =========================================================================
-    // Issue Operations
+    // Work Item Operations
     // =========================================================================
 
-    /// Insert a new issue.
-    pub async fn insert_issue(&self, issue: &IssueRecord) -> Result<()> {
-        issues::insert_issue(&self.pool, issue).await
+    /// Insert a new work item.
+    pub async fn insert_work_item(&self, item: &WorkItemRecord) -> Result<()> {
+        work_items::insert_work_item(&self.pool, item).await
     }
 
-    /// Get an issue by ID.
-    pub async fn get_issue(&self, id: &str) -> Result<Option<IssueRecord>> {
-        issues::get_issue(&self.pool, id).await
+    /// Get a work item by ID.
+    pub async fn get_work_item(&self, id: &str) -> Result<Option<WorkItemRecord>> {
+        work_items::get_work_item(&self.pool, id).await
     }
 
-    /// Get an issue by project and number.
-    pub async fn get_issue_by_number(
+    /// Get a work item by project and number.
+    pub async fn get_work_item_by_number(
         &self,
         project_id: &str,
         number: u32,
-    ) -> Result<Option<IssueRecord>> {
-        issues::get_issue_by_number(&self.pool, project_id, number).await
+    ) -> Result<Option<WorkItemRecord>> {
+        work_items::get_work_item_by_number(&self.pool, project_id, number).await
     }
 
-    /// Get an issue by project ID and GitHub number.
-    pub async fn get_issue_by_github_number(
-        &self,
-        project_id: &str,
-        github_number: u32,
-    ) -> Result<Option<IssueRecord>> {
-        issues::get_issue_by_github_number(&self.pool, project_id, github_number).await
+    /// Update a work item.
+    pub async fn update_work_item(&self, item: &WorkItemRecord) -> Result<bool> {
+        work_items::update_work_item(&self.pool, item).await
     }
 
-    /// Update an issue.
-    pub async fn update_issue(&self, issue: &IssueRecord) -> Result<bool> {
-        issues::update_issue(&self.pool, issue).await
+    /// Delete a work item by ID.
+    pub async fn delete_work_item(&self, id: &str) -> Result<bool> {
+        work_items::delete_work_item(&self.pool, id).await
     }
 
-    /// Delete an issue by ID.
-    pub async fn delete_issue(&self, id: &str) -> Result<bool> {
-        issues::delete_issue(&self.pool, id).await
-    }
-
-    /// List issues for a project.
-    pub async fn list_issues(
+    /// List work items for a project.
+    pub async fn list_work_items(
         &self,
         project_id: &str,
         state: Option<&str>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<IssueRecord>> {
-        issues::list_issues(&self.pool, project_id, state, limit, offset).await
+    ) -> Result<Vec<WorkItemRecord>> {
+        work_items::list_work_items(&self.pool, project_id, state, limit, offset).await
     }
 
-    /// Get the next issue number for a project.
-    pub async fn next_issue_number(&self, project_id: &str) -> Result<u32> {
-        issues::next_issue_number(&self.pool, project_id).await
+    /// Get the next work item number for a project.
+    pub async fn next_work_item_number(&self, project_id: &str) -> Result<u32> {
+        work_items::next_work_item_number(&self.pool, project_id).await
+    }
+
+    // =========================================================================
+    // Board Operations
+    // =========================================================================
+
+    /// List work items for board view (grouped by column and sorted by position).
+    pub async fn list_work_items_for_board(
+        &self,
+        project_id: &str,
+        item_type: Option<&str>,
+    ) -> Result<Vec<WorkItemRecord>> {
+        work_items::list_work_items_for_board(&self.pool, project_id, item_type).await
+    }
+
+    /// Update work item position (for drag-drop reordering).
+    pub async fn update_work_item_position(
+        &self,
+        item_id: &str,
+        board_column: &str,
+        position: i64,
+    ) -> Result<bool> {
+        work_items::update_work_item_position(&self.pool, item_id, board_column, position).await
+    }
+
+    /// Shift positions in a column to make room for a card.
+    pub async fn shift_positions(
+        &self,
+        project_id: &str,
+        board_column: &str,
+        from_position: i64,
+        shift: i64,
+    ) -> Result<()> {
+        work_items::shift_positions(&self.pool, project_id, board_column, from_position, shift).await
+    }
+
+    /// Get child work items for a parent.
+    pub async fn get_child_work_items(&self, parent_id: &str) -> Result<Vec<WorkItemRecord>> {
+        work_items::get_child_work_items(&self.pool, parent_id).await
+    }
+
+    /// Count work items by column for a project.
+    pub async fn count_work_items_by_column(&self, project_id: &str) -> Result<Vec<(String, i64)>> {
+        work_items::count_work_items_by_column(&self.pool, project_id).await
+    }
+
+    /// Get the next position for a column.
+    pub async fn next_position_in_column(
+        &self,
+        project_id: &str,
+        board_column: &str,
+    ) -> Result<i64> {
+        work_items::next_position_in_column(&self.pool, project_id, board_column).await
     }
 
     // =========================================================================
@@ -334,30 +374,6 @@ impl SqliteStore {
     /// Check if an entry is linked to a project.
     pub async fn is_entry_linked(&self, project_id: &str, entry_id: &str) -> Result<bool> {
         links::is_linked(&self.pool, project_id, entry_id).await
-    }
-
-    // =========================================================================
-    // Token Operations
-    // =========================================================================
-
-    /// Store a token (encrypted).
-    pub async fn store_token(&self, token: &TokenRecord) -> Result<()> {
-        tokens::store_token(&self.pool, token).await
-    }
-
-    /// Get a token by scope.
-    pub async fn get_token(&self, scope: &str) -> Result<Option<TokenRecord>> {
-        tokens::get_token(&self.pool, scope).await
-    }
-
-    /// Delete a token by scope.
-    pub async fn delete_token(&self, scope: &str) -> Result<bool> {
-        tokens::delete_token(&self.pool, scope).await
-    }
-
-    /// List all tokens.
-    pub async fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
-        tokens::list_tokens(&self.pool).await
     }
 
     // =========================================================================
@@ -398,22 +414,22 @@ impl SqliteStore {
     // Utility Operations
     // =========================================================================
 
-    /// Count issues for a project.
-    pub async fn issue_count(&self, project_id: &str) -> Result<usize> {
-        issues::issue_count(&self.pool, project_id).await
+    /// Count work items for a project.
+    pub async fn work_item_count(&self, project_id: &str) -> Result<usize> {
+        work_items::work_item_count(&self.pool, project_id).await
     }
 
     /// Clear all data from all tables (use with caution!).
     ///
     /// This permanently deletes all data from entries, pages, projects,
-    /// issues, project_entries, github_tokens, jobs, and job_items tables.
+    /// work_items, project_entries, board_config, jobs, and job_items tables.
     pub async fn clear_all(&self) -> Result<()> {
         // Delete in order respecting foreign key constraints
         sqlx::query("DELETE FROM job_items").execute(&self.pool).await?;
         sqlx::query("DELETE FROM jobs").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM github_tokens").execute(&self.pool).await?;
+        sqlx::query("DELETE FROM board_config").execute(&self.pool).await?;
         sqlx::query("DELETE FROM project_entries").execute(&self.pool).await?;
-        sqlx::query("DELETE FROM issues").execute(&self.pool).await?;
+        sqlx::query("DELETE FROM work_items").execute(&self.pool).await?;
         sqlx::query("DELETE FROM projects").execute(&self.pool).await?;
         sqlx::query("DELETE FROM pages").execute(&self.pool).await?;
         sqlx::query("DELETE FROM entries").execute(&self.pool).await?;

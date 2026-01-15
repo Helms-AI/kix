@@ -23,9 +23,6 @@ pub struct ProjectRecord {
     /// Hex color for UI (e.g., "#3b82f6")
     pub color: Option<String>,
 
-    /// GitHub configuration as JSON
-    pub github_config: String,
-
     /// Whether the project is archived (0 or 1)
     pub archived: i64,
 
@@ -37,12 +34,8 @@ pub struct ProjectRecord {
 }
 
 impl ProjectRecord {
-    /// Create a new project with GitHub integration.
-    pub fn new(
-        name: impl Into<String>,
-        github_owner: impl Into<String>,
-        github_repo: impl Into<String>,
-    ) -> Self {
+    /// Create a new project.
+    pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         let slug = slugify(&name);
         let now = Utc::now().to_rfc3339();
@@ -53,65 +46,10 @@ impl ProjectRecord {
             slug,
             description: None,
             color: None,
-            github_config: serde_json::json!({
-                "owner": github_owner.into(),
-                "repo": github_repo.into(),
-                "sync": {
-                    "enabled": false,
-                    "direction": "bidirectional",
-                    "last_synced_at": null
-                }
-            })
-            .to_string(),
             archived: 0,
             created_at: now.clone(),
             updated_at: now,
         }
-    }
-
-    /// Create a new local-only project (no GitHub).
-    pub fn new_local(name: impl Into<String>) -> Self {
-        let name = name.into();
-        let slug = slugify(&name);
-        let now = Utc::now().to_rfc3339();
-
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            name,
-            slug,
-            description: None,
-            color: None,
-            github_config: "{}".to_string(),
-            archived: 0,
-            created_at: now.clone(),
-            updated_at: now,
-        }
-    }
-
-    /// Get GitHub config as JSON value.
-    pub fn github_config_json(&self) -> Option<serde_json::Value> {
-        serde_json::from_str(&self.github_config).ok()
-    }
-
-    /// Get GitHub owner.
-    pub fn github_owner(&self) -> Option<String> {
-        self.github_config_json()?
-            .get("owner")?
-            .as_str()
-            .map(String::from)
-    }
-
-    /// Get GitHub repo.
-    pub fn github_repo(&self) -> Option<String> {
-        self.github_config_json()?
-            .get("repo")?
-            .as_str()
-            .map(String::from)
-    }
-
-    /// Check if project has GitHub integration.
-    pub fn has_github(&self) -> bool {
-        self.github_owner().is_some() && self.github_repo().is_some()
     }
 
     /// Check if project is archived.
@@ -129,27 +67,6 @@ impl ProjectRecord {
     pub fn with_color(mut self, color: impl Into<String>) -> Self {
         self.color = Some(color.into());
         self
-    }
-
-    /// Set GitHub Project V2 configuration.
-    pub fn with_github_project_v2(mut self, v2_config: serde_json::Value) -> Self {
-        if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&self.github_config) {
-            config["project_v2"] = v2_config;
-            self.github_config = config.to_string();
-        }
-        self
-    }
-
-    /// Get GitHub Project V2 URL if configured.
-    pub fn github_project_v2_url(&self) -> Option<String> {
-        let config = self.github_config_json()?;
-        config.get("project_v2")?.get("url")?.as_str().map(String::from)
-    }
-
-    /// Get GitHub Project V2 ID (node_id) if configured.
-    pub fn github_project_v2_id(&self) -> Option<String> {
-        let config = self.github_config_json()?;
-        config.get("project_v2")?.get("project_id")?.as_str().map(String::from)
     }
 }
 
@@ -171,8 +88,8 @@ pub async fn insert_project(pool: &SqlitePool, project: &ProjectRecord) -> Resul
         r#"
         INSERT INTO projects (
             id, name, slug, description, color,
-            github_config, archived, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            archived, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&project.id)
@@ -180,7 +97,6 @@ pub async fn insert_project(pool: &SqlitePool, project: &ProjectRecord) -> Resul
     .bind(&project.slug)
     .bind(&project.description)
     .bind(&project.color)
-    .bind(&project.github_config)
     .bind(project.archived)
     .bind(&project.created_at)
     .bind(&project.updated_at)
@@ -216,7 +132,7 @@ pub async fn update_project(pool: &SqlitePool, project: &ProjectRecord) -> Resul
         r#"
         UPDATE projects SET
             name = ?, slug = ?, description = ?, color = ?,
-            github_config = ?, archived = ?, updated_at = ?
+            archived = ?, updated_at = ?
         WHERE id = ?
         "#,
     )
@@ -224,7 +140,6 @@ pub async fn update_project(pool: &SqlitePool, project: &ProjectRecord) -> Resul
     .bind(&project.slug)
     .bind(&project.description)
     .bind(&project.color)
-    .bind(&project.github_config)
     .bind(project.archived)
     .bind(Utc::now().to_rfc3339())
     .bind(&project.id)
@@ -277,7 +192,7 @@ mod tests {
     async fn test_insert_and_get_project() {
         let (pool, _temp_dir) = setup_test_db().await;
 
-        let project = ProjectRecord::new("My Project", "owner", "repo")
+        let project = ProjectRecord::new("My Project")
             .with_description("A test project")
             .with_color("#3b82f6");
 
@@ -287,26 +202,14 @@ mod tests {
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.name, "My Project");
-        assert_eq!(retrieved.github_owner(), Some("owner".to_string()));
-        assert_eq!(retrieved.github_repo(), Some("repo".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_local_project() {
-        let (pool, _temp_dir) = setup_test_db().await;
-
-        let project = ProjectRecord::new_local("Local Project");
-        insert_project(&pool, &project).await.unwrap();
-
-        let retrieved = get_project(&pool, &project.id).await.unwrap().unwrap();
-        assert!(!retrieved.has_github());
+        assert_eq!(retrieved.description, Some("A test project".to_string()));
     }
 
     #[tokio::test]
     async fn test_get_project_by_slug() {
         let (pool, _temp_dir) = setup_test_db().await;
 
-        let project = ProjectRecord::new("Test Project", "owner", "repo");
+        let project = ProjectRecord::new("Test Project");
         insert_project(&pool, &project).await.unwrap();
 
         let retrieved = get_project_by_slug(&pool, "test-project").await.unwrap();
@@ -319,11 +222,11 @@ mod tests {
         let (pool, _temp_dir) = setup_test_db().await;
 
         // Insert active project
-        let active = ProjectRecord::new_local("Active Project");
+        let active = ProjectRecord::new("Active Project");
         insert_project(&pool, &active).await.unwrap();
 
         // Insert archived project
-        let mut archived = ProjectRecord::new_local("Archived Project");
+        let mut archived = ProjectRecord::new("Archived Project");
         archived.archived = 1;
         insert_project(&pool, &archived).await.unwrap();
 

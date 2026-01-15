@@ -1,12 +1,12 @@
 //! # kix-projects
 //!
-//! AI-powered project management system for Kix with GitHub integration.
+//! Local-first project management system for Kix.
 //!
 //! This crate provides:
-//! - Project and issue management with GitHub synchronization
-//! - GitHub Projects V2 integration (Kanban boards, bug tracking, etc.)
+//! - Project and work item management
+//! - Kanban board with epic lanes
 //! - AI-assisted project planning with knowledge base context
-//! - Project-scoped search across issues and knowledge
+//! - Project-scoped search across work items and knowledge
 //!
 //! ## Architecture
 //!
@@ -15,36 +15,31 @@
 //! │                      kix-projects                                │
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │  project.rs    → Project data model and configuration           │
-//! │  issue.rs      → Issue data model and CRUD                      │
+//! │  issue.rs      → Work item data model and CRUD                  │
 //! │  knowledge.rs  → Project-entry linking                          │
-//! │  templates.rs  → GitHub Project V2 templates                    │
 //! │  planning.rs   → AI planning data structures                    │
-//! │  github/       → GitHub REST + GraphQL integration              │
+//! │  templates.rs  → Board templates                                │
 //! │  error.rs      → Error types                                    │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Key Features
 //!
-//! - **Projects**: Bounded containers for knowledge and issues
-//! - **GitHub Required**: Projects must connect to a GitHub repo
-//! - **Projects V2**: Create Kanban, Bug Tracking, Sprint boards
+//! - **Projects**: Containers for work items organized by epics
+//! - **Work Items**: Hierarchical items (epic → story → task → subtask)
+//! - **Kanban Board**: Epic lanes with drag-drop support
 //! - **AI Planning**: Use knowledge base to help plan tasks
-//! - **Real-time Sync**: MCP → UI events for live updates
+//! - **Real-time Events**: MCP → UI events for live updates
 //!
 //! ## Usage
 //!
 //! ```rust,ignore
-//! use kix_projects::{Project, Issue, ProjectTemplate};
+//! use kix_projects::{Project, Issue};
 //!
 //! // Create a new project
-//! let project = Project::new(
-//!     "My App".to_string(),
-//!     "myorg".to_string(),
-//!     "myapp".to_string(),
-//! );
+//! let project = Project::new("My App".to_string());
 //!
-//! // Create an issue
+//! // Create a work item
 //! let issue = Issue::new(
 //!     project.id.clone(),
 //!     1,
@@ -54,24 +49,17 @@
 
 pub mod error;
 pub mod events;
-pub mod github;
 pub mod issue;
 pub mod knowledge;
 pub mod planning;
 pub mod project;
 pub mod search;
-pub mod sync_state;
 pub mod templates;
 
 // Re-export main types for convenience
 pub use error::ProjectError;
-pub use github::models::{
-    GitHubFieldOption, GitHubFieldValue, GitHubGraphQLError, GitHubIssue, GitHubLabel,
-    GitHubProjectField, GitHubProjectItem, GitHubProjectItemContent, GitHubProjectV2,
-    GitHubRepository, GitHubUser,
-};
 pub use issue::{
-    CreateIssueParams, GitHubIssueData, Issue, IssueFilters, IssueSource, UpdateIssueParams,
+    CreateIssueParams, Issue, IssueFilters, IssueState, UpdateIssueParams,
 };
 pub use knowledge::{KnowledgeReference, LinkEntryParams, ProjectEntry};
 pub use planning::{
@@ -79,27 +67,11 @@ pub use planning::{
     PlanTemplate, PlannedTask, ProjectContext, ProjectContextStats, SuggestTasksParams,
     TaskBreakdown, TaskSuggestion, TaskSuggestions,
 };
-pub use project::{
-    CustomFieldConfig, GitHubConfig, GitHubProjectV2Config, GitHubSyncConfig, IssueState, Project,
-    ProjectFieldType, ProjectStats, StatusOption,
-};
+pub use project::{BoardColumn, IssueType, Project, ProjectStats};
 pub use templates::{CustomFieldDefinition, CustomFieldType, ProjectTemplate, ProjectView, TemplateConfig};
 pub use search::{
     IssueSearchResult, KnowledgeSearchResult, ProjectSearchParams, ProjectSearchResult,
     SearchResultMerger, SearchType, calculate_text_score, generate_excerpt,
-};
-pub use sync_state::{
-    ConflictDetector, ConflictType, ContentHasher, IssueSyncState, MergeResult,
-    MergeStrategy, SmartMerger, SyncStatus,
-    SyncDirection as SyncStateDirection, SyncResult as SyncStateResult,
-};
-
-// GitHub integration re-exports
-pub use github::{
-    EncryptedToken, GitHubGraphQLClient, GitHubRestClient, GitHubSyncService,
-    GitHubTokenManager, InMemoryTokenStorage, IssueInfo, ProjectTokenType, ProjectV2Service,
-    SyncConfig, SyncDirection, SyncResult, TokenScope, TokenService, TokenStorage,
-    TokenStoreResult, get_token_with_fallback,
 };
 
 // Event bus re-exports

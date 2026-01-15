@@ -6,7 +6,7 @@
 //!
 //! Since both types map to the same database schema, conversions are 1:1.
 
-use super::{entry, github_token, issue, job, job_item, page, project, project_entry};
+use super::{entry, job, job_item, page, project, project_entry, work_item};
 
 // ============================================================================
 // Entry conversions
@@ -108,7 +108,6 @@ impl From<project::Model> for crate::projects::ProjectRecord {
             slug: model.slug,
             description: model.description,
             color: model.color,
-            github_config: model.github_config,
             archived: model.archived,
             created_at: model.created_at,
             updated_at: model.updated_at,
@@ -125,7 +124,6 @@ impl From<&crate::projects::ProjectRecord> for project::ActiveModel {
             slug: Set(record.slug.clone()),
             description: Set(record.description.clone()),
             color: Set(record.color.clone()),
-            github_config: Set(record.github_config.clone()),
             archived: Set(record.archived),
             created_at: Set(record.created_at.clone()),
             updated_at: Set(record.updated_at.clone()),
@@ -134,11 +132,11 @@ impl From<&crate::projects::ProjectRecord> for project::ActiveModel {
 }
 
 // ============================================================================
-// Issue conversions
+// Work Item conversions
 // ============================================================================
 
-impl From<issue::Model> for crate::issues::IssueRecord {
-    fn from(model: issue::Model) -> Self {
+impl From<work_item::Model> for crate::work_items::WorkItemRecord {
+    fn from(model: work_item::Model) -> Self {
         Self {
             id: model.id,
             project_id: model.project_id,
@@ -149,21 +147,22 @@ impl From<issue::Model> for crate::issues::IssueRecord {
             labels: model.labels,
             assignees: model.assignees,
             priority: model.priority,
-            github_number: model.github_number,
-            github_node_id: model.github_node_id,
-            github_url: model.github_url,
-            github_project_item_id: model.github_project_item_id,
-            source: model.source,
             created_at: model.created_at,
             updated_at: model.updated_at,
             closed_at: model.closed_at,
-            synced_at: model.synced_at,
+            // Board fields
+            item_type: model.item_type,
+            parent_id: model.parent_id,
+            position: model.position,
+            board_column: model.board_column,
+            story_points: model.story_points,
+            epic_color: model.epic_color,
         }
     }
 }
 
-impl From<&crate::issues::IssueRecord> for issue::ActiveModel {
-    fn from(record: &crate::issues::IssueRecord) -> Self {
+impl From<&crate::work_items::WorkItemRecord> for work_item::ActiveModel {
+    fn from(record: &crate::work_items::WorkItemRecord) -> Self {
         use sea_orm::ActiveValue::Set;
         Self {
             id: Set(record.id.clone()),
@@ -175,15 +174,16 @@ impl From<&crate::issues::IssueRecord> for issue::ActiveModel {
             labels: Set(record.labels.clone()),
             assignees: Set(record.assignees.clone()),
             priority: Set(record.priority),
-            github_number: Set(record.github_number),
-            github_node_id: Set(record.github_node_id.clone()),
-            github_url: Set(record.github_url.clone()),
-            github_project_item_id: Set(record.github_project_item_id.clone()),
-            source: Set(record.source.clone()),
             created_at: Set(record.created_at.clone()),
             updated_at: Set(record.updated_at.clone()),
             closed_at: Set(record.closed_at.clone()),
-            synced_at: Set(record.synced_at.clone()),
+            // Board fields
+            item_type: Set(record.item_type.clone()),
+            parent_id: Set(record.parent_id.clone()),
+            position: Set(record.position),
+            board_column: Set(record.board_column.clone()),
+            story_points: Set(record.story_points),
+            epic_color: Set(record.epic_color.clone()),
         }
     }
 }
@@ -215,41 +215,6 @@ impl From<&crate::links::ProjectEntryRecord> for project_entry::ActiveModel {
             relevance: Set(record.relevance),
             notes: Set(record.notes.clone()),
             linked_at: Set(record.linked_at.clone()),
-        }
-    }
-}
-
-// ============================================================================
-// GitHub Token conversions
-// ============================================================================
-
-impl From<github_token::Model> for crate::tokens::TokenRecord {
-    fn from(model: github_token::Model) -> Self {
-        Self {
-            scope: model.scope,
-            encrypted_token: model.encrypted_token,
-            token_suffix: model.token_suffix,
-            token_format: model.token_format,
-            verified_at: model.verified_at,
-            verified_user: model.verified_user,
-            created_at: model.created_at,
-            updated_at: model.updated_at,
-        }
-    }
-}
-
-impl From<&crate::tokens::TokenRecord> for github_token::ActiveModel {
-    fn from(record: &crate::tokens::TokenRecord) -> Self {
-        use sea_orm::ActiveValue::Set;
-        Self {
-            scope: Set(record.scope.clone()),
-            encrypted_token: Set(record.encrypted_token.clone()),
-            token_suffix: Set(record.token_suffix.clone()),
-            token_format: Set(record.token_format.clone()),
-            verified_at: Set(record.verified_at.clone()),
-            verified_user: Set(record.verified_user.clone()),
-            created_at: Set(record.created_at.clone()),
-            updated_at: Set(record.updated_at.clone()),
         }
     }
 }

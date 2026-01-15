@@ -1,9 +1,9 @@
-//! GitHub Project V2 templates for creating pre-configured project boards.
+//! Board templates for creating pre-configured project boards.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Available project templates for GitHub Projects V2.
+/// Available project templates for Kanban boards.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectTemplate {
@@ -185,7 +185,7 @@ pub struct CustomFieldDefinition {
     pub options: Option<Vec<String>>,
 }
 
-/// Custom field types supported by GitHub Projects V2.
+/// Custom field types for board configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CustomFieldType {
@@ -197,14 +197,14 @@ pub enum CustomFieldType {
 }
 
 impl CustomFieldType {
-    /// Convert to GraphQL enum value.
-    pub fn to_graphql(&self) -> &'static str {
+    /// Convert to string representation.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            CustomFieldType::Text => "TEXT",
-            CustomFieldType::Number => "NUMBER",
-            CustomFieldType::Date => "DATE",
-            CustomFieldType::SingleSelect => "SINGLE_SELECT",
-            CustomFieldType::Iteration => "ITERATION",
+            CustomFieldType::Text => "text",
+            CustomFieldType::Number => "number",
+            CustomFieldType::Date => "date",
+            CustomFieldType::SingleSelect => "single_select",
+            CustomFieldType::Iteration => "iteration",
         }
     }
 }

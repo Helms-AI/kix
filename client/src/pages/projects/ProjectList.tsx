@@ -4,17 +4,12 @@ import { Link } from 'react-router-dom';
 import {
   Plus,
   FolderKanban,
-  GitBranch,
   FileText,
   ArrowRight,
   Archive,
   MoreVertical,
-  RefreshCw,
   Trash2,
-  ExternalLink,
-  Folder,
 } from 'lucide-react';
-import clsx from 'clsx';
 import { projectApi, formatRelativeTime } from '../../api/projectClient';
 import type { Project } from '../../types/project';
 import { useProjectEventRefetch } from '../../hooks/useProjectEvents';
@@ -31,16 +26,8 @@ function ProjectCard({ project }: { project: Project }) {
     },
   });
 
-  const syncMutation = useMutation({
-    mutationFn: () => projectApi.syncGitHub(project.id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['projects'] });
-    },
-  });
-
   // Default color if none set
   const projectColor = project.color || '#06b6d4';
-  const hasGitHub = project.has_github && project.github_owner && project.github_repo;
 
   return (
     <div
@@ -60,29 +47,16 @@ function ProjectCard({ project }: { project: Project }) {
               className="w-10 h-10 rounded-lg flex items-center justify-center"
               style={{ backgroundColor: `${projectColor}20` }}
             >
-              {hasGitHub ? (
-                <FolderKanban className="w-5 h-5" style={{ color: projectColor }} />
-              ) : (
-                <Folder className="w-5 h-5" style={{ color: projectColor }} />
-              )}
+              <FolderKanban className="w-5 h-5" style={{ color: projectColor }} />
             </div>
             <div className="flex-1 min-w-0">
               <h3 className="text-lg font-semibold text-white group-hover/link:text-cyan-400 transition-colors truncate">
                 {project.name}
               </h3>
-              {hasGitHub ? (
-                <div className="flex items-center gap-2 text-sm text-slate-500">
-                  <GitBranch className="w-3.5 h-3.5" />
-                  <span className="truncate">
-                    {project.github_owner}/{project.github_repo}
-                  </span>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2 text-sm text-slate-500">
-                  <Folder className="w-3.5 h-3.5" />
-                  <span>Local Project</span>
-                </div>
-              )}
+              <div className="flex items-center gap-2 text-sm text-slate-500">
+                <FolderKanban className="w-3.5 h-3.5" />
+                <span>Project</span>
+              </div>
             </div>
           </Link>
 
@@ -99,31 +73,6 @@ function ProjectCard({ project }: { project: Project }) {
               <>
                 <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
                 <div className="absolute right-0 top-full mt-1 w-48 bg-slate-800 border border-slate-700 rounded-lg shadow-xl z-20 py-1">
-                  {hasGitHub && (
-                    <>
-                      <a
-                        href={`https://github.com/${project.github_owner}/${project.github_repo}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="flex items-center gap-2 px-3 py-2 text-sm text-slate-300 hover:text-white hover:bg-slate-700/50"
-                        onClick={() => setMenuOpen(false)}
-                      >
-                        <ExternalLink className="w-4 h-4" />
-                        View on GitHub
-                      </a>
-                      <button
-                        onClick={() => {
-                          syncMutation.mutate();
-                          setMenuOpen(false);
-                        }}
-                        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-300 hover:text-white hover:bg-slate-700/50"
-                        disabled={syncMutation.isPending}
-                      >
-                        <RefreshCw className={clsx('w-4 h-4', syncMutation.isPending && 'animate-spin')} />
-                        {syncMutation.isPending ? 'Syncing...' : 'Sync GitHub'}
-                      </button>
-                    </>
-                  )}
                   <button
                     onClick={() => {
                       setMenuOpen(false);
@@ -162,11 +111,11 @@ function ProjectCard({ project }: { project: Project }) {
         <div className="flex items-center gap-4 text-sm">
           <div className="flex items-center gap-1.5 text-slate-400">
             <div className="w-2 h-2 rounded-full bg-emerald-400" />
-            <span>{project.stats?.open_issues || 0} open</span>
+            <span>{project.stats?.open_items || 0} open</span>
           </div>
           <div className="flex items-center gap-1.5 text-slate-400">
-            <div className="w-2 h-2 rounded-full bg-blue-400" />
-            <span>{project.stats?.in_progress_issues || 0} in progress</span>
+            <div className="w-2 h-2 rounded-full bg-slate-400" />
+            <span>{project.stats?.closed_items || 0} closed</span>
           </div>
           <div className="flex items-center gap-1.5 text-slate-400">
             <FileText className="w-3.5 h-3.5" />
@@ -200,8 +149,8 @@ function EmptyState({ onCreateClick }: { onCreateClick: () => void }) {
       </div>
       <h3 className="text-xl font-semibold text-white mb-2">No projects yet</h3>
       <p className="text-slate-400 max-w-md mb-6">
-        Create your first project to start organizing issues and linking knowledge base entries.
-        Each project connects to a GitHub repository for seamless issue tracking.
+        Create your first project to start organizing work items and linking knowledge base entries.
+        Use the Kanban board to track progress and manage your workflow.
       </p>
       <button
         onClick={onCreateClick}

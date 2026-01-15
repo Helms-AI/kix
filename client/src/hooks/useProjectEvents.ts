@@ -108,13 +108,11 @@ export function useProjectEvents({
       'project_created',
       'project_updated',
       'project_deleted',
-      'issue_created',
-      'issue_updated',
-      'issue_deleted',
+      'work_item_created',
+      'work_item_updated',
+      'work_item_deleted',
       'entry_linked',
       'entry_unlinked',
-      'github_sync_started',
-      'github_sync_completed',
       'heartbeat',
     ];
 
@@ -184,7 +182,7 @@ export function useProjectEventRefetch(
   refetchFns: {
     refetchProjects?: () => void;
     refetchProject?: () => void;
-    refetchIssues?: () => void;
+    refetchWorkItems?: () => void;
     refetchEntries?: () => void;
   }
 ) {
@@ -199,20 +197,16 @@ export function useProjectEventRefetch(
           refetchFns.refetchProjects?.();
           refetchFns.refetchProject?.();
           break;
-        case 'issue_created':
-        case 'issue_updated':
-        case 'issue_deleted':
-          refetchFns.refetchIssues?.();
+        case 'work_item_created':
+        case 'work_item_updated':
+        case 'work_item_deleted':
+          refetchFns.refetchWorkItems?.();
           refetchFns.refetchProject?.(); // Refresh stats
           break;
         case 'entry_linked':
         case 'entry_unlinked':
           refetchFns.refetchEntries?.();
           refetchFns.refetchProject?.(); // Refresh stats
-          break;
-        case 'github_sync_completed':
-          refetchFns.refetchIssues?.();
-          refetchFns.refetchProject?.();
           break;
       }
     },

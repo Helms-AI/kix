@@ -203,6 +203,10 @@ run_local_mode() {
     export OLLAMA_MODEL="${OLLAMA_MODEL:-nomic-embed-text}"
     export KIX_EMBEDDING_DIM="${KIX_EMBEDDING_DIM:-768}"
 
+    # GitHub token encryption key (base64-encoded 32-byte key - DO NOT use in production)
+    # Generate new key with: openssl rand -base64 32
+    export KIX_ENCRYPTION_KEY="${KIX_ENCRYPTION_KEY:-a2l4RGV2RW5jcnlwdGlvbktleTMyQnl0ZXNUZXN0ISE=}"
+
     # Start unified server (API + MCP with shared store) in background
     echo ""
     echo "Starting unified server (API + MCP with shared KixStore)..."

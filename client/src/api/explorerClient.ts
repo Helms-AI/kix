@@ -94,10 +94,14 @@ interface TemplatesResponse {
   templates: QueryTemplate[];
 }
 
+// ErrorResponse type for API error handling (used in catch blocks)
 interface ErrorResponse {
   error: string;
   message: string;
 }
+
+// Suppress unused warning - type is used for error handling patterns
+void (0 as unknown as ErrorResponse);
 
 // API Functions
 

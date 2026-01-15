@@ -2,10 +2,9 @@
 //!
 //! This module defines all the types for the project management tools:
 //! - Project CRUD (5 tools)
-//! - Issue CRUD (5 tools)
-//! - GitHub Projects V2 (5 tools)
+//! - Work Item CRUD (5 tools)
+//! - Board Operations (3 tools): get_board, move_card, get_child_work_items
 //! - AI Planning (4 tools)
-//! - Token management (2 tools)
 //! - Knowledge linking (3 tools)
 //! - Search (1 tool)
 
@@ -23,18 +22,6 @@ pub struct CreateProjectParams {
     #[schemars(description = "Name of the project")]
     pub name: String,
 
-    /// GitHub repository owner (required)
-    #[schemars(description = "GitHub repository owner (user or organization)")]
-    pub github_owner: String,
-
-    /// GitHub repository name (required)
-    #[schemars(description = "GitHub repository name")]
-    pub github_repo: String,
-
-    /// GitHub Project V2 template (required)
-    #[schemars(description = "Project template: 'kanban', 'bug_tracking', 'sprint_planning', or 'feature_roadmap'")]
-    pub template: String,
-
     /// Project description (optional)
     #[schemars(description = "Project description")]
     pub description: Option<String>,
@@ -42,14 +29,6 @@ pub struct CreateProjectParams {
     /// Project color (hex format, optional)
     #[schemars(description = "Project color in hex format (e.g., '#3B82F6')")]
     pub color: Option<String>,
-
-    /// Enable automatic sync with GitHub
-    #[schemars(description = "Enable automatic sync with GitHub (default: false)")]
-    pub auto_sync: Option<bool>,
-
-    /// Sync direction
-    #[schemars(description = "Sync direction: 'pull', 'push', or 'bidirectional' (default)")]
-    pub sync_direction: Option<String>,
 }
 
 /// Response from creating a project.
@@ -59,11 +38,6 @@ pub struct CreateProjectResponse {
     pub project_id: String,
     pub name: String,
     pub slug: String,
-    pub github_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_project_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -94,11 +68,9 @@ pub struct ProjectSummary {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
-    pub github_owner: String,
-    pub github_repo: String,
     pub archived: bool,
-    pub open_issues: usize,
-    pub closed_issues: usize,
+    pub open_items: usize,
+    pub closed_items: usize,
     pub created_at: String,
 }
 
@@ -117,8 +89,8 @@ pub struct GetProjectParams {
     #[schemars(description = "Project ID or slug")]
     pub project: String,
 
-    /// Include issue counts
-    #[schemars(description = "Include issue counts (default: true)")]
+    /// Include work item counts
+    #[schemars(description = "Include work item counts (default: true)")]
     pub include_stats: Option<bool>,
 }
 
@@ -132,34 +104,20 @@ pub struct ProjectDetail {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
-    pub github_owner: String,
-    pub github_repo: String,
-    pub github_url: String,
     pub archived: bool,
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<ProjectStats>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_project: Option<GitHubProjectInfo>,
 }
 
 /// Project statistics.
 #[derive(Debug, Serialize)]
 pub struct ProjectStats {
-    pub open_issues: usize,
-    pub closed_issues: usize,
-    pub total_issues: usize,
+    pub open_items: usize,
+    pub closed_items: usize,
+    pub total_items: usize,
     pub linked_entries: usize,
-}
-
-/// GitHub Project V2 info.
-#[derive(Debug, Serialize)]
-pub struct GitHubProjectInfo {
-    pub node_id: String,
-    pub number: u32,
-    pub title: String,
-    pub url: String,
 }
 
 /// Parameters for updating a project.
@@ -202,69 +160,84 @@ pub struct DeleteProjectParams {
     #[schemars(description = "Project ID or slug")]
     pub project: String,
 
-    /// Delete associated issues from Kix (not GitHub)
-    #[schemars(description = "Also delete local issue copies (default: true)")]
-    pub delete_issues: Option<bool>,
+    /// Delete associated work items from Kix
+    #[schemars(description = "Also delete local work item copies (default: true)")]
+    pub delete_items: Option<bool>,
 }
 
 /// Response from deleting a project.
 #[derive(Debug, Serialize)]
 pub struct DeleteProjectResponse {
     pub success: bool,
-    pub issues_deleted: usize,
+    pub items_deleted: usize,
     pub entries_unlinked: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 // =============================================================================
-// ISSUE CRUD PARAMETERS
+// WORK ITEM CRUD PARAMETERS
 // =============================================================================
 
-/// Parameters for creating an issue.
+/// Parameters for creating a work item.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct CreateIssueParams {
+pub struct CreateWorkItemParams {
     /// Project ID or slug
     #[schemars(description = "Project ID or slug")]
     pub project: String,
 
-    /// Issue title (required)
-    #[schemars(description = "Issue title")]
+    /// Work item title (required)
+    #[schemars(description = "Work item title")]
     pub title: String,
 
-    /// Issue body/description
-    #[schemars(description = "Issue body in markdown")]
+    /// Work item body/description
+    #[schemars(description = "Work item body in markdown")]
     pub body: Option<String>,
 
     /// Labels to apply
-    #[schemars(description = "Labels to apply to the issue")]
+    #[schemars(description = "Labels to apply to the work item")]
     pub labels: Option<Vec<String>>,
 
-    /// Assignees (GitHub usernames)
-    #[schemars(description = "GitHub usernames to assign")]
+    /// Assignees (usernames)
+    #[schemars(description = "Usernames to assign")]
     pub assignees: Option<Vec<String>>,
 
-    /// Push to GitHub immediately
-    #[schemars(description = "Create issue on GitHub immediately (default: true)")]
-    pub push_to_github: Option<bool>,
+    // Board fields
+    /// Item type for board swimlane placement
+    #[schemars(description = "Item type: 'epic', 'story', 'task', 'subtask', or 'bug' (default: 'task')")]
+    pub item_type: Option<String>,
+
+    /// Parent work item ID for hierarchy
+    #[schemars(description = "Parent work item ID for creating sub-items (e.g., a subtask under a story)")]
+    pub parent_id: Option<String>,
+
+    /// Board column for initial placement
+    #[schemars(description = "Board column: 'backlog', 'todo', 'in_progress', 'in_review', 'testing', or 'done' (default: 'backlog')")]
+    pub board_column: Option<String>,
+
+    /// Story points estimate
+    #[schemars(description = "Story points estimate (for agile planning)")]
+    pub story_points: Option<i64>,
+
+    /// Epic color (hex, for epic items only)
+    #[schemars(description = "Epic color in hex format (e.g., 'A855F7'), only used for epic item type")]
+    pub epic_color: Option<String>,
 }
 
-/// Response from creating an issue.
+/// Response from creating a work item.
 #[derive(Debug, Serialize)]
-pub struct CreateIssueResponse {
+pub struct CreateWorkItemResponse {
     pub success: bool,
-    pub issue_id: String,
+    pub item_id: String,
     pub number: u32,
     pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Parameters for listing issues.
+/// Parameters for listing work items.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListIssuesParams {
+pub struct ListWorkItemsParams {
     /// Project ID or slug
     #[schemars(description = "Project ID or slug")]
     pub project: String,
@@ -278,7 +251,7 @@ pub struct ListIssuesParams {
     pub labels: Option<Vec<String>>,
 
     /// Filter by assignee
-    #[schemars(description = "Filter by assignee GitHub username")]
+    #[schemars(description = "Filter by assignee username")]
     pub assignee: Option<String>,
 
     /// Search in title/body
@@ -294,9 +267,9 @@ pub struct ListIssuesParams {
     pub offset: Option<usize>,
 }
 
-/// Issue summary for listing.
-#[derive(Debug, Serialize)]
-pub struct IssueSummary {
+/// Work item summary for listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkItemSummary {
     pub id: String,
     pub number: u32,
     pub title: String,
@@ -304,35 +277,43 @@ pub struct IssueSummary {
     pub labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignees: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_url: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    // Board fields
+    pub item_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub board_column: String,
+    pub position: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epic_color: Option<String>,
 }
 
-/// Response from listing issues.
+/// Response from listing work items.
 #[derive(Debug, Serialize)]
-pub struct ListIssuesResponse {
-    pub issues: Vec<IssueSummary>,
+pub struct ListWorkItemsResponse {
+    pub items: Vec<WorkItemSummary>,
     pub total: usize,
     pub has_more: bool,
 }
 
-/// Parameters for getting an issue.
+/// Parameters for getting a work item.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetIssueParams {
+pub struct GetWorkItemParams {
     /// Project ID or slug
     #[schemars(description = "Project ID or slug")]
     pub project: String,
 
-    /// Issue number or ID
-    #[schemars(description = "Issue number (e.g., 42) or full ID")]
-    pub issue: String,
+    /// Work item number or ID
+    #[schemars(description = "Work item number (e.g., 42) or full ID")]
+    pub item: String,
 }
 
-/// Detailed issue response.
+/// Detailed work item response.
 #[derive(Debug, Serialize)]
-pub struct IssueDetail {
+pub struct WorkItemDetail {
     pub id: String,
     pub project_id: String,
     pub number: u32,
@@ -343,25 +324,30 @@ pub struct IssueDetail {
     pub labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignees: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_number: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_url: Option<String>,
-    pub source: String,
     pub created_at: String,
     pub updated_at: String,
+    // Board fields
+    pub item_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub board_column: String,
+    pub position: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epic_color: Option<String>,
 }
 
-/// Parameters for updating an issue.
+/// Parameters for updating a work item.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct UpdateIssueParams {
+pub struct UpdateWorkItemParams {
     /// Project ID or slug
     #[schemars(description = "Project ID or slug")]
     pub project: String,
 
-    /// Issue number or ID
-    #[schemars(description = "Issue number or ID")]
-    pub issue: String,
+    /// Work item number or ID
+    #[schemars(description = "Work item number or ID")]
+    pub item: String,
 
     /// New title
     #[schemars(description = "New title")]
@@ -383,224 +369,55 @@ pub struct UpdateIssueParams {
     #[schemars(description = "New assignees (replaces existing)")]
     pub assignees: Option<Vec<String>>,
 
-    /// Push changes to GitHub
-    #[schemars(description = "Push changes to GitHub (default: true)")]
-    pub push_to_github: Option<bool>,
+    // Board fields
+    /// Change item type (may affect swimlane)
+    #[schemars(description = "Change item type: 'epic', 'story', 'task', 'subtask', or 'bug'")]
+    pub item_type: Option<String>,
+
+    /// Change parent work item
+    #[schemars(description = "New parent work item ID (null to make top-level)")]
+    pub parent_id: Option<String>,
+
+    /// Move to board column
+    #[schemars(description = "Move to board column: 'backlog', 'todo', 'in_progress', 'in_review', 'testing', or 'done'")]
+    pub board_column: Option<String>,
+
+    /// Update story points
+    #[schemars(description = "Update story points estimate")]
+    pub story_points: Option<i64>,
+
+    /// Update epic color (epics only)
+    #[schemars(description = "Update epic color in hex format")]
+    pub epic_color: Option<String>,
 }
 
-/// Response from updating an issue.
+/// Response from updating a work item.
 #[derive(Debug, Serialize)]
-pub struct UpdateIssueResponse {
+pub struct UpdateWorkItemResponse {
     pub success: bool,
-    pub issue_id: String,
-    pub synced_to_github: bool,
+    pub item_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Parameters for deleting an issue.
+/// Parameters for deleting a work item.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct DeleteIssueParams {
+pub struct DeleteWorkItemParams {
     /// Project ID or slug
     #[schemars(description = "Project ID or slug")]
     pub project: String,
 
-    /// Issue number or ID
-    #[schemars(description = "Issue number or ID")]
-    pub issue: String,
-
-    /// Also close on GitHub (not delete)
-    #[schemars(description = "Close the issue on GitHub (default: false)")]
-    pub close_on_github: Option<bool>,
-}
-
-/// Response from deleting an issue.
-#[derive(Debug, Serialize)]
-pub struct DeleteIssueResponse {
-    pub success: bool,
-    pub closed_on_github: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-// =============================================================================
-// GITHUB PROJECTS V2 PARAMETERS
-// =============================================================================
-
-/// Parameters for creating a GitHub Project V2.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct CreateGitHubProjectParams {
-    /// Kix project ID or slug
-    #[schemars(description = "Kix project ID or slug")]
-    pub project: String,
-
-    /// Project title on GitHub
-    #[schemars(description = "Title for the GitHub Project (defaults to Kix project name)")]
-    pub title: Option<String>,
-
-    /// Template to use
-    #[schemars(
-        description = "Template: 'kanban', 'bug_tracking', 'sprint_planning', or 'feature_roadmap'"
-    )]
-    pub template: Option<String>,
-}
-
-/// Response from creating a GitHub Project.
-#[derive(Debug, Serialize)]
-pub struct CreateGitHubProjectResponse {
-    pub success: bool,
-    pub project_node_id: String,
-    pub project_number: u32,
-    pub project_url: String,
-    pub template_applied: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Parameters for getting a GitHub Project.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetGitHubProjectParams {
-    /// Kix project ID or slug
-    #[schemars(description = "Kix project ID or slug")]
-    pub project: String,
-
-    /// Include items on the board
-    #[schemars(description = "Include items on the board (default: true)")]
-    pub include_items: Option<bool>,
-}
-
-/// GitHub Project field info.
-#[derive(Debug, Serialize)]
-pub struct GitHubFieldInfo {
-    pub id: String,
-    pub name: String,
-    pub field_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub options: Option<Vec<GitHubFieldOptionInfo>>,
-}
-
-/// GitHub field option.
-#[derive(Debug, Serialize)]
-pub struct GitHubFieldOptionInfo {
-    pub id: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
-}
-
-/// GitHub Project item.
-#[derive(Debug, Serialize)]
-pub struct GitHubProjectItemInfo {
-    pub item_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub issue_number: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    pub field_values: Vec<GitHubFieldValueInfo>,
-}
-
-/// GitHub field value.
-#[derive(Debug, Serialize)]
-pub struct GitHubFieldValueInfo {
-    pub field_name: String,
-    pub value: String,
-}
-
-/// Response from getting a GitHub Project.
-#[derive(Debug, Serialize)]
-pub struct GetGitHubProjectResponse {
-    pub node_id: String,
-    pub number: u32,
-    pub title: String,
-    pub url: String,
-    pub fields: Vec<GitHubFieldInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<GitHubProjectItemInfo>>,
-}
-
-/// Parameters for adding an issue to a GitHub Project.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct AddIssueToProjectParams {
-    /// Kix project ID or slug
-    #[schemars(description = "Kix project ID or slug")]
-    pub project: String,
-
-    /// Issue number or ID to add
-    #[schemars(description = "Issue number or ID to add to the project board")]
-    pub issue: String,
-
-    /// Initial status (column)
-    #[schemars(description = "Initial status (e.g., 'Todo', 'In Progress')")]
-    pub status: Option<String>,
-}
-
-/// Response from adding an issue to a project.
-#[derive(Debug, Serialize)]
-pub struct AddIssueToProjectResponse {
-    pub success: bool,
-    pub item_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Parameters for updating a project item.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct UpdateProjectItemParams {
-    /// Kix project ID or slug
-    #[schemars(description = "Kix project ID or slug")]
-    pub project: String,
-
-    /// Issue number or project item ID
-    #[schemars(description = "Issue number or project item ID")]
+    /// Work item number or ID
+    #[schemars(description = "Work item number or ID")]
     pub item: String,
-
-    /// New status
-    #[schemars(description = "New status value")]
-    pub status: Option<String>,
-
-    /// Priority (for templates that support it)
-    #[schemars(description = "Priority value (e.g., 'High', 'Medium', 'Low')")]
-    pub priority: Option<String>,
-
-    /// Custom field updates
-    #[schemars(description = "Custom field updates as field_name: value pairs")]
-    pub custom_fields: Option<std::collections::HashMap<String, String>>,
 }
 
-/// Response from updating a project item.
+/// Response from deleting a work item.
 #[derive(Debug, Serialize)]
-pub struct UpdateProjectItemResponse {
+pub struct DeleteWorkItemResponse {
     pub success: bool,
-    pub fields_updated: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-/// Parameters for syncing a GitHub Project.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SyncGitHubProjectParams {
-    /// Kix project ID or slug
-    #[schemars(description = "Kix project ID or slug")]
-    pub project: String,
-
-    /// Sync direction
-    #[schemars(description = "Sync direction: 'pull', 'push', or 'bidirectional' (default)")]
-    pub direction: Option<String>,
-
-    /// Include closed issues
-    #[schemars(description = "Include closed issues in sync (default: true)")]
-    pub include_closed: Option<bool>,
-}
-
-/// Response from syncing a GitHub Project.
-#[derive(Debug, Serialize)]
-pub struct SyncGitHubProjectResponse {
-    pub success: bool,
-    pub issues_pulled: usize,
-    pub issues_pushed: usize,
-    pub issues_updated: usize,
-    pub errors: Vec<String>,
-    pub synced_at: String,
 }
 
 // =============================================================================
@@ -750,67 +567,6 @@ pub struct BreakdownTaskResponse {
 }
 
 // =============================================================================
-// TOKEN MANAGEMENT PARAMETERS
-// =============================================================================
-
-/// Parameters for setting a GitHub token.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SetGitHubTokenParams {
-    /// The GitHub Personal Access Token
-    #[schemars(description = "GitHub Personal Access Token (PAT)")]
-    pub token: String,
-
-    /// Scope: global or project-specific
-    #[schemars(description = "Scope: 'global' or a project ID/slug for project-specific token")]
-    pub scope: Option<String>,
-}
-
-/// Response from setting a token.
-#[derive(Debug, Serialize)]
-pub struct SetGitHubTokenResponse {
-    pub success: bool,
-    pub scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Parameters for syncing GitHub issues.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SyncGitHubIssuesParams {
-    /// Kix project ID or slug
-    #[schemars(description = "Kix project ID or slug")]
-    pub project: String,
-
-    /// Sync direction
-    #[schemars(description = "Sync direction: 'pull', 'push', or 'bidirectional'")]
-    pub direction: Option<String>,
-
-    /// Include closed issues
-    #[schemars(description = "Include closed issues (default: true)")]
-    pub include_closed: Option<bool>,
-
-    /// Labels filter
-    #[schemars(description = "Only sync issues with these labels")]
-    pub labels: Option<Vec<String>>,
-
-    /// Maximum issues
-    #[schemars(description = "Maximum issues to sync (default: 100)")]
-    pub max_issues: Option<usize>,
-}
-
-/// Response from syncing issues.
-#[derive(Debug, Serialize)]
-pub struct SyncGitHubIssuesResponse {
-    pub success: bool,
-    pub issues_pulled: usize,
-    pub issues_pushed: usize,
-    pub issues_updated: usize,
-    pub issues_failed: usize,
-    pub errors: Vec<String>,
-    pub synced_at: String,
-}
-
-// =============================================================================
 // KNOWLEDGE LINKING PARAMETERS
 // =============================================================================
 
@@ -917,21 +673,21 @@ pub struct SearchProjectParams {
     pub query: String,
 
     /// Search type filter
-    #[schemars(description = "Search type: 'all', 'issues', or 'knowledge' (default: 'all')")]
+    #[schemars(description = "Search type: 'all', 'work_items', or 'knowledge' (default: 'all')")]
     pub search_type: Option<String>,
 
     /// Maximum results
     #[schemars(description = "Maximum results (default: 20)")]
     pub limit: Option<usize>,
 
-    /// Include closed issues
-    #[schemars(description = "Include closed issues (default: false)")]
+    /// Include closed work items
+    #[schemars(description = "Include closed work items (default: false)")]
     pub include_closed: Option<bool>,
 }
 
-/// Issue search result.
+/// Work item search result.
 #[derive(Debug, Serialize)]
-pub struct IssueSearchResultItem {
+pub struct WorkItemSearchResultItem {
     pub id: String,
     pub number: u32,
     pub title: String,
@@ -940,8 +696,6 @@ pub struct IssueSearchResultItem {
     pub state: String,
     pub labels: Vec<String>,
     pub score: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_url: Option<String>,
 }
 
 /// Knowledge search result.
@@ -961,6 +715,115 @@ pub struct KnowledgeSearchResultItem {
 #[derive(Debug, Serialize)]
 pub struct SearchProjectResponse {
     pub total: usize,
-    pub issues: Vec<IssueSearchResultItem>,
+    pub work_items: Vec<WorkItemSearchResultItem>,
     pub knowledge: Vec<KnowledgeSearchResultItem>,
+}
+
+// =============================================================================
+// BOARD TOOL PARAMETERS
+// =============================================================================
+
+/// Parameters for getting board view.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetBoardParams {
+    /// Project ID or slug
+    #[schemars(description = "Project ID or slug")]
+    pub project: String,
+
+    /// Filter by item type (swimlane)
+    #[schemars(description = "Filter by item type: 'epic', 'story', 'task', 'subtask', or 'bug'")]
+    pub item_type: Option<String>,
+}
+
+/// Board column info.
+#[derive(Debug, Serialize)]
+pub struct BoardColumnInfo {
+    pub id: String,
+    pub name: String,
+    pub display_name: String,
+}
+
+/// Board swimlane with work items.
+#[derive(Debug, Serialize)]
+pub struct BoardSwimlane {
+    pub item_type: String,
+    pub label: String,
+    pub columns: std::collections::HashMap<String, Vec<WorkItemSummary>>,
+    pub total_items: usize,
+}
+
+/// Response from get_board.
+#[derive(Debug, Serialize)]
+pub struct GetBoardResponse {
+    pub columns: Vec<BoardColumnInfo>,
+    pub swimlanes: Vec<BoardSwimlane>,
+    pub column_counts: std::collections::HashMap<String, usize>,
+    pub total_items: usize,
+}
+
+/// Parameters for getting column counts.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetColumnCountsParams {
+    /// Project ID or slug
+    #[schemars(description = "Project ID or slug")]
+    pub project: String,
+}
+
+/// Response from get_column_counts.
+#[derive(Debug, Serialize)]
+pub struct GetColumnCountsResponse {
+    pub counts: std::collections::HashMap<String, usize>,
+    pub total: usize,
+}
+
+/// Parameters for moving a card.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MoveCardParams {
+    /// Project ID or slug
+    #[schemars(description = "Project ID or slug")]
+    pub project: String,
+
+    /// Work item ID to move
+    #[schemars(description = "Work item ID or number to move")]
+    pub item: String,
+
+    /// Target board column
+    #[schemars(description = "Target column: 'backlog', 'todo', 'in_progress', 'in_review', 'testing', or 'done'")]
+    pub to_column: String,
+
+    /// Target position in column (0 = top)
+    #[schemars(description = "Target position in column (0 = top, default: 0)")]
+    pub to_position: Option<i64>,
+}
+
+/// Response from move_card.
+#[derive(Debug, Serialize)]
+pub struct MoveCardResponse {
+    pub success: bool,
+    pub item_id: String,
+    pub from_column: String,
+    pub to_column: String,
+    pub to_position: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Parameters for getting child work items.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetChildWorkItemsParams {
+    /// Project ID or slug
+    #[schemars(description = "Project ID or slug")]
+    pub project: String,
+
+    /// Parent work item ID
+    #[schemars(description = "Parent work item ID to get children for")]
+    pub parent_id: String,
+}
+
+/// Response from get_child_work_items.
+#[derive(Debug, Serialize)]
+pub struct GetChildWorkItemsResponse {
+    pub parent_id: String,
+    pub children: Vec<WorkItemSummary>,
+    pub total: usize,
 }

@@ -4,11 +4,11 @@
 //! for backward compatibility with existing code.
 
 use crate::error::StoreError;
-use kix_sqlite::{IssueRecord, ProjectEntryRecord, ProjectRecord, SqliteStore};
+use kix_sqlite::{WorkItemRecord, ProjectEntryRecord, ProjectRecord, SqliteStore};
 use std::path::Path;
 
 // Re-export record types for convenience
-pub use kix_sqlite::{IssueRecord as Issue, ProjectRecord as Project};
+pub use kix_sqlite::{WorkItemRecord as WorkItem, ProjectRecord as Project};
 
 /// Project store wrapper.
 ///
@@ -81,7 +81,7 @@ impl ProjectStore {
         })
     }
 
-    /// Delete a project and cascade to issues and links.
+    /// Delete a project and cascade to work items and links.
     pub async fn delete_project(&self, id: &str) -> Result<bool, StoreError> {
         self.sqlite.delete_project(id).await.map_err(|e| {
             StoreError::Database(format!("Failed to delete project: {}", e))
@@ -96,83 +96,137 @@ impl ProjectStore {
     }
 
     // =========================================================================
-    // Issue Operations
+    // Work Item Operations
     // =========================================================================
 
-    /// Create a new issue.
-    pub async fn create_issue(&self, issue: &IssueRecord) -> Result<(), StoreError> {
-        self.sqlite.insert_issue(issue).await.map_err(|e| {
-            StoreError::Database(format!("Failed to create issue: {}", e))
+    /// Create a new work item.
+    pub async fn create_work_item(&self, item: &WorkItemRecord) -> Result<(), StoreError> {
+        self.sqlite.insert_work_item(item).await.map_err(|e| {
+            StoreError::Database(format!("Failed to create work item: {}", e))
         })
     }
 
-    /// Get an issue by ID.
-    pub async fn get_issue(&self, id: &str) -> Result<Option<IssueRecord>, StoreError> {
-        self.sqlite.get_issue(id).await.map_err(|e| {
-            StoreError::Database(format!("Failed to get issue: {}", e))
+    /// Get a work item by ID.
+    pub async fn get_work_item(&self, id: &str) -> Result<Option<WorkItemRecord>, StoreError> {
+        self.sqlite.get_work_item(id).await.map_err(|e| {
+            StoreError::Database(format!("Failed to get work item: {}", e))
         })
     }
 
-    /// Get an issue by project and number.
-    pub async fn get_issue_by_number(
+    /// Get a work item by project and number.
+    pub async fn get_work_item_by_number(
         &self,
         project_id: &str,
         number: u32,
-    ) -> Result<Option<IssueRecord>, StoreError> {
-        self.sqlite.get_issue_by_number(project_id, number).await.map_err(|e| {
-            StoreError::Database(format!("Failed to get issue by number: {}", e))
+    ) -> Result<Option<WorkItemRecord>, StoreError> {
+        self.sqlite.get_work_item_by_number(project_id, number).await.map_err(|e| {
+            StoreError::Database(format!("Failed to get work item by number: {}", e))
         })
     }
 
-    /// Get an issue by project and GitHub number.
-    pub async fn get_issue_by_github_number(
-        &self,
-        project_id: &str,
-        github_number: u32,
-    ) -> Result<Option<IssueRecord>, StoreError> {
-        self.sqlite.get_issue_by_github_number(project_id, github_number).await.map_err(|e| {
-            StoreError::Database(format!("Failed to get issue by GitHub number: {}", e))
+    /// Update a work item.
+    pub async fn update_work_item(&self, item: &WorkItemRecord) -> Result<bool, StoreError> {
+        self.sqlite.update_work_item(item).await.map_err(|e| {
+            StoreError::Database(format!("Failed to update work item: {}", e))
         })
     }
 
-    /// Update an issue.
-    pub async fn update_issue(&self, issue: &IssueRecord) -> Result<bool, StoreError> {
-        self.sqlite.update_issue(issue).await.map_err(|e| {
-            StoreError::Database(format!("Failed to update issue: {}", e))
+    /// Delete a work item.
+    pub async fn delete_work_item(&self, id: &str) -> Result<bool, StoreError> {
+        self.sqlite.delete_work_item(id).await.map_err(|e| {
+            StoreError::Database(format!("Failed to delete work item: {}", e))
         })
     }
 
-    /// Delete an issue.
-    pub async fn delete_issue(&self, id: &str) -> Result<bool, StoreError> {
-        self.sqlite.delete_issue(id).await.map_err(|e| {
-            StoreError::Database(format!("Failed to delete issue: {}", e))
-        })
-    }
-
-    /// List issues for a project.
-    pub async fn list_issues(
+    /// List work items for a project.
+    pub async fn list_work_items(
         &self,
         project_id: &str,
         state: Option<&str>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<IssueRecord>, StoreError> {
-        self.sqlite.list_issues(project_id, state, limit, offset).await.map_err(|e| {
-            StoreError::Database(format!("Failed to list issues: {}", e))
+    ) -> Result<Vec<WorkItemRecord>, StoreError> {
+        self.sqlite.list_work_items(project_id, state, limit, offset).await.map_err(|e| {
+            StoreError::Database(format!("Failed to list work items: {}", e))
         })
     }
 
-    /// Get the next issue number for a project.
-    pub async fn next_issue_number(&self, project_id: &str) -> Result<u32, StoreError> {
-        self.sqlite.next_issue_number(project_id).await.map_err(|e| {
-            StoreError::Database(format!("Failed to get next issue number: {}", e))
+    /// Get the next work item number for a project.
+    pub async fn next_work_item_number(&self, project_id: &str) -> Result<u32, StoreError> {
+        self.sqlite.next_work_item_number(project_id).await.map_err(|e| {
+            StoreError::Database(format!("Failed to get next work item number: {}", e))
         })
     }
 
-    /// Count issues in a project.
-    pub async fn issue_count(&self, project_id: &str) -> Result<usize, StoreError> {
-        self.sqlite.issue_count(project_id).await.map_err(|e| {
-            StoreError::Database(format!("Failed to count issues: {}", e))
+    /// Count work items in a project.
+    pub async fn work_item_count(&self, project_id: &str) -> Result<usize, StoreError> {
+        self.sqlite.work_item_count(project_id).await.map_err(|e| {
+            StoreError::Database(format!("Failed to count work items: {}", e))
+        })
+    }
+
+    // =========================================================================
+    // Board Operations
+    // =========================================================================
+
+    /// List work items for board view (grouped by column and sorted by position).
+    pub async fn list_work_items_for_board(
+        &self,
+        project_id: &str,
+        item_type: Option<&str>,
+    ) -> Result<Vec<WorkItemRecord>, StoreError> {
+        self.sqlite.list_work_items_for_board(project_id, item_type).await.map_err(|e| {
+            StoreError::Database(format!("Failed to list work items for board: {}", e))
+        })
+    }
+
+    /// Update work item position (for drag-drop reordering).
+    pub async fn update_work_item_position(
+        &self,
+        item_id: &str,
+        board_column: &str,
+        position: i64,
+    ) -> Result<bool, StoreError> {
+        self.sqlite.update_work_item_position(item_id, board_column, position).await.map_err(|e| {
+            StoreError::Database(format!("Failed to update work item position: {}", e))
+        })
+    }
+
+    /// Shift positions in a column to make room for a card.
+    pub async fn shift_positions(
+        &self,
+        project_id: &str,
+        board_column: &str,
+        from_position: i64,
+        shift: i64,
+    ) -> Result<(), StoreError> {
+        self.sqlite.shift_positions(project_id, board_column, from_position, shift).await.map_err(|e| {
+            StoreError::Database(format!("Failed to shift positions: {}", e))
+        })
+    }
+
+    /// Get child work items for a parent.
+    pub async fn get_child_work_items(&self, parent_id: &str) -> Result<Vec<WorkItemRecord>, StoreError> {
+        self.sqlite.get_child_work_items(parent_id).await.map_err(|e| {
+            StoreError::Database(format!("Failed to get child work items: {}", e))
+        })
+    }
+
+    /// Count work items by column for a project.
+    pub async fn count_work_items_by_column(&self, project_id: &str) -> Result<Vec<(String, i64)>, StoreError> {
+        self.sqlite.count_work_items_by_column(project_id).await.map_err(|e| {
+            StoreError::Database(format!("Failed to count work items by column: {}", e))
+        })
+    }
+
+    /// Get the next position for a column.
+    pub async fn next_position_in_column(
+        &self,
+        project_id: &str,
+        board_column: &str,
+    ) -> Result<i64, StoreError> {
+        self.sqlite.next_position_in_column(project_id, board_column).await.map_err(|e| {
+            StoreError::Database(format!("Failed to get next position: {}", e))
         })
     }
 

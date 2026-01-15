@@ -1,14 +1,16 @@
 // Project Management Types
 
-export type IssueState = 'open' | 'closed' | 'in_progress' | 'blocked';
-export type IssueSource = 'local' | 'github';
-export type IssuePriority = 'low' | 'medium' | 'high' | 'critical';
+export type WorkItemState = 'open' | 'closed' | 'in_progress' | 'blocked';
+export type WorkItemPriority = 'low' | 'medium' | 'high' | 'critical';
+
+// Board-related types
+export type WorkItemType = 'epic' | 'story' | 'task' | 'subtask' | 'bug';
+export type BoardColumn = 'backlog' | 'todo' | 'in_progress' | 'in_review' | 'testing' | 'done';
 
 export interface ProjectStats {
-  total_issues: number;
-  open_issues: number;
-  closed_issues: number;
-  in_progress_issues: number;
+  total_items: number;
+  open_items: number;
+  closed_items: number;
   linked_entries: number;
 }
 
@@ -19,33 +21,32 @@ export interface Project {
   slug: string;
   description?: string;
   color?: string;
-  github_owner?: string;
-  github_repo?: string;
-  has_github: boolean;
-  has_token?: boolean;
-  /** URL to the linked GitHub Project V2 board (if any) */
-  github_project_v2_url?: string;
   stats?: ProjectStats;
   archived: boolean;
   created_at: string;
   updated_at: string;
 }
 
-export interface Issue {
+export interface WorkItem {
   id: string;
   project_id: string;
   number: number;
   title: string;
   body?: string;
-  state: IssueState;
+  state: WorkItemState;
   labels: string[];
-  priority?: IssuePriority;
+  priority?: WorkItemPriority;
   assignees: string[];
-  github_number?: number;
-  github_url?: string;
-  source: IssueSource;
   created_at: string;
   updated_at: string;
+  closed_at?: string;
+  // Board fields
+  item_type: WorkItemType;
+  parent_id?: string;
+  position: number;
+  board_column: BoardColumn;
+  story_points?: number;
+  epic_color?: string;
 }
 
 export interface ProjectEntry {
@@ -60,22 +61,11 @@ export interface ProjectEntry {
   linked_at: string;
 }
 
-// Project template types (for GitHub Projects V2)
-export type ProjectTemplate = 'kanban' | 'bug_tracking' | 'sprint_planning' | 'feature_roadmap';
-
 // API Request/Response Types
 export interface CreateProjectRequest {
   name: string;
   description?: string;
   color?: string;
-  // GitHub config (optional for local-only projects)
-  github_owner?: string;
-  github_repo?: string;
-  // GitHub Project V2 template (required for GitHub projects)
-  template?: ProjectTemplate;
-  // Token config
-  use_global_token?: boolean;
-  token?: string;
 }
 
 export interface UpdateProjectRequest {
@@ -85,24 +75,32 @@ export interface UpdateProjectRequest {
   archived?: boolean;
 }
 
-export interface CreateIssueRequest {
+export interface CreateWorkItemRequest {
   title: string;
   body?: string;
-  state?: IssueState;
+  state?: WorkItemState;
   labels?: string[];
-  priority?: IssuePriority;
+  priority?: WorkItemPriority;
   assignees?: string[];
-  create_on_github?: boolean;
+  item_type?: WorkItemType;
+  parent_id?: string;
+  board_column?: BoardColumn;
+  story_points?: number;
+  epic_color?: string;
 }
 
-export interface UpdateIssueRequest {
+export interface UpdateWorkItemRequest {
   title?: string;
   body?: string;
-  state?: IssueState;
+  state?: WorkItemState;
   labels?: string[];
-  priority?: IssuePriority;
+  priority?: WorkItemPriority;
   assignees?: string[];
-  sync_to_github?: boolean;
+  item_type?: WorkItemType;
+  parent_id?: string;
+  board_column?: BoardColumn;
+  story_points?: number;
+  epic_color?: string;
 }
 
 export interface LinkEntryRequest {
@@ -116,8 +114,8 @@ export interface ProjectListResponse {
   total: number;
 }
 
-export interface IssueListResponse {
-  issues: Issue[];
+export interface WorkItemListResponse {
+  items: WorkItem[];
   total: number;
 }
 
@@ -126,37 +124,16 @@ export interface ProjectEntryListResponse {
   total: number;
 }
 
-// GitHub Sync Types
-export interface SyncChangeDetail {
-  issue_number: number;
-  title: string;
-  action: 'pulled' | 'pushed' | 'merged' | 'created' | 'updated' | 'conflicted';
-  fields_affected: string[];
-}
-
-export interface GitHubSyncResult {
-  success: boolean;
-  message: string;
-  pulled: number;
-  pushed: number;
-  merged: number;
-  conflicts_resolved: number;
-  change_details: SyncChangeDetail[];
-  errors: string[];
-}
-
 // Project Event Types (for SSE)
 export type ProjectEventType =
   | 'project_created'
   | 'project_updated'
   | 'project_deleted'
-  | 'issue_created'
-  | 'issue_updated'
-  | 'issue_deleted'
+  | 'work_item_created'
+  | 'work_item_updated'
+  | 'work_item_deleted'
   | 'entry_linked'
   | 'entry_unlinked'
-  | 'github_sync_started'
-  | 'github_sync_completed'
   | 'heartbeat';
 
 export interface ProjectEvent {
@@ -168,10 +145,6 @@ export interface ProjectEvent {
     id?: string;
     name?: string;
     title?: string;
-    // Sync fields
-    created?: number;
-    updated?: number;
-    errors?: string[];
     // Entry fields
     entry_id?: string;
     entry_title?: string;
@@ -179,70 +152,64 @@ export interface ProjectEvent {
 }
 
 // ============================================================================
-// GitHub API Types
+// Board API Types
 // ============================================================================
 
-export interface GitHubTokenStatus {
-  has_global_token: boolean;
-  token_suffix?: string;
-  verified_user?: string;
-}
-
-export interface SetGlobalTokenResponse {
-  success: boolean;
-  username?: string;
-}
-
-export interface GitHubUser {
-  id: number;
-  login: string;
-  name?: string;
-  avatar_url: string;
-  html_url: string;
-  email?: string;
-  user_type: string;
-}
-
-export interface GitHubOrg {
-  login: string;
-  avatar_url: string;
-  type: 'user' | 'org';
-  description?: string;
-}
-
-export interface GitHubOrgsResponse {
-  orgs: GitHubOrg[];
-}
-
-export interface GitHubRepo {
+export interface BoardColumnInfo {
+  id: string;
   name: string;
-  full_name: string;
-  description?: string;
-  private: boolean;
+  display_name: string;
 }
 
-export interface GitHubReposResponse {
-  repos: GitHubRepo[];
-  has_more: boolean;
+export interface BoardResponse {
+  columns: BoardColumnInfo[];
+  swimlanes: WorkItemType[];
+  items_by_swimlane: Record<WorkItemType, Record<BoardColumn, WorkItem[]>>;
+  column_counts: Record<BoardColumn, number>;
+  total_items: number;
 }
 
-export interface VerifyAccessRequest {
-  owner: string;
-  repo: string;
-  token?: string;
+export interface MoveCardRequest {
+  item_id: string;
+  to_column: BoardColumn;
+  to_position: number;
 }
 
-export interface VerifyAccessResponse {
-  has_access: boolean;
-  permissions?: {
-    admin: boolean;
-    push: boolean;
-    pull: boolean;
-  };
+export interface MoveCardResponse {
+  success: boolean;
+  item_id: string;
+  from_column: BoardColumn;
+  to_column: BoardColumn;
+  to_position: number;
 }
 
-// Project token type (matches backend ProjectTokenType)
-export type ProjectTokenType =
-  | { type: 'project_specific'; suffix?: string; verified_user?: string }
-  | { type: 'using_global'; suffix?: string }
-  | { type: 'not_configured' };
+export interface ColumnCountsResponse {
+  columns: Record<BoardColumn, number>;
+  total: number;
+}
+
+export interface ChildWorkItemsResponse {
+  parent_id: string;
+  parent_type: WorkItemType;
+  children: WorkItem[];
+  total: number;
+}
+
+// Board column display configuration
+export const BOARD_COLUMNS: BoardColumnInfo[] = [
+  { id: 'backlog', name: 'backlog', display_name: 'Backlog' },
+  { id: 'todo', name: 'todo', display_name: 'To Do' },
+  { id: 'in_progress', name: 'in_progress', display_name: 'In Progress' },
+  { id: 'in_review', name: 'in_review', display_name: 'In Review' },
+  { id: 'testing', name: 'testing', display_name: 'Testing' },
+  { id: 'done', name: 'done', display_name: 'Done' },
+];
+
+// Work item type display configuration
+export const WORK_ITEM_TYPES: { type: WorkItemType; label: string; color: string }[] = [
+  { type: 'epic', label: 'Epic', color: 'purple' },
+  { type: 'story', label: 'Story', color: 'blue' },
+  { type: 'task', label: 'Task', color: 'slate' },
+  { type: 'subtask', label: 'Subtask', color: 'gray' },
+  { type: 'bug', label: 'Bug', color: 'red' },
+];

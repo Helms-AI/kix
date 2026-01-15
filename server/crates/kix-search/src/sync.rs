@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use crate::{EntryDocument, IssueDocument, PageDocument, SearchEngine, SearchResult};
 
 // Re-export entity types from kix-sqlite for convenience
-use kix_sqlite::entities::{entry, issue, page};
+use kix_sqlite::entities::{entry, page, work_item};
 
 /// Synchronizer for keeping search indexes in sync with the database.
 ///
@@ -111,29 +111,29 @@ impl<'a> IndexSynchronizer<'a> {
         Ok(stats)
     }
 
-    /// Perform a full reindex of all issues from the database.
+    /// Perform a full reindex of all work items from the database.
     pub async fn full_reindex_issues(&self) -> SearchResult<SyncStats> {
-        info!("Starting full reindex of issues");
+        info!("Starting full reindex of work items");
 
         self.search.issue_writer().clear_all()?;
 
-        let issues = issue::Entity::find()
-            .order_by_asc(issue::Column::CreatedAt)
+        let items = work_item::Entity::find()
+            .order_by_asc(work_item::Column::CreatedAt)
             .all(self.db)
             .await
             .map_err(|e| crate::error::SearchError::Index(format!("Database error: {}", e)))?;
 
-        let total = issues.len();
-        info!(count = total, "Loaded issues from database");
+        let total = items.len();
+        info!(count = total, "Loaded work items from database");
 
         let batch_size = 1000;
         let mut indexed = 0;
 
-        for chunk in issues.chunks(batch_size) {
-            let docs: Vec<IssueDocument> = chunk.iter().map(issue_to_document).collect();
+        for chunk in items.chunks(batch_size) {
+            let docs: Vec<IssueDocument> = chunk.iter().map(work_item_to_document).collect();
             let count = self.search.index_issues(&docs)?;
             indexed += count;
-            debug!(indexed = indexed, total = total, "Indexed issue batch");
+            debug!(indexed = indexed, total = total, "Indexed work item batch");
         }
 
         let stats = SyncStats {
@@ -143,7 +143,7 @@ impl<'a> IndexSynchronizer<'a> {
             errors: vec![],
         };
 
-        info!(indexed = indexed, "Issue reindex complete");
+        info!(indexed = indexed, "Work item reindex complete");
         Ok(stats)
     }
 
@@ -223,22 +223,22 @@ impl<'a> IndexSynchronizer<'a> {
         Ok(())
     }
 
-    /// Sync a single issue by ID.
-    pub async fn sync_issue(&self, issue_id: &str) -> SearchResult<()> {
-        let issue = issue::Entity::find_by_id(issue_id)
+    /// Sync a single work item by ID.
+    pub async fn sync_issue(&self, item_id: &str) -> SearchResult<()> {
+        let item = work_item::Entity::find_by_id(item_id)
             .one(self.db)
             .await
             .map_err(|e| crate::error::SearchError::Index(format!("Database error: {}", e)))?;
 
-        match issue {
+        match item {
             Some(i) => {
-                let doc = issue_to_document(&i);
+                let doc = work_item_to_document(&i);
                 self.search.index_issue(&doc)?;
-                debug!(id = issue_id, "Synced issue to index");
+                debug!(id = item_id, "Synced work item to index");
             }
             None => {
-                self.search.delete_issue(issue_id)?;
-                debug!(id = issue_id, "Deleted issue from index");
+                self.search.delete_issue(item_id)?;
+                debug!(id = item_id, "Deleted work item from index");
             }
         }
 
@@ -391,26 +391,26 @@ fn page_to_document(page: &page::Model) -> PageDocument {
     }
 }
 
-/// Convert a SeaORM issue model to a Tantivy document.
-fn issue_to_document(issue: &issue::Model) -> IssueDocument {
-    let created_at = chrono::DateTime::parse_from_rfc3339(&issue.created_at)
+/// Convert a SeaORM work item model to a Tantivy document.
+fn work_item_to_document(item: &work_item::Model) -> IssueDocument {
+    let created_at = chrono::DateTime::parse_from_rfc3339(&item.created_at)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
 
     // Parse labels from JSON
-    let labels: Vec<String> = issue
+    let labels: Vec<String> = item
         .labels
         .as_ref()
         .and_then(|l| serde_json::from_str(l).ok())
         .unwrap_or_default();
 
     IssueDocument {
-        id: issue.id.clone(),
-        project_id: issue.project_id.clone(),
-        number: issue.number,
-        title: issue.title.clone(),
-        body: issue.body.clone(),
-        state: issue.state.clone(),
+        id: item.id.clone(),
+        project_id: item.project_id.clone(),
+        number: item.number,
+        title: item.title.clone(),
+        body: item.body.clone(),
+        state: item.state.clone(),
         labels,
         created_at,
     }
@@ -470,31 +470,31 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_to_document() {
-        let issue = issue::Model {
-            id: "issue-1".to_string(),
+    fn test_work_item_to_document() {
+        let item = work_item::Model {
+            id: "item-1".to_string(),
             project_id: "project-1".to_string(),
             number: 42,
-            title: "Test Issue".to_string(),
-            body: Some("Issue body".to_string()),
+            title: "Test Work Item".to_string(),
+            body: Some("Work item body".to_string()),
             state: "open".to_string(),
             labels: Some(r#"["bug", "p1"]"#.to_string()),
             assignees: None,
             priority: Some(1),
-            github_number: None,
-            github_node_id: None,
-            github_url: None,
-            github_project_item_id: None,
-            source: "local".to_string(),
+            item_type: "task".to_string(),
+            parent_id: None,
+            position: 0,
+            board_column: "backlog".to_string(),
+            story_points: None,
+            epic_color: None,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             closed_at: None,
-            synced_at: None,
         };
 
-        let doc = issue_to_document(&issue);
+        let doc = work_item_to_document(&item);
 
-        assert_eq!(doc.id, "issue-1");
+        assert_eq!(doc.id, "item-1");
         assert_eq!(doc.number, 42);
         assert_eq!(doc.labels, vec!["bug", "p1"]);
     }

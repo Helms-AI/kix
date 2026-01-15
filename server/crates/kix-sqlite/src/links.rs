@@ -167,7 +167,7 @@ mod tests {
     }
 
     async fn create_test_data(pool: &SqlitePool) -> (String, String) {
-        let mut project = ProjectRecord::new_local("Test Project");
+        let mut project = ProjectRecord::new("Test Project");
         project.id = "proj-1".to_string();
         insert_project(pool, &project).await.unwrap();
 
@@ -223,7 +223,7 @@ mod tests {
         let (pool, _temp_dir) = setup_test_db().await;
 
         // Create project
-        let mut project = ProjectRecord::new_local("Project");
+        let mut project = ProjectRecord::new("Project");
         project.id = "proj-list".to_string();
         insert_project(&pool, &project).await.unwrap();
 

@@ -33,8 +33,8 @@ use crate::error::StoreError;
 use crate::search::{PatternSummary, SearchFilters, SearchResult};
 use kix_parser::{Entry, EntryChunk};
 use kix_sqlite::{
-    EntryRecord, IssueRecord, JobRecord, PageRecord, ProjectEntryRecord, ProjectRecord,
-    SqliteStore, TokenRecord,
+    EntryRecord, WorkItemRecord, JobRecord, PageRecord, ProjectEntryRecord, ProjectRecord,
+    SqliteStore,
 };
 use kix_search::{
     EntryDocument, EntrySearchFilters, IssueDocument, PageDocument, SearchEngine,
@@ -535,18 +535,18 @@ impl KixStore {
     }
 
     // =========================================================================
-    // Issue Operations (SQLite)
+    // Work Item Operations (SQLite)
     // =========================================================================
 
-    /// Insert an issue into SQLite and Tantivy search index.
-    pub async fn insert_issue(&self, issue: &IssueRecord) -> Result<(), StoreError> {
+    /// Insert a work item into SQLite and Tantivy search index.
+    pub async fn insert_work_item(&self, item: &WorkItemRecord) -> Result<(), StoreError> {
         self.sqlite
-            .insert_issue(issue)
+            .insert_work_item(item)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
         // Sync to Tantivy search index
-        let doc = issue_record_to_document(issue);
+        let doc = work_item_record_to_document(item);
         self.search
             .index_issue(&doc)
             .map_err(|e| StoreError::Database(format!("Search sync failed: {}", e)))?;
@@ -554,38 +554,38 @@ impl KixStore {
         Ok(())
     }
 
-    /// Get an issue by ID.
-    pub async fn get_issue(&self, id: &str) -> Result<Option<IssueRecord>, StoreError> {
+    /// Get a work item by ID.
+    pub async fn get_work_item(&self, id: &str) -> Result<Option<WorkItemRecord>, StoreError> {
         self.sqlite
-            .get_issue(id)
+            .get_work_item(id)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    /// List issues for a project.
-    pub async fn list_issues(
+    /// List work items for a project.
+    pub async fn list_work_items(
         &self,
         project_id: &str,
         state: Option<&str>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<IssueRecord>, StoreError> {
+    ) -> Result<Vec<WorkItemRecord>, StoreError> {
         self.sqlite
-            .list_issues(project_id, state, limit, offset)
+            .list_work_items(project_id, state, limit, offset)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    /// Update an issue in SQLite and Tantivy search index.
-    pub async fn update_issue(&self, issue: &IssueRecord) -> Result<bool, StoreError> {
+    /// Update a work item in SQLite and Tantivy search index.
+    pub async fn update_work_item(&self, item: &WorkItemRecord) -> Result<bool, StoreError> {
         let result = self.sqlite
-            .update_issue(issue)
+            .update_work_item(item)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
         // Sync to Tantivy search index
         if result {
-            let doc = issue_record_to_document(issue);
+            let doc = work_item_record_to_document(item);
             self.search
                 .index_issue(&doc)
                 .map_err(|e| StoreError::Database(format!("Search sync failed: {}", e)))?;
@@ -594,63 +594,43 @@ impl KixStore {
         Ok(result)
     }
 
-    /// Delete an issue from SQLite and Tantivy search index.
-    pub async fn delete_issue(&self, id: &str) -> Result<bool, StoreError> {
+    /// Delete a work item from SQLite and Tantivy search index.
+    pub async fn delete_work_item(&self, id: &str) -> Result<bool, StoreError> {
         // Delete from Tantivy search index first
         self.search
             .delete_issue(id)
             .map_err(|e| StoreError::Database(format!("Search delete failed: {}", e)))?;
 
         self.sqlite
-            .delete_issue(id)
+            .delete_work_item(id)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    /// Get an issue by number within a project.
-    pub async fn get_issue_by_number(
+    /// Get a work item by number within a project.
+    pub async fn get_work_item_by_number(
         &self,
         project_id: &str,
         number: u32,
-    ) -> Result<Option<IssueRecord>, StoreError> {
+    ) -> Result<Option<WorkItemRecord>, StoreError> {
         self.sqlite
-            .get_issue_by_number(project_id, number)
+            .get_work_item_by_number(project_id, number)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    /// Get the next issue number for a project.
-    pub async fn next_issue_number(&self, project_id: &str) -> Result<u32, StoreError> {
+    /// Get the next work item number for a project.
+    pub async fn next_work_item_number(&self, project_id: &str) -> Result<u32, StoreError> {
         self.sqlite
-            .next_issue_number(project_id)
+            .next_work_item_number(project_id)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    /// Count issues for a project.
-    pub async fn issue_count(&self, project_id: &str) -> Result<usize, StoreError> {
+    /// Count work items for a project.
+    pub async fn work_item_count(&self, project_id: &str) -> Result<usize, StoreError> {
         self.sqlite
-            .issue_count(project_id)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))
-    }
-
-    // =========================================================================
-    // Token Operations (SQLite)
-    // =========================================================================
-
-    /// Store a token.
-    pub async fn store_token(&self, token: &TokenRecord) -> Result<(), StoreError> {
-        self.sqlite
-            .store_token(token)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))
-    }
-
-    /// Get a token by scope.
-    pub async fn get_token(&self, scope: &str) -> Result<Option<TokenRecord>, StoreError> {
-        self.sqlite
-            .get_token(scope)
+            .work_item_count(project_id)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))
     }
@@ -813,18 +793,18 @@ impl KixStore {
             }
         }
 
-        // Reindex issues (for all projects)
+        // Reindex work items (for all projects)
         let projects = self.list_projects(true).await?;
         for project in &projects {
-            let issues = self.list_issues(&project.id, None, 100000, 0).await?;
-            info!("Reindexing {} issues for project {}", issues.len(), project.id);
-            for issue in &issues {
-                let doc = issue_record_to_document(issue);
+            let items = self.list_work_items(&project.id, None, 100000, 0).await?;
+            info!("Reindexing {} work items for project {}", items.len(), project.id);
+            for item in &items {
+                let doc = work_item_record_to_document(item);
                 match self.search.index_issue(&doc) {
                     Ok(_) => stats.issues_indexed += 1,
                     Err(e) => {
-                        warn!(issue_id = %issue.id, error = %e, "Failed to index issue");
-                        stats.errors.push(format!("Issue {}: {}", issue.id, e));
+                        warn!(item_id = %item.id, error = %e, "Failed to index work item");
+                        stats.errors.push(format!("WorkItem {}: {}", item.id, e));
                     }
                 }
             }
@@ -1100,25 +1080,25 @@ fn page_record_to_document(page: &PageRecord) -> PageDocument {
     }
 }
 
-/// Convert IssueRecord to Tantivy IssueDocument.
-fn issue_record_to_document(issue: &IssueRecord) -> IssueDocument {
-    let labels: Vec<String> = issue
+/// Convert WorkItemRecord to Tantivy IssueDocument.
+fn work_item_record_to_document(item: &WorkItemRecord) -> IssueDocument {
+    let labels: Vec<String> = item
         .labels
         .as_ref()
         .and_then(|l| serde_json::from_str(l).ok())
         .unwrap_or_default();
 
-    let created_at = chrono::DateTime::parse_from_rfc3339(&issue.created_at)
+    let created_at = chrono::DateTime::parse_from_rfc3339(&item.created_at)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
 
     IssueDocument {
-        id: issue.id.clone(),
-        project_id: issue.project_id.clone(),
-        number: issue.number,
-        title: issue.title.clone(),
-        body: issue.body.clone(),
-        state: issue.state.clone(),
+        id: item.id.clone(),
+        project_id: item.project_id.clone(),
+        number: item.number,
+        title: item.title.clone(),
+        body: item.body.clone(),
+        state: item.state.clone(),
         labels,
         created_at,
     }

@@ -51,9 +51,9 @@ pub struct LinkResult {
 /// Options for search within project scope.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectSearchOptions {
-    /// Search type: "all", "issues", or "knowledge"
+    /// Search type: "all", "work_items", or "knowledge"
     pub search_type: Option<String>,
-    /// Include closed issues
+    /// Include closed work items
     pub include_closed: bool,
     /// Maximum results
     pub limit: usize,
@@ -62,13 +62,13 @@ pub struct ProjectSearchOptions {
 /// Result from project-scoped search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectSearchResult {
-    pub issues: Vec<IssueSearchHit>,
+    pub work_items: Vec<WorkItemSearchHit>,
     pub entries: Vec<EntrySearchHit>,
 }
 
-/// Issue search hit.
+/// Work item search hit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IssueSearchHit {
+pub struct WorkItemSearchHit {
     pub id: String,
     pub number: u32,
     pub title: String,
@@ -248,6 +248,104 @@ pub async fn list_linked_entries(
         .collect();
 
     Ok(LinkedEntryList { entries, total })
+}
+
+/// Search within a project's scope across work items and linked knowledge entries.
+///
+/// # Arguments
+/// * `store` - The ProjectStore instance
+/// * `project_id_or_slug` - Project ID or slug
+/// * `query` - Search query
+/// * `options` - Search options
+///
+/// # Returns
+/// Search results with work items and knowledge entries
+pub async fn search_project(
+    store: &Arc<RwLock<ProjectStore>>,
+    project_id_or_slug: &str,
+    query: &str,
+    options: ProjectSearchOptions,
+) -> ServiceResult<ProjectSearchResult> {
+    info!(
+        "Search project {} for '{}'",
+        project_id_or_slug, query
+    );
+
+    let store_guard = store.read().await;
+
+    // Get project to validate it exists
+    let project = store_guard
+        .get_project(project_id_or_slug)
+        .await
+        .map_err(ServiceError::Store)?
+        .ok_or_else(|| ServiceError::not_found("Project", project_id_or_slug))?;
+
+    let search_type = options.search_type.as_deref().unwrap_or("all");
+    let limit = if options.limit == 0 { 20 } else { options.limit };
+    let query_lower = query.to_lowercase();
+
+    let mut work_items = Vec::new();
+    let mut entries = Vec::new();
+
+    // Search work items if requested
+    if search_type == "all" || search_type == "work_items" {
+        let state_filter = if options.include_closed { None } else { Some("open") };
+        let items = store_guard
+            .list_work_items(&project.id, state_filter, limit * 2, 0)
+            .await
+            .map_err(ServiceError::Store)?;
+
+        for item in items {
+            let title_match = item.title.to_lowercase().contains(&query_lower);
+            let body_match = item.body.as_ref()
+                .map(|b| b.to_lowercase().contains(&query_lower))
+                .unwrap_or(false);
+
+            if title_match || body_match {
+                let score = if title_match { 1.0 } else { 0.7 };
+                work_items.push(WorkItemSearchHit {
+                    id: item.id,
+                    number: item.number as u32,
+                    title: item.title,
+                    state: item.state,
+                    score,
+                });
+            }
+        }
+
+        // Sort by score and limit
+        work_items.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        work_items.truncate(limit);
+    }
+
+    // Search linked entries if requested
+    if search_type == "all" || search_type == "knowledge" {
+        let linked = store_guard
+            .list_project_entries(&project.id)
+            .await
+            .map_err(ServiceError::Store)?;
+
+        // For now, simple text match on entry_id (in production, would join with entries table)
+        for link in linked {
+            let id_match = link.entry_id.to_lowercase().contains(&query_lower);
+            let notes_match = link.notes.as_ref()
+                .map(|n| n.to_lowercase().contains(&query_lower))
+                .unwrap_or(false);
+
+            if id_match || notes_match {
+                entries.push(EntrySearchHit {
+                    id: link.entry_id.clone(),
+                    title: link.notes.unwrap_or_else(|| link.entry_id.clone()),
+                    entry_type: "document".to_string(),
+                    score: link.relevance.map(|r| r as f32).unwrap_or(0.5),
+                });
+            }
+        }
+
+        entries.truncate(limit);
+    }
+
+    Ok(ProjectSearchResult { work_items, entries })
 }
 
 #[cfg(test)]

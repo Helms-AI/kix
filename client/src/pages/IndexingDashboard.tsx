@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Globe,
@@ -17,6 +17,9 @@ import {
   Radio,
   Loader2,
   ExternalLink,
+  Plus,
+  Activity,
+  History,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useSSEContext } from '../contexts/SSEContext';
@@ -26,10 +29,20 @@ import {
   formatFileSize,
   FileUpload,
   PersistedJob,
+  Job,
+  EnhancedLiveJobData,
 } from '../api/indexingClient';
 import { ActiveJobCard } from '../components/indexing/ActiveJobCard';
 import { HistoryJobCard } from '../components/indexing/HistoryJobCard';
 import { DeleteAllDataModal } from '../components/DeleteAllDataModal';
+
+// ============================================================================
+// Types
+// ============================================================================
+type MainTab = 'index' | 'active' | 'history';
+type IndexSubTab = 'url' | 'files';
+
+const STORAGE_KEY = 'kix-indexing-tab';
 
 // ============================================================================
 // URL Indexing Form
@@ -38,11 +51,11 @@ function UrlIndexingForm({ onSuccess }: { onSuccess?: () => void }) {
   const [url, setUrl] = useState('');
   const [levels, setLevels] = useState(1);
   const [respectRobots, setRespectRobots] = useState(true);
-  const [skipRender, setSkipRender] = useState(false);  // Default: render JS (skipRender=false)
-  const [timeoutSecs, setTimeoutSecs] = useState(30);   // Browser rendering timeout
+  const [skipRender, setSkipRender] = useState(false);
+  const [timeoutSecs, setTimeoutSecs] = useState(30);
   const [priority, setPriority] = useState(5);
   const [urlError, setUrlError] = useState('');
-  const [maxPages, setMaxPages] = useState(0);  // 0 = unlimited (discovery mode)
+  const [maxPages, setMaxPages] = useState(0);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const queryClient = useQueryClient();
@@ -150,7 +163,7 @@ function UrlIndexingForm({ onSuccess }: { onSuccess?: () => void }) {
       {showAdvanced && (
         <div className="space-y-4 p-4 bg-slate-800/30 rounded-lg border border-slate-700/50">
           {/* Options Grid */}
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <label className="flex items-center gap-3 p-3 bg-slate-800/50 rounded-lg border border-slate-700/50 cursor-pointer hover:border-slate-600 transition-colors">
               <input
                 type="checkbox"
@@ -495,17 +508,212 @@ function FileUploadForm({ onSuccess }: { onSuccess?: () => void }) {
   );
 }
 
+// ============================================================================
+// Index Tab Content
+// ============================================================================
+function IndexTabContent() {
+  const [subTab, setSubTab] = useState<IndexSubTab>('url');
+
+  return (
+    <div className="h-full flex flex-col">
+      <div className="max-w-2xl mx-auto w-full px-4 sm:px-6 py-8">
+        {/* Sub-tab Switcher (URL / Files) */}
+        <div className="flex bg-slate-800/50 rounded-lg p-1 mb-8">
+          <button
+            onClick={() => setSubTab('url')}
+            className={clsx(
+              'flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-md text-sm font-medium transition-all',
+              subTab === 'url'
+                ? 'bg-gradient-to-r from-cyan-600 to-teal-600 text-white shadow-lg'
+                : 'text-slate-400 hover:text-white'
+            )}
+          >
+            <Globe className="w-4 h-4" />
+            URL
+          </button>
+          <button
+            onClick={() => setSubTab('files')}
+            className={clsx(
+              'flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-md text-sm font-medium transition-all',
+              subTab === 'files'
+                ? 'bg-gradient-to-r from-violet-600 to-purple-600 text-white shadow-lg'
+                : 'text-slate-400 hover:text-white'
+            )}
+          >
+            <Upload className="w-4 h-4" />
+            Files
+          </button>
+        </div>
+
+        {/* Form Content */}
+        <div className="card p-6">
+          {subTab === 'url' ? <UrlIndexingForm /> : <FileUploadForm />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Active Jobs Tab Content
+// ============================================================================
+function ActiveJobsTabContent({
+  jobs,
+  liveJobData,
+  expandedJobId,
+  onToggleExpand,
+  onCancel,
+  onClearLog,
+}: {
+  jobs: Job[];
+  liveJobData: Record<string, EnhancedLiveJobData>;
+  expandedJobId: string | null;
+  onToggleExpand: (id: string) => void;
+  onCancel: (id: string) => void;
+  onClearLog: (id: string) => void;
+}) {
+  const activeJobs = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
+
+  return (
+    <div className="h-full flex flex-col overflow-hidden">
+      {/* Header */}
+      <div className="flex-shrink-0 px-4 sm:px-6 py-4 border-b border-slate-800/50">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+            <Radio className="w-5 h-5 text-cyan-400" />
+            Active Jobs
+          </h2>
+          <span className="text-sm text-slate-500 font-mono tabular-nums">
+            {activeJobs.length} running
+          </span>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-4">
+        {activeJobs.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full min-h-[300px] text-slate-500">
+            <div className="w-20 h-20 mb-6 rounded-2xl bg-slate-800/80 flex items-center justify-center">
+              <Clock className="w-10 h-10 text-slate-600" />
+            </div>
+            <p className="font-medium text-lg">No active jobs</p>
+            <p className="text-sm mt-2 text-slate-600">Start a new indexing job to see progress here</p>
+          </div>
+        ) : (
+          <div className="space-y-3 max-w-4xl mx-auto">
+            {activeJobs.map((job) => (
+              <ActiveJobCard
+                key={job.id}
+                job={job}
+                liveData={liveJobData[job.id]}
+                isExpanded={expandedJobId === job.id}
+                onToggleExpand={() => onToggleExpand(job.id)}
+                onCancel={(id) => onCancel(id)}
+                onClearLog={onClearLog}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// History Tab Content
+// ============================================================================
+function HistoryTabContent({
+  persistedJobs,
+  isLoading,
+  total,
+  expandedJobId,
+  onToggleExpand,
+}: {
+  persistedJobs: PersistedJob[];
+  isLoading: boolean;
+  total: number;
+  expandedJobId: string | null;
+  onToggleExpand: (id: string) => void;
+}) {
+  return (
+    <div className="h-full flex flex-col overflow-hidden">
+      {/* Header */}
+      <div className="flex-shrink-0 px-4 sm:px-6 py-4 border-b border-slate-800/50">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+            <History className="w-5 h-5 text-slate-400" />
+            Job History
+          </h2>
+          <span className="text-sm text-slate-500 font-mono tabular-nums">
+            {total} jobs
+          </span>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-4">
+        {isLoading ? (
+          <div className="flex items-center justify-center h-full min-h-[300px]">
+            <Loader2 className="w-10 h-10 text-cyan-400 animate-spin" />
+          </div>
+        ) : persistedJobs.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full min-h-[300px] text-slate-500">
+            <div className="w-20 h-20 mb-6 rounded-2xl bg-slate-800/80 flex items-center justify-center">
+              <CheckCircle className="w-10 h-10 text-slate-600" />
+            </div>
+            <p className="font-medium text-lg">No completed jobs yet</p>
+            <p className="text-sm mt-2 text-slate-600">Completed jobs will appear here</p>
+          </div>
+        ) : (
+          <div className="space-y-3 max-w-4xl mx-auto">
+            {persistedJobs.map((job) => (
+              <HistoryJobCard
+                key={job.job_id}
+                job={job}
+                isExpanded={expandedJobId === job.job_id}
+                onToggleExpand={() => onToggleExpand(job.job_id)}
+              />
+            ))}
+
+            {persistedJobs.length > 10 && (
+              <div className="pt-4 text-center border-t border-slate-800 mt-4">
+                <button className="text-sm text-cyan-400 hover:text-cyan-300 font-medium flex items-center gap-2 mx-auto">
+                  View all {total} jobs
+                  <ExternalLink className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // ============================================================================
 // Main Dashboard Component
 // ============================================================================
 export default function IndexingDashboard() {
-  const [activeTab, setActiveTab] = useState<'url' | 'files'>('url');
+  // Load initial tab from localStorage
+  const [activeTab, setActiveTab] = useState<MainTab>(() => {
+    if (typeof window === 'undefined') return 'index';
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored === 'index' || stored === 'active' || stored === 'history') {
+      return stored;
+    }
+    return 'index';
+  });
+
   const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
   const [expandedHistoryJobId, setExpandedHistoryJobId] = useState<string | null>(null);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
 
   const queryClient = useQueryClient();
+
+  // Persist tab selection
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, activeTab);
+  }, [activeTab]);
 
   // Use global SSE context for real-time updates
   const { isConnected, reconnect, jobs: liveJobData, clearJobLog } = useSSEContext();
@@ -518,11 +726,11 @@ export default function IndexingDashboard() {
     retry: 2,
   });
 
-  // Fetch persisted job history from LanceDB
+  // Fetch persisted job history
   const { data: historyData, isLoading: isHistoryLoading } = useQuery({
     queryKey: ['job-history'],
     queryFn: () => indexingApi.getJobHistory({ limit: 50 }),
-    refetchInterval: 30000, // Refresh every 30 seconds
+    refetchInterval: 30000,
     retry: 2,
   });
 
@@ -534,12 +742,11 @@ export default function IndexingDashboard() {
     },
   });
 
-  // Toggle expansion (accordion behavior - only one expanded at a time)
+  // Toggle expansion (accordion behavior)
   const handleToggleExpand = useCallback((jobId: string) => {
     setExpandedJobId((prev) => (prev === jobId ? null : jobId));
   }, []);
 
-  // Toggle history job expansion (accordion behavior - only one expanded at a time)
   const handleToggleHistoryExpand = useCallback((jobId: string) => {
     setExpandedHistoryJobId((prev) => (prev === jobId ? null : jobId));
   }, []);
@@ -555,15 +762,25 @@ export default function IndexingDashboard() {
 
   const jobs = jobsData?.jobs || [];
   const activeJobs = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
-
-  // Use persisted job history from LanceDB
   const persistedJobs: PersistedJob[] = historyData?.jobs || [];
 
+  // Tab configuration
+  const tabs: Array<{
+    id: MainTab;
+    label: string;
+    icon: React.ElementType;
+    badge?: number;
+  }> = [
+    { id: 'index', label: 'Index', icon: Plus },
+    { id: 'active', label: 'Active', icon: Activity, badge: activeJobs.length > 0 ? activeJobs.length : undefined },
+    { id: 'history', label: 'History', icon: History },
+  ];
+
   return (
-    <div className="space-y-8">
+    <div className="h-full flex flex-col">
       {/* Backend Connection Error Banner */}
       {isError && (
-        <div className="bg-red-900/30 border border-red-700/50 rounded-xl p-4">
+        <div className="flex-shrink-0 mx-4 mt-4 bg-red-900/30 border border-red-700/50 rounded-xl p-4">
           <div className="flex items-center gap-3">
             <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
             <div>
@@ -580,173 +797,117 @@ export default function IndexingDashboard() {
       )}
 
       {/* Header */}
-      <div className="flex items-start justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-white flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-gradient-to-br from-cyan-500 to-teal-500">
-              <Zap className="w-6 h-6 text-white" />
-            </div>
-            Indexing Dashboard
-          </h1>
-          <p className="text-slate-400 mt-2">Index URLs and files into the knowledge system</p>
-        </div>
-        <div className="flex items-center gap-3">
-          <div className={clsx(
-            'flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-mono',
-            isConnected
-              ? 'bg-emerald-900/30 text-emerald-400 border border-emerald-700/50'
-              : 'bg-red-900/30 text-red-400 border border-red-700/50'
-          )}>
-            <div className={clsx(
-              'w-2 h-2 rounded-full',
-              isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'
-            )} />
-            {isConnected ? 'Live' : 'Disconnected'}
+      <div className="flex-shrink-0 px-4 sm:px-6 py-6">
+        <div className="flex items-start justify-between">
+          <div>
+            <h1 className="text-2xl sm:text-3xl font-bold text-white flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-gradient-to-br from-cyan-500 to-teal-500">
+                <Zap className="w-5 h-5 sm:w-6 sm:h-6 text-white" />
+              </div>
+              Indexing Dashboard
+            </h1>
+            <p className="text-slate-400 mt-2 text-sm sm:text-base">Index URLs and files into the knowledge system</p>
           </div>
-          {!isConnected && (
+          <div className="flex items-center gap-2 sm:gap-3">
+            <div className={clsx(
+              'flex items-center gap-2 px-2.5 sm:px-3 py-1.5 rounded-full text-xs sm:text-sm font-mono',
+              isConnected
+                ? 'bg-emerald-900/30 text-emerald-400 border border-emerald-700/50'
+                : 'bg-red-900/30 text-red-400 border border-red-700/50'
+            )}>
+              <div className={clsx(
+                'w-2 h-2 rounded-full',
+                isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'
+              )} />
+              <span className="hidden sm:inline">{isConnected ? 'Live' : 'Disconnected'}</span>
+            </div>
+            {!isConnected && (
+              <button
+                onClick={reconnect}
+                className="p-2 text-slate-400 hover:text-cyan-400 hover:bg-slate-800 rounded-lg transition-colors"
+                title="Reconnect"
+              >
+                <RefreshCw className="w-4 h-4 sm:w-5 sm:h-5" />
+              </button>
+            )}
             <button
-              onClick={reconnect}
-              className="p-2 text-slate-400 hover:text-cyan-400 hover:bg-slate-800 rounded-lg transition-colors"
-              title="Reconnect"
+              onClick={() => setShowDeleteModal(true)}
+              className="flex items-center gap-2 px-2.5 sm:px-3 py-1.5 text-xs sm:text-sm text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg border border-red-500/20 hover:border-red-500/40 transition-all"
+              title="Delete all indexed data"
             >
-              <RefreshCw className="w-5 h-5" />
+              <Trash2 className="w-4 h-4" />
+              <span className="hidden sm:inline">Clear Index</span>
             </button>
-          )}
-          <button
-            onClick={() => setShowDeleteModal(true)}
-            className="flex items-center gap-2 px-3 py-1.5 text-sm text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg border border-red-500/20 hover:border-red-500/40 transition-all"
-            title="Delete all indexed data"
-          >
-            <Trash2 className="w-4 h-4" />
-            <span className="hidden sm:inline">Clear Index</span>
-          </button>
+          </div>
         </div>
       </div>
 
-      {/* Main Grid */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-        {/* Left Column - Input Forms */}
-        <div className="xl:col-span-1">
-          <div className="card p-6 sticky top-8">
-            {/* Tab Switcher */}
-            <div className="flex bg-slate-800/50 rounded-lg p-1 mb-6">
+      {/* Tab Navigation */}
+      <div className="flex-shrink-0 px-4 sm:px-6">
+        <nav className="flex flex-col sm:flex-row border-b border-slate-700/50">
+          {tabs.map((tab) => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.id;
+
+            return (
               <button
-                onClick={() => setActiveTab('url')}
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
                 className={clsx(
-                  'flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-md text-sm font-medium transition-all',
-                  activeTab === 'url'
-                    ? 'bg-gradient-to-r from-cyan-600 to-teal-600 text-white shadow-lg'
-                    : 'text-slate-400 hover:text-white'
+                  'group relative flex items-center justify-center sm:justify-start gap-2 px-5 py-3.5 text-sm font-medium transition-all duration-200',
+                  'border-b-2 sm:border-b-2 -mb-px',
+                  isActive
+                    ? 'text-cyan-400 border-cyan-400'
+                    : 'text-slate-400 border-transparent hover:text-white hover:border-slate-600'
                 )}
               >
-                <Globe className="w-4 h-4" />
-                URL
-              </button>
-              <button
-                onClick={() => setActiveTab('files')}
-                className={clsx(
-                  'flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-md text-sm font-medium transition-all',
-                  activeTab === 'files'
-                    ? 'bg-gradient-to-r from-violet-600 to-purple-600 text-white shadow-lg'
-                    : 'text-slate-400 hover:text-white'
+                <Icon className={clsx(
+                  'w-4 h-4 transition-colors',
+                  isActive ? 'text-cyan-400' : 'text-slate-500 group-hover:text-slate-300'
+                )} />
+                <span>{tab.label}</span>
+                {tab.badge !== undefined && (
+                  <span className={clsx(
+                    'ml-1.5 px-1.5 py-0.5 text-xs font-mono rounded-full',
+                    isActive
+                      ? 'bg-cyan-400/20 text-cyan-300'
+                      : 'bg-slate-700 text-slate-400'
+                  )}>
+                    {tab.badge}
+                  </span>
                 )}
-              >
-                <Upload className="w-4 h-4" />
-                Files
+                {/* Active indicator glow */}
+                {isActive && (
+                  <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.6)]" />
+                )}
               </button>
-            </div>
+            );
+          })}
+        </nav>
+      </div>
 
-            {/* Forms */}
-            {activeTab === 'url' ? <UrlIndexingForm /> : <FileUploadForm />}
-          </div>
-        </div>
-
-        {/* Right Column - Jobs */}
-        <div className="xl:col-span-2 space-y-6">
-          {/* Active Jobs */}
-          <div className="card p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-semibold text-white flex items-center gap-2">
-                <Radio className="w-5 h-5 text-cyan-400" />
-                Active Jobs
-              </h2>
-              <span className="text-sm text-slate-500 font-mono">
-                {activeJobs.length} running
-              </span>
-            </div>
-
-            {activeJobs.length === 0 ? (
-              <div className="text-center py-12 text-slate-500">
-                <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-slate-800 flex items-center justify-center">
-                  <Clock className="w-8 h-8 text-slate-600" />
-                </div>
-                <p className="font-medium">No active jobs</p>
-                <p className="text-sm mt-1">Start a new indexing job to see progress here</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {activeJobs.map((job) => (
-                  <ActiveJobCard
-                    key={job.id}
-                    job={job}
-                    liveData={liveJobData[job.id]}
-                    isExpanded={expandedJobId === job.id}
-                    onToggleExpand={() => handleToggleExpand(job.id)}
-                    onCancel={(id) => cancelMutation.mutate(id)}
-                    onClearLog={clearJobLog}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Job History */}
-          <div className="card p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-semibold text-white flex items-center gap-2">
-                <Clock className="w-5 h-5 text-slate-400" />
-                Job History
-              </h2>
-              <span className="text-sm text-slate-500 font-mono">
-                {historyData?.total ?? persistedJobs.length} jobs
-              </span>
-            </div>
-
-            {isHistoryLoading ? (
-              <div className="flex items-center justify-center py-12">
-                <Loader2 className="w-8 h-8 text-cyan-400 animate-spin" />
-              </div>
-            ) : persistedJobs.length === 0 ? (
-              <div className="text-center py-12 text-slate-500">
-                <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-slate-800 flex items-center justify-center">
-                  <CheckCircle className="w-8 h-8 text-slate-600" />
-                </div>
-                <p className="font-medium">No completed jobs yet</p>
-                <p className="text-sm mt-1">Completed jobs will appear here</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {persistedJobs.slice(0, 10).map((job) => (
-                  <HistoryJobCard
-                    key={job.job_id}
-                    job={job}
-                    isExpanded={expandedHistoryJobId === job.job_id}
-                    onToggleExpand={() => handleToggleHistoryExpand(job.job_id)}
-                  />
-                ))}
-              </div>
-            )}
-
-            {persistedJobs.length > 10 && (
-              <div className="pt-4 text-center border-t border-slate-800 mt-4">
-                <button className="text-sm text-cyan-400 hover:text-cyan-300 font-medium flex items-center gap-2 mx-auto">
-                  View all {historyData?.total ?? persistedJobs.length} jobs
-                  <ExternalLink className="w-4 h-4" />
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
+      {/* Tab Content */}
+      <div className="flex-1 min-h-0 overflow-hidden">
+        {activeTab === 'index' && <IndexTabContent />}
+        {activeTab === 'active' && (
+          <ActiveJobsTabContent
+            jobs={jobs}
+            liveJobData={liveJobData}
+            expandedJobId={expandedJobId}
+            onToggleExpand={handleToggleExpand}
+            onCancel={(id) => cancelMutation.mutate(id)}
+            onClearLog={clearJobLog}
+          />
+        )}
+        {activeTab === 'history' && (
+          <HistoryTabContent
+            persistedJobs={persistedJobs}
+            isLoading={isHistoryLoading}
+            total={historyData?.total ?? persistedJobs.length}
+            expandedJobId={expandedHistoryJobId}
+            onToggleExpand={handleToggleHistoryExpand}
+          />
+        )}
       </div>
 
       {/* Delete All Data Modal */}

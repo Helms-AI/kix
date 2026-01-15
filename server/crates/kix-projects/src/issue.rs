@@ -1,12 +1,56 @@
-//! Issue data model and storage operations.
+//! Work item data model and parameters.
+//!
+//! Note: This file is named issue.rs for backward compatibility,
+//! but represents work items (epic, story, task, subtask, bug).
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::project::IssueState;
+use crate::project::{BoardColumn, IssueType};
 
-/// A project issue (local or synced from GitHub).
+/// Issue state (open or closed).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueState {
+    #[default]
+    Open,
+    Closed,
+}
+
+impl IssueState {
+    /// Convert from string representation.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "open" => Some(IssueState::Open),
+            "closed" => Some(IssueState::Closed),
+            _ => None,
+        }
+    }
+
+    /// Convert to string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IssueState::Open => "open",
+            IssueState::Closed => "closed",
+        }
+    }
+}
+
+impl std::fmt::Display for IssueState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A work item in a project.
+///
+/// Work items support a hierarchy:
+/// - Epic → Story, Bug, Task
+/// - Story → Task, Subtask
+/// - Task → Subtask
+/// - Bug → Subtask
+/// - Subtask → (none)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Issue {
     /// Unique identifier (UUID)
@@ -15,17 +59,17 @@ pub struct Issue {
     /// Parent project ID
     pub project_id: String,
 
-    /// Issue number within project (auto-incremented)
+    /// Work item number within project (auto-incremented)
     pub number: u32,
 
-    /// Issue title
+    /// Work item title
     pub title: String,
 
-    /// Issue body (markdown)
+    /// Work item body (markdown)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 
-    /// Issue state
+    /// Work item state (open or closed)
     pub state: IssueState,
 
     /// Labels
@@ -40,25 +84,6 @@ pub struct Issue {
     #[serde(default)]
     pub assignees: Vec<String>,
 
-    /// GitHub issue number (if synced)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_number: Option<u32>,
-
-    /// GitHub issue node ID (for GraphQL operations)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_node_id: Option<String>,
-
-    /// GitHub issue URL (if synced)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_url: Option<String>,
-
-    /// GitHub Project item ID (if added to a project board)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_project_item_id: Option<String>,
-
-    /// Source of the issue
-    pub source: IssueSource,
-
     /// Created timestamp
     pub created_at: DateTime<Utc>,
 
@@ -69,33 +94,37 @@ pub struct Issue {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<DateTime<Utc>>,
 
-    /// Sync timestamp (last synced with GitHub)
+    // =========================================================================
+    // Board/Hierarchy fields
+    // =========================================================================
+
+    /// Work item type (epic, story, task, subtask, bug)
+    #[serde(default)]
+    pub issue_type: IssueType,
+
+    /// Parent work item ID (for hierarchy)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub synced_at: Option<DateTime<Utc>>,
+    pub parent_id: Option<String>,
 
-    /// Content hash for change detection
+    /// Position within board column (for drag-drop ordering)
+    #[serde(default)]
+    pub position: i64,
+
+    /// Board column (backlog, todo, in_progress, in_review, testing, done)
+    #[serde(default)]
+    pub board_column: BoardColumn,
+
+    /// Story points for estimation
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
+    pub story_points: Option<u32>,
 
-    /// Local version number (incremented on each change)
-    #[serde(default = "default_version")]
-    pub local_version: i64,
-}
-
-/// Issue source.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum IssueSource {
-    /// Created locally in Kix
-    Local,
-    /// Synced from GitHub
-    GitHub,
-    /// Created via MCP tool
-    Mcp,
+    /// Epic color (hex without #, e.g., "4f46e5")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epic_color: Option<String>,
 }
 
 impl Issue {
-    /// Create a new local issue.
+    /// Create a new work item.
     pub fn new(project_id: String, number: u32, title: String) -> Self {
         let now = Utc::now();
 
@@ -109,126 +138,111 @@ impl Issue {
             labels: Vec::new(),
             priority: None,
             assignees: Vec::new(),
-            github_number: None,
-            github_node_id: None,
-            github_url: None,
-            github_project_item_id: None,
-            source: IssueSource::Local,
             created_at: now,
             updated_at: now,
             closed_at: None,
-            synced_at: None,
-            content_hash: None,
-            local_version: 1,
+            issue_type: IssueType::Task,
+            parent_id: None,
+            position: 0,
+            board_column: BoardColumn::Backlog,
+            story_points: None,
+            epic_color: None,
         }
     }
 
-    /// Create an issue from GitHub sync.
-    pub fn from_github(
-        project_id: String,
-        number: u32,
-        github_issue: GitHubIssueData,
-    ) -> Self {
-        let now = Utc::now();
-
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            project_id,
-            number,
-            title: github_issue.title,
-            body: github_issue.body,
-            state: github_issue.state,
-            labels: github_issue.labels,
-            priority: None, // Local field, not from GitHub
-            assignees: github_issue.assignees,
-            github_number: Some(github_issue.number),
-            github_node_id: Some(github_issue.node_id),
-            github_url: Some(github_issue.url),
-            github_project_item_id: None,
-            source: IssueSource::GitHub,
-            created_at: github_issue.created_at,
-            updated_at: now,
-            closed_at: github_issue.closed_at,
-            synced_at: Some(now),
-            content_hash: None, // Will be calculated after creation
-            local_version: 1,
-        }
+    /// Create a new epic.
+    pub fn new_epic(project_id: String, number: u32, title: String, color: Option<String>) -> Self {
+        let mut issue = Self::new(project_id, number, title);
+        issue.issue_type = IssueType::Epic;
+        issue.epic_color = color;
+        issue
     }
 
-    /// Check if this issue is synced from GitHub.
-    pub fn is_github_synced(&self) -> bool {
-        self.github_number.is_some()
+    /// Check if this is an epic.
+    pub fn is_epic(&self) -> bool {
+        self.issue_type == IssueType::Epic
     }
 
-    /// Close the issue.
+    /// Check if this work item can contain a child of the given type.
+    pub fn can_contain(&self, child_type: IssueType) -> bool {
+        self.issue_type.can_contain(child_type)
+    }
+
+    /// Close the work item.
     pub fn close(&mut self) {
         self.state = IssueState::Closed;
         self.closed_at = Some(Utc::now());
         self.updated_at = Utc::now();
-        self.increment_version();
     }
 
-    /// Reopen the issue.
+    /// Reopen the work item.
     pub fn reopen(&mut self) {
         self.state = IssueState::Open;
         self.closed_at = None;
         self.updated_at = Utc::now();
-        self.increment_version();
     }
 
-    /// Increment the local version number.
-    pub fn increment_version(&mut self) {
-        self.local_version += 1;
-    }
-
-    /// Update the content hash.
-    pub fn update_content_hash(&mut self) {
-        use crate::sync_state::ContentHasher;
-        self.content_hash = Some(ContentHasher::calculate_hash(self));
-    }
-
-    /// Mark as modified and update tracking fields.
-    pub fn mark_modified(&mut self) {
+    /// Move to a different board column.
+    pub fn move_to_column(&mut self, column: BoardColumn, position: i64) {
+        self.board_column = column;
+        self.position = position;
         self.updated_at = Utc::now();
-        self.increment_version();
-        self.update_content_hash();
     }
 
-    /// Update from sync operation.
-    pub fn update_from_sync(&mut self, github_updated_at: Option<DateTime<Utc>>) {
-        self.synced_at = Some(Utc::now());
-        if let Some(updated) = github_updated_at {
-            // Don't increment local version for sync updates
-            self.updated_at = updated;
-        }
-        self.update_content_hash();
+    /// Set parent work item.
+    pub fn set_parent(&mut self, parent_id: Option<String>) {
+        self.parent_id = parent_id;
+        self.updated_at = Utc::now();
+    }
+
+    /// Set with body (builder pattern).
+    pub fn with_body(mut self, body: impl Into<String>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
+    /// Set with issue type (builder pattern).
+    pub fn with_type(mut self, issue_type: IssueType) -> Self {
+        self.issue_type = issue_type;
+        self
+    }
+
+    /// Set with labels (builder pattern).
+    pub fn with_labels(mut self, labels: Vec<String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// Set with parent (builder pattern).
+    pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
+        self.parent_id = Some(parent_id.into());
+        self
+    }
+
+    /// Set with story points (builder pattern).
+    pub fn with_story_points(mut self, points: u32) -> Self {
+        self.story_points = Some(points);
+        self
     }
 }
 
-/// Data extracted from a GitHub issue for creating a local issue.
-#[derive(Debug, Clone)]
-pub struct GitHubIssueData {
-    pub number: u32,
-    pub node_id: String,
-    pub title: String,
-    pub body: Option<String>,
-    pub state: IssueState,
-    pub labels: Vec<String>,
-    pub assignees: Vec<String>,
-    pub url: String,
-    pub created_at: DateTime<Utc>,
-    pub closed_at: Option<DateTime<Utc>>,
-}
-
-/// Parameters for creating an issue.
+/// Parameters for creating a work item.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CreateIssueParams {
-    /// Issue title
+    /// Work item title
     pub title: String,
 
-    /// Issue body (markdown)
+    /// Work item body (markdown)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+
+    /// Work item type (default: task)
+    #[serde(default)]
+    pub issue_type: IssueType,
+
+    /// Parent work item ID (for hierarchy)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 
     /// Labels to add
     #[serde(default)]
@@ -238,24 +252,24 @@ pub struct CreateIssueParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
 
-    /// Also create on GitHub (default: true)
-    #[serde(default = "default_true")]
-    pub create_on_github: bool,
+    /// Board column (default: backlog)
+    #[serde(default)]
+    pub board_column: BoardColumn,
 
-    /// Add to GitHub Project board (default: true if project has board)
-    #[serde(default = "default_true")]
-    pub add_to_project: bool,
+    /// Story points for estimation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
+
+    /// Epic color (for epics only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epic_color: Option<String>,
+
+    /// Assignees (usernames)
+    #[serde(default)]
+    pub assignees: Vec<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_version() -> i64 {
-    1
-}
-
-/// Parameters for updating an issue.
+/// Parameters for updating a work item.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct UpdateIssueParams {
     /// New title
@@ -270,6 +284,14 @@ pub struct UpdateIssueParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<IssueState>,
 
+    /// New issue type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<IssueType>,
+
+    /// New parent ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+
     /// New labels (replaces existing)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<String>>,
@@ -278,17 +300,37 @@ pub struct UpdateIssueParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
 
-    /// Also update on GitHub (default: true for synced issues)
-    #[serde(default = "default_true")]
-    pub sync_to_github: bool,
+    /// New assignees
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignees: Option<Vec<String>>,
+
+    /// New board column
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_column: Option<BoardColumn>,
+
+    /// New story points
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub story_points: Option<u32>,
+
+    /// New epic color
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epic_color: Option<String>,
 }
 
-/// Filters for listing issues.
+/// Filters for listing work items.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct IssueFilters {
     /// Filter by state
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<IssueState>,
+
+    /// Filter by issue type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<IssueType>,
+
+    /// Filter by parent ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 
     /// Filter by labels (any match)
     #[serde(default)]
@@ -298,9 +340,13 @@ pub struct IssueFilters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
 
-    /// Filter by source
+    /// Filter by assignee
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<IssueSource>,
+    pub assignee: Option<String>,
+
+    /// Filter by board column
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_column: Option<BoardColumn>,
 
     /// Maximum results
     #[serde(default = "default_limit")]
@@ -332,8 +378,8 @@ mod tests {
         assert_eq!(issue.number, 1);
         assert_eq!(issue.title, "Test Issue");
         assert_eq!(issue.state, IssueState::Open);
-        assert_eq!(issue.source, IssueSource::Local);
-        assert!(!issue.is_github_synced());
+        assert_eq!(issue.issue_type, IssueType::Task);
+        assert_eq!(issue.board_column, BoardColumn::Backlog);
     }
 
     #[test]
@@ -357,25 +403,60 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_from_github() {
-        let github_data = GitHubIssueData {
-            number: 42,
-            node_id: "I_123".to_string(),
-            title: "GitHub Issue".to_string(),
-            body: Some("Body text".to_string()),
-            state: IssueState::Open,
-            labels: vec!["bug".to_string()],
-            assignees: vec!["user1".to_string()],
-            url: "https://github.com/owner/repo/issues/42".to_string(),
-            created_at: Utc::now(),
-            closed_at: None,
-        };
+    fn test_epic_creation() {
+        let epic = Issue::new_epic(
+            "proj_123".to_string(),
+            1,
+            "Auth Epic".to_string(),
+            Some("4f46e5".to_string()),
+        );
 
-        let issue = Issue::from_github("proj_123".to_string(), 1, github_data);
+        assert!(epic.is_epic());
+        assert_eq!(epic.issue_type, IssueType::Epic);
+        assert_eq!(epic.epic_color, Some("4f46e5".to_string()));
+    }
 
-        assert!(issue.is_github_synced());
-        assert_eq!(issue.github_number, Some(42));
-        assert_eq!(issue.source, IssueSource::GitHub);
-        assert_eq!(issue.labels, vec!["bug".to_string()]);
+    #[test]
+    fn test_issue_hierarchy() {
+        let epic = Issue::new_epic(
+            "proj_123".to_string(),
+            1,
+            "Epic".to_string(),
+            None,
+        );
+
+        // Epic can contain Story, Bug, Task
+        assert!(epic.can_contain(IssueType::Story));
+        assert!(epic.can_contain(IssueType::Bug));
+        assert!(epic.can_contain(IssueType::Task));
+        assert!(!epic.can_contain(IssueType::Subtask));
+
+        // Task can only contain Subtask
+        let task = Issue::new("proj_123".to_string(), 2, "Task".to_string());
+        assert!(task.can_contain(IssueType::Subtask));
+        assert!(!task.can_contain(IssueType::Task));
+    }
+
+    #[test]
+    fn test_move_to_column() {
+        let mut issue = Issue::new(
+            "proj_123".to_string(),
+            1,
+            "Test".to_string(),
+        );
+
+        assert_eq!(issue.board_column, BoardColumn::Backlog);
+        assert_eq!(issue.position, 0);
+
+        issue.move_to_column(BoardColumn::InProgress, 5);
+        assert_eq!(issue.board_column, BoardColumn::InProgress);
+        assert_eq!(issue.position, 5);
+    }
+
+    #[test]
+    fn test_issue_state_from_str() {
+        assert_eq!(IssueState::from_str("open"), Some(IssueState::Open));
+        assert_eq!(IssueState::from_str("CLOSED"), Some(IssueState::Closed));
+        assert_eq!(IssueState::from_str("unknown"), None);
     }
 }

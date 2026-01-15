@@ -9,14 +9,9 @@ use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info};
 
-/// Initial migration SQL
-const INITIAL_MIGRATION: &str = include_str!("migrations/001_initial.sql");
-
-/// Sync state migration SQL
-const SYNC_STATE_MIGRATION: &str = include_str!("migrations/002_sync_state.sql");
-
-/// Code extraction stats migration SQL
-const CODE_EXTRACTION_STATS_MIGRATION: &str = include_str!("migrations/003_code_extraction_stats.sql");
+/// Consolidated seed migration SQL
+/// Contains the complete schema with work_items (no GitHub integration)
+const SEED_MIGRATION: &str = include_str!("migrations/001_seed.sql");
 
 /// Create a new SQLite connection pool
 ///
@@ -55,11 +50,9 @@ pub async fn create_pool(db_path: &Path) -> Result<SqlitePool> {
 pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     debug!("Running SQLite migrations...");
 
-    // Run migrations in order
+    // Run seed migration (single consolidated schema)
     let migrations = vec![
-        ("001_initial", INITIAL_MIGRATION),
-        ("002_sync_state", SYNC_STATE_MIGRATION),
-        ("003_code_extraction_stats", CODE_EXTRACTION_STATS_MIGRATION),
+        ("001_seed", SEED_MIGRATION),
     ];
 
     for (name, migration_sql) in migrations {

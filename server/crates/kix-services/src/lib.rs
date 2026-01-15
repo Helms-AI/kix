@@ -37,17 +37,15 @@
 //!
 //! - [`error`] - Unified error types that map to HTTP and MCP errors
 //! - [`retrieval`] - Search, document retrieval, and RAG context (TODO)
-//! - [`projects`] - Project CRUD operations (TODO)
-//! - [`issues`] - Issue CRUD with GitHub sync (TODO)
-//! - [`github`] - Token management and GitHub API (TODO)
-//! - [`indexing`] - URL/file indexing and job management (TODO)
-//! - [`knowledge`] - Entry linking and project-scoped search (TODO)
+//! - [`projects`] - Project CRUD operations
+//! - [`work_items`] - Work item CRUD operations
+//! - [`indexing`] - URL/file indexing and job management
+//! - [`knowledge`] - Entry linking and project-scoped search
 
 pub mod error;
 pub mod explorer;
-pub mod github;
 pub mod indexing;
-pub mod issues;
+pub mod work_items;
 pub mod knowledge;
 pub mod projects;
 pub mod retrieval;
@@ -64,27 +62,18 @@ pub use retrieval::{
 
 // Re-export project types and functions
 pub use projects::{
-    delete_project, get_project, list_projects, update_project, DeleteProjectOptions,
-    DeleteProjectResult, ProjectDetail, ProjectFilters, ProjectList, ProjectStats,
-    ProjectSummary, ProjectUpdates,
+    create_project, delete_project, get_project, list_projects, update_project,
+    CreateProjectData, CreateProjectResult, DeleteProjectOptions, DeleteProjectResult,
+    ProjectDetail, ProjectFilters, ProjectList, ProjectStats, ProjectSummary, ProjectUpdates,
 };
 
-// Re-export issue types and functions
-pub use issues::{
-    create_issue, delete_issue, get_issue, list_issues, update_issue,
-    CreateIssueData, CreateIssueResult, DeleteIssueOptions, DeleteIssueResult,
-    IssueFilters, IssueList, IssueOptions, IssueSummary, IssueUpdates,
+// Re-export work item types and functions
+pub use work_items::{
+    create_work_item, delete_work_item, get_board, get_child_work_items, get_column_counts,
+    get_work_item, list_work_items, move_card, update_work_item,
+    BoardColumn, BoardSwimlane, BoardView, ColumnCounts, CreateWorkItemData, CreateWorkItemResult,
+    WorkItemFilters, WorkItemList, WorkItemSummary, WorkItemUpdates,
 };
-
-// Re-export GitHub types and functions
-pub use github::{
-    get_authenticated_user, get_token_for_project, get_token_status, list_organizations,
-    search_repositories, set_token, verify_repo_access, OrgItem, RepoItem, RepoListResult,
-    RepoSearchQuery, SetTokenResult, TokenScope, TokenStatus, VerifyAccessResult,
-};
-
-// Re-export external types used by GitHub services
-pub use kix_projects::github::models::AuthenticatedUser;
 
 // Re-export indexing types and functions
 pub use indexing::{
@@ -98,7 +87,7 @@ pub use indexing::{
 
 // Re-export knowledge linking types and functions
 pub use knowledge::{
-    link_entry, list_linked_entries, unlink_entry, EntrySearchHit, IssueSearchHit,
+    link_entry, list_linked_entries, search_project, unlink_entry, EntrySearchHit, WorkItemSearchHit,
     LinkedEntry, LinkedEntryFilters, LinkedEntryList, LinkResult, ProjectSearchOptions,
     ProjectSearchResult,
 };

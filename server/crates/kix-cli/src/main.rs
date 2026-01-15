@@ -29,7 +29,7 @@ use kix_crawler::ContentExtractor;
 use url::Url;
 use kix_sse::{ConnectionManager, spawn_cleanup_task};
 use kix_store::search::SearchFilters;
-use kix_store::{JobStore, KixStore, ProjectStore, TokenStore};
+use kix_store::{JobStore, KixStore, ProjectStore};
 use kix_projects::create_event_bus;
 use kix_auth::{AuthStore, AuthState, handlers as auth_handlers};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -546,24 +546,9 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
         .context("Failed to initialize project tables")?;
     let shared_project_store = Arc::new(RwLock::new(project_store));
 
-    // Create token store for GitHub token persistence (uses shared SQLite database)
-    let token_db_path = format!("{}/sqlite/kix.db", db_path);
-    let mut token_store = TokenStore::new(&token_db_path)
-        .await
-        .context("Failed to create token store")?;
-    token_store
-        .init_tables()
-        .await
-        .context("Failed to initialize token tables")?;
-    let shared_token_store = Arc::new(RwLock::new(token_store));
-    info!("Token store initialized at {}", token_db_path);
-
     let event_bus = create_event_bus();
-    let project_state = ProjectState::new(shared_project_store.clone(), event_bus.clone(), shared_token_store.clone());
+    let project_state = ProjectState::new(shared_project_store.clone(), event_bus.clone());
     info!("Project store initialized at {}", project_db_path);
-
-    // Get token service for MCP server (before project_state is moved)
-    let shared_token_service = project_state.token_service().clone();
 
     // Create explorer state for data explorer
     let explorer_state = ExplorerState::new(PathBuf::from(db_path));
@@ -579,9 +564,8 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
     // Create MCP server using the SAME shared store, embedder, and project store
     let mcp_server = KixMcpServer::with_shared(shared_store.clone(), shared_embedder, job_queue)
         .with_project_store(shared_project_store)
-        .with_event_bus(event_bus)
-        .with_token_service(shared_token_service);
-    info!("MCP server initialized with project management and GitHub token support enabled");
+        .with_event_bus(event_bus);
+    info!("MCP server initialized with project management enabled");
 
     // Create the MCP streamable HTTP service
     let mcp_service = StreamableHttpService::new(
