@@ -213,3 +213,66 @@ export const WORK_ITEM_TYPES: { type: WorkItemType; label: string; color: string
   { type: 'subtask', label: 'Subtask', color: 'gray' },
   { type: 'bug', label: 'Bug', color: 'red' },
 ];
+
+// ============================================================================
+// Epic-Based Board API Types
+// ============================================================================
+
+/**
+ * Statistics for an Epic swimlane.
+ * Aggregated from all descendants within the Epic.
+ */
+export interface EpicStats {
+  total_items: number;
+  total_story_points: number;
+  items_by_column: Record<BoardColumn, number>;
+}
+
+/**
+ * Data for an Epic swimlane containing all its descendants.
+ * The Epic itself acts as a container/swimlane, with its children
+ * (Stories, Tasks, Bugs, Subtasks) appearing as cards within columns.
+ */
+export interface EpicSwimlaneData {
+  /** The Epic work item (container for the swimlane) */
+  epic: WorkItem;
+  /** Descendant items organized by board column */
+  items_by_column: Record<BoardColumn, WorkItem[]>;
+  /** Aggregated statistics for the Epic */
+  stats: EpicStats;
+}
+
+/**
+ * Epic-based board response.
+ * Each Epic becomes a swimlane containing its descendant items.
+ * Items without an Epic ancestor appear in the "unassigned" swimlane.
+ */
+export interface EpicBoardResponse {
+  /** Column definitions */
+  columns: BoardColumnInfo[];
+  /** Epic swimlanes (each Epic is a swimlane) */
+  epics: EpicSwimlaneData[];
+  /** Orphan items not assigned to any Epic, organized by column */
+  unassigned: Record<BoardColumn, WorkItem[]>;
+  /** Total count per column (across all swimlanes) */
+  column_counts: Record<BoardColumn, number>;
+  /** Total number of items on the board */
+  total_items: number;
+}
+
+/**
+ * Request to reorder an Epic swimlane.
+ */
+export interface ReorderEpicRequest {
+  epic_id: string;
+  to_position: number;
+}
+
+/**
+ * Response from reordering an Epic swimlane.
+ */
+export interface ReorderEpicResponse {
+  success: boolean;
+  epic_id: string;
+  to_position: number;
+}

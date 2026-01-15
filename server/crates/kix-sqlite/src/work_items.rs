@@ -532,6 +532,164 @@ pub async fn next_position_in_column(
     Ok(max.0.unwrap_or(-1) + 1)
 }
 
+// =========================================================================
+// Epic-based board operations
+// =========================================================================
+
+/// List all Epics for a project, ordered by position.
+/// Used for Epic-based swimlane board view.
+pub async fn list_epics_for_project(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> Result<Vec<WorkItemRecord>> {
+    let items = sqlx::query_as::<_, WorkItemRecord>(
+        r#"
+        SELECT * FROM work_items
+        WHERE project_id = ? AND item_type = 'epic'
+        ORDER BY position ASC
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(items)
+}
+
+/// Compute the root Epic ID for all descendants in a project.
+/// Walks the parent_id chain up to find the Epic ancestor.
+/// Returns a HashMap mapping item_id -> root_epic_id.
+/// Items with no Epic ancestor are not included in the result.
+pub async fn compute_epic_assignments(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    // Load all work items for the project
+    let items = sqlx::query_as::<_, WorkItemRecord>(
+        "SELECT * FROM work_items WHERE project_id = ?",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    // Build a lookup map: id -> item
+    let item_map: std::collections::HashMap<String, &WorkItemRecord> =
+        items.iter().map(|item| (item.id.clone(), item)).collect();
+
+    // Build a parent lookup map: id -> parent_id
+    let parent_map: std::collections::HashMap<String, Option<String>> = items
+        .iter()
+        .map(|item| (item.id.clone(), item.parent_id.clone()))
+        .collect();
+
+    // Compute root epic for each item
+    let mut epic_assignments: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for item in &items {
+        // Skip Epics themselves - they don't need assignment
+        if item.item_type == "epic" {
+            continue;
+        }
+
+        // Walk up the parent chain to find the root Epic
+        let mut current_id = item.id.clone();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        loop {
+            // Prevent infinite loops
+            if visited.contains(&current_id) {
+                break;
+            }
+            visited.insert(current_id.clone());
+
+            // Get the current item
+            let current = match item_map.get(&current_id) {
+                Some(i) => *i,
+                None => break,
+            };
+
+            // If this is an Epic, we found the root
+            if current.item_type == "epic" {
+                epic_assignments.insert(item.id.clone(), current.id.clone());
+                break;
+            }
+
+            // Move to parent
+            match parent_map.get(&current_id) {
+                Some(Some(parent_id)) => current_id = parent_id.clone(),
+                _ => break, // No parent, item is unassigned
+            }
+        }
+    }
+
+    Ok(epic_assignments)
+}
+
+/// Update Epic swimlane position (for reordering).
+pub async fn update_epic_position(
+    pool: &SqlitePool,
+    epic_id: &str,
+    new_position: i64,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE work_items SET
+            position = ?,
+            updated_at = ?
+        WHERE id = ? AND item_type = 'epic'
+        "#,
+    )
+    .bind(new_position)
+    .bind(Utc::now().to_rfc3339())
+    .bind(epic_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Shift Epic positions when reordering swimlanes.
+pub async fn shift_epic_positions(
+    pool: &SqlitePool,
+    project_id: &str,
+    from_position: i64,
+    to_position: i64,
+) -> Result<()> {
+    if from_position < to_position {
+        // Moving down: shift items between (from, to] up by 1
+        sqlx::query(
+            r#"
+            UPDATE work_items SET
+                position = position - 1
+            WHERE project_id = ? AND item_type = 'epic'
+                AND position > ? AND position <= ?
+            "#,
+        )
+        .bind(project_id)
+        .bind(from_position)
+        .bind(to_position)
+        .execute(pool)
+        .await?;
+    } else {
+        // Moving up: shift items between [to, from) down by 1
+        sqlx::query(
+            r#"
+            UPDATE work_items SET
+                position = position + 1
+            WHERE project_id = ? AND item_type = 'epic'
+                AND position >= ? AND position < ?
+            "#,
+        )
+        .bind(project_id)
+        .bind(to_position)
+        .bind(from_position)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

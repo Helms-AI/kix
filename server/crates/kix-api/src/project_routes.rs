@@ -85,7 +85,9 @@ pub fn create_project_router(state: ProjectState) -> Router {
         .route("/api/projects/:id/search", get(search_project))
         // Board endpoints
         .route("/api/projects/:id/board", get(get_board))
+        .route("/api/projects/:id/board/epics", get(get_epic_board))
         .route("/api/projects/:id/board/move", post(move_card))
+        .route("/api/projects/:id/board/reorder-epic", post(reorder_epic))
         .route("/api/projects/:id/board/columns", get(get_column_counts))
         .route("/api/projects/:id/work-items/:item_id/children", get(get_child_work_items))
         .with_state(state)
@@ -334,6 +336,32 @@ impl From<&WorkItemRecord> for WorkItemResponse {
             board_column: item.board_column.clone(),
             story_points: item.story_points,
             epic_color: item.epic_color.clone(),
+        }
+    }
+}
+
+impl WorkItemResponse {
+    /// Create from a WorkItemSummary (from kix_services).
+    fn from_summary(summary: &kix_services::work_items::WorkItemSummary) -> Self {
+        WorkItemResponse {
+            id: summary.id.clone(),
+            project_id: summary.project_id.clone(),
+            number: summary.number,
+            title: summary.title.clone(),
+            body: summary.body.clone(),
+            state: summary.state.clone(),
+            labels: summary.labels.clone(),
+            assignees: summary.assignees.clone(),
+            priority: summary.priority.clone(),
+            created_at: summary.created_at.clone(),
+            updated_at: summary.updated_at.clone(),
+            // Board fields
+            item_type: summary.item_type.clone(),
+            parent_id: summary.parent_id.clone(),
+            position: summary.position,
+            board_column: summary.board_column.clone(),
+            story_points: summary.story_points,
+            epic_color: summary.epic_color.clone(),
         }
     }
 }
@@ -1093,6 +1121,159 @@ async fn get_column_counts(
         Err(e) => {
             warn!("Failed to get project: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+// =============================================================================
+// EPIC-BASED BOARD ENDPOINTS
+// =============================================================================
+
+/// Response type for Epic-based board statistics.
+#[derive(Debug, Serialize)]
+struct EpicStatsResponse {
+    total_items: usize,
+    total_story_points: i64,
+    items_by_column: std::collections::HashMap<String, usize>,
+}
+
+/// Response type for an Epic swimlane.
+#[derive(Debug, Serialize)]
+struct EpicSwimlaneResponse {
+    epic: WorkItemResponse,
+    items_by_column: std::collections::HashMap<String, Vec<WorkItemResponse>>,
+    stats: EpicStatsResponse,
+}
+
+/// Response type for Epic-based board view.
+#[derive(Debug, Serialize)]
+struct EpicBoardResponse {
+    columns: Vec<BoardColumnInfo>,
+    epics: Vec<EpicSwimlaneResponse>,
+    unassigned: std::collections::HashMap<String, Vec<WorkItemResponse>>,
+    column_counts: std::collections::HashMap<String, usize>,
+    total_items: usize,
+}
+
+/// GET /api/projects/:id/board/epics - Get Epic-based board with swimlanes per Epic.
+async fn get_epic_board(
+    State(state): State<ProjectState>,
+    Path(project_id): Path<String>,
+) -> impl IntoResponse {
+    let result = kix_services::work_items::get_epic_board(
+        &state.store,
+        &project_id,
+    )
+    .await;
+
+    match result {
+        Ok(board) => {
+            // Convert service types to response types
+            let epics: Vec<EpicSwimlaneResponse> = board
+                .epics
+                .into_iter()
+                .map(|e| EpicSwimlaneResponse {
+                    epic: WorkItemResponse::from_summary(&e.epic),
+                    items_by_column: e
+                        .items_by_column
+                        .into_iter()
+                        .map(|(k, v)| (k, v.into_iter().map(|i| WorkItemResponse::from_summary(&i)).collect()))
+                        .collect(),
+                    stats: EpicStatsResponse {
+                        total_items: e.stats.total_items,
+                        total_story_points: e.stats.total_story_points,
+                        items_by_column: e.stats.items_by_column,
+                    },
+                })
+                .collect();
+
+            let unassigned: std::collections::HashMap<String, Vec<WorkItemResponse>> = board
+                .unassigned
+                .into_iter()
+                .map(|(k, v)| (k, v.into_iter().map(|i| WorkItemResponse::from_summary(&i)).collect()))
+                .collect();
+
+            // Build column info
+            let columns: Vec<BoardColumnInfo> = BOARD_COLUMNS
+                .iter()
+                .map(|col| BoardColumnInfo {
+                    id: col.to_string(),
+                    name: col.to_string(),
+                    display_name: match *col {
+                        "backlog" => "Backlog".to_string(),
+                        "todo" => "To Do".to_string(),
+                        "in_progress" => "In Progress".to_string(),
+                        "in_review" => "In Review".to_string(),
+                        "testing" => "Testing".to_string(),
+                        "done" => "Done".to_string(),
+                        _ => col.to_string(),
+                    },
+                })
+                .collect();
+
+            Json(EpicBoardResponse {
+                columns,
+                epics,
+                unassigned,
+                column_counts: board.column_counts,
+                total_items: board.total_items,
+            })
+            .into_response()
+        }
+        Err(e) => {
+            warn!("Failed to get Epic board: {}", e);
+            match e {
+                kix_services::ServiceError::NotFound { .. } => {
+                    (StatusCode::NOT_FOUND, e.to_string()).into_response()
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+    }
+}
+
+/// Request body for reordering an Epic swimlane.
+#[derive(Debug, Deserialize)]
+struct ReorderEpicRequest {
+    epic_id: String,
+    to_position: i64,
+}
+
+/// POST /api/projects/:id/board/reorder-epic - Reorder Epic swimlanes.
+async fn reorder_epic(
+    State(state): State<ProjectState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<ReorderEpicRequest>,
+) -> impl IntoResponse {
+    let result = kix_services::work_items::reorder_epic(
+        &state.store,
+        Some(&state.event_bus),
+        &project_id,
+        &req.epic_id,
+        req.to_position,
+    )
+    .await;
+
+    match result {
+        Ok(success) => {
+            Json(serde_json::json!({
+                "success": success,
+                "epic_id": req.epic_id,
+                "to_position": req.to_position,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            warn!("Failed to reorder Epic: {}", e);
+            match e {
+                kix_services::ServiceError::NotFound(_) => {
+                    (StatusCode::NOT_FOUND, e.to_string()).into_response()
+                }
+                kix_services::ServiceError::Validation(_) => {
+                    (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
         }
     }
 }

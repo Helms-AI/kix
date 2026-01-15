@@ -28,7 +28,7 @@ import type {
   UpdateWorkItemRequest,
   WorkItemState,
   WorkItemPriority,
-  WorkItemType,
+  WorkItemType,  // Still needed for item creation
   BoardColumn,
 } from '../../types/project';
 import { KanbanBoard, BoardHeader } from '../../components/board';
@@ -360,7 +360,6 @@ function WorkItemsTab({ project }: { project: Project }) {
   const [editingItem, setEditingItem] = useState<WorkItem | undefined>();
   const [stateFilter, setStateFilter] = useState<string>('');
   const [viewMode, setViewMode] = useState<'board' | 'list'>('board'); // Default to board
-  const [filterItemType, setFilterItemType] = useState<WorkItemType | null>(null);
 
   // List view query
   const { data: listData, isLoading: isListLoading } = useQuery({
@@ -372,10 +371,10 @@ function WorkItemsTab({ project }: { project: Project }) {
     enabled: viewMode === 'list',
   });
 
-  // Board view query
+  // Board view query - use Epic-based board
   const { data: boardData, isLoading: isBoardLoading, refetch: refetchBoard } = useQuery({
-    queryKey: ['project', project.id, 'board', filterItemType],
-    queryFn: () => projectApi.getBoard(project.id, filterItemType || undefined),
+    queryKey: ['project', project.id, 'board', 'epics'],
+    queryFn: () => projectApi.getEpicBoard(project.id),
     enabled: viewMode === 'board',
   });
 
@@ -417,8 +416,6 @@ function WorkItemsTab({ project }: { project: Project }) {
           columnCounts={columnCounts as Record<BoardColumn, number>}
           viewMode={viewMode}
           onViewModeChange={setViewMode}
-          filterItemType={filterItemType}
-          onFilterItemTypeChange={setFilterItemType}
           onCreateItem={() => setShowCreateModal(true)}
           onRefresh={handleBoardUpdate}
           isLoading={isBoardLoading}

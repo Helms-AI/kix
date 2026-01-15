@@ -15,13 +15,13 @@ import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
 import type {
   WorkItem,
   BoardColumn,
-  WorkItemType,
-  BoardResponse,
+  EpicBoardResponse,
+  EpicSwimlaneData,
   MoveCardRequest,
 } from '../../types/project';
-import { BOARD_COLUMNS, WORK_ITEM_TYPES } from '../../types/project';
+import { BOARD_COLUMNS } from '../../types/project';
 import { projectApi } from '../../api/projectClient';
-import { Swimlane } from './Swimlane';
+import { EpicSwimlane } from './EpicSwimlane';
 import { BoardCard } from './BoardCard';
 
 // Hierarchy info computed from board data
@@ -33,10 +33,10 @@ export interface HierarchyInfo {
 
 interface KanbanBoardProps {
   projectId: string;
-  boardData: BoardResponse;
+  boardData: EpicBoardResponse;
   onBoardUpdate: () => void;
   onCardClick?: (item: WorkItem) => void;
-  onAddCard?: (column: BoardColumn, itemType?: WorkItemType) => void;
+  onAddCard?: (column: BoardColumn) => void;
 }
 
 export function KanbanBoard({
@@ -68,9 +68,13 @@ export function KanbanBoard({
     const parentInfo = new Map<string, { id: string; title: string; number: number }>();
     const itemMap = new Map<string, WorkItem>();
 
-    // First pass: build item map and count children
-    for (const swimlane of Object.values(boardData.items_by_swimlane)) {
-      for (const columnItems of Object.values(swimlane)) {
+    // Process all epics and their items
+    for (const epicData of boardData.epics) {
+      // Add the epic itself to the item map
+      itemMap.set(epicData.epic.id, epicData.epic);
+
+      // Process items in each column
+      for (const columnItems of Object.values(epicData.items_by_column)) {
         for (const item of columnItems) {
           itemMap.set(item.id, item);
 
@@ -83,20 +87,29 @@ export function KanbanBoard({
       }
     }
 
+    // Process unassigned items
+    for (const columnItems of Object.values(boardData.unassigned)) {
+      for (const item of columnItems) {
+        itemMap.set(item.id, item);
+
+        // Count children for parent items
+        if (item.parent_id) {
+          const currentCount = childrenCount.get(item.parent_id) || 0;
+          childrenCount.set(item.parent_id, currentCount + 1);
+        }
+      }
+    }
+
     // Second pass: build parent info map
-    for (const swimlane of Object.values(boardData.items_by_swimlane)) {
-      for (const columnItems of Object.values(swimlane)) {
-        for (const item of columnItems) {
-          if (item.parent_id) {
-            const parent = itemMap.get(item.parent_id);
-            if (parent) {
-              parentInfo.set(item.id, {
-                id: parent.id,
-                title: parent.title,
-                number: parent.number,
-              });
-            }
-          }
+    for (const [_id, item] of itemMap) {
+      if (item.parent_id) {
+        const parent = itemMap.get(item.parent_id);
+        if (parent) {
+          parentInfo.set(item.id, {
+            id: parent.id,
+            title: parent.title,
+            number: parent.number,
+          });
         }
       }
     }
@@ -181,44 +194,72 @@ export function KanbanBoard({
   };
 
   // Apply optimistic updates to board data
-  const boardDataWithOptimisticUpdates = useMemo(() => {
+  const boardDataWithOptimisticUpdates = useMemo((): EpicBoardResponse => {
     if (optimisticUpdates.size === 0) return boardData;
 
     // Deep clone the board data
-    const updated: BoardResponse = {
+    const updated: EpicBoardResponse = {
       ...boardData,
-      items_by_swimlane: {} as BoardResponse['items_by_swimlane'],
+      epics: boardData.epics.map((epicData): EpicSwimlaneData => ({
+        ...epicData,
+        items_by_column: { ...epicData.items_by_column },
+      })),
+      unassigned: { ...boardData.unassigned },
     };
 
-    // Clone each swimlane
-    for (const [swimlane, columns] of Object.entries(boardData.items_by_swimlane)) {
-      updated.items_by_swimlane[swimlane as WorkItemType] = {} as Record<BoardColumn, WorkItem[]>;
-      for (const [column, items] of Object.entries(columns)) {
-        // Filter out items that have been moved
-        updated.items_by_swimlane[swimlane as WorkItemType][column as BoardColumn] = items.filter(
-          (item) => {
-            const update = optimisticUpdates.get(item.id);
-            return !update || update.column === column;
-          }
-        );
-      }
-    }
-
-    // Add moved items to their new columns
+    // Filter out moved items from their original locations and add to new locations
     for (const [itemId, { column }] of optimisticUpdates) {
       const item = findItem(itemId);
-      if (item) {
-        const swimlane = item.item_type;
-        if (!updated.items_by_swimlane[swimlane]) {
-          updated.items_by_swimlane[swimlane] = {} as Record<BoardColumn, WorkItem[]>;
+      if (!item) continue;
+
+      const originalColumn = item.board_column;
+
+      // Remove from original location in epics
+      for (const epicData of updated.epics) {
+        if (epicData.items_by_column[originalColumn]) {
+          epicData.items_by_column[originalColumn] = epicData.items_by_column[originalColumn].filter(
+            (i) => i.id !== itemId
+          );
         }
-        if (!updated.items_by_swimlane[swimlane][column]) {
-          updated.items_by_swimlane[swimlane][column] = [];
+      }
+
+      // Remove from unassigned
+      if (updated.unassigned[originalColumn]) {
+        updated.unassigned[originalColumn] = updated.unassigned[originalColumn].filter(
+          (i) => i.id !== itemId
+        );
+      }
+
+      // Find which epic this item belongs to and add to new column
+      let foundEpic = false;
+      for (const epicData of updated.epics) {
+        // Check if this item was in this epic's swimlane
+        const wasInThisEpic = boardData.epics
+          .find((e) => e.epic.id === epicData.epic.id)
+          ?.items_by_column[originalColumn]
+          ?.some((i) => i.id === itemId);
+
+        if (wasInThisEpic) {
+          if (!epicData.items_by_column[column]) {
+            epicData.items_by_column[column] = [];
+          }
+          epicData.items_by_column[column] = [
+            { ...item, board_column: column },
+            ...epicData.items_by_column[column],
+          ];
+          foundEpic = true;
+          break;
         }
-        // Add to the beginning of the column
-        updated.items_by_swimlane[swimlane][column] = [
+      }
+
+      // If not in any epic, add to unassigned
+      if (!foundEpic) {
+        if (!updated.unassigned[column]) {
+          updated.unassigned[column] = [];
+        }
+        updated.unassigned[column] = [
           { ...item, board_column: column },
-          ...updated.items_by_swimlane[swimlane][column],
+          ...updated.unassigned[column],
         ];
       }
     }
@@ -226,17 +267,43 @@ export function KanbanBoard({
     return updated;
   }, [boardData, optimisticUpdates, findItem]);
 
-  // Filter swimlanes that have items
-  const activeSwimlanes = useMemo(() => {
-    return WORK_ITEM_TYPES.filter(({ type }) => {
-      const swimlane = boardDataWithOptimisticUpdates.items_by_swimlane[type];
-      if (!swimlane) return false;
-      return Object.values(swimlane).some((items) => items.length > 0);
-    });
+  // Check if there are any unassigned items
+  const hasUnassignedItems = useMemo(() => {
+    return Object.values(boardDataWithOptimisticUpdates.unassigned).some(
+      (items) => items.length > 0
+    );
   }, [boardDataWithOptimisticUpdates]);
 
-  // All swimlanes for showing empty ones too
-  const allSwimlanes = WORK_ITEM_TYPES;
+  // Compute unassigned stats
+  const unassignedStats = useMemo(() => {
+    const items_by_column: Record<BoardColumn, number> = {} as Record<BoardColumn, number>;
+    let total_items = 0;
+    let total_story_points = 0;
+
+    for (const [column, items] of Object.entries(boardDataWithOptimisticUpdates.unassigned)) {
+      items_by_column[column as BoardColumn] = items.length;
+      total_items += items.length;
+      total_story_points += items.reduce((sum, item) => sum + (item.story_points || 0), 0);
+    }
+
+    return {
+      total_items,
+      total_story_points,
+      items_by_column,
+    };
+  }, [boardDataWithOptimisticUpdates]);
+
+  // Initialize empty columns for consistent rendering
+  const initializeColumns = (items: Record<BoardColumn, WorkItem[]>): Record<BoardColumn, WorkItem[]> => {
+    return {
+      backlog: items.backlog || [],
+      todo: items.todo || [],
+      in_progress: items.in_progress || [],
+      in_review: items.in_review || [],
+      testing: items.testing || [],
+      done: items.done || [],
+    };
+  };
 
   return (
     <DndContext
@@ -249,42 +316,35 @@ export function KanbanBoard({
       <div className="flex flex-col h-full">
         {/* Board Content */}
         <div className="flex-1 overflow-y-auto">
-          {/* Swimlanes */}
-          {allSwimlanes.map(({ type }) => {
-            const swimlaneData =
-              boardDataWithOptimisticUpdates.items_by_swimlane[type] ||
-              ({} as Record<BoardColumn, WorkItem[]>);
+          {/* Epic Swimlanes */}
+          {boardDataWithOptimisticUpdates.epics.map((epicData) => (
+            <EpicSwimlane
+              key={epicData.epic.id}
+              epic={epicData.epic}
+              columns={BOARD_COLUMNS}
+              itemsByColumn={initializeColumns(epicData.items_by_column)}
+              stats={epicData.stats}
+              hierarchyInfo={hierarchyInfo}
+              onCardClick={onCardClick}
+              onAddCard={onAddCard}
+              defaultExpanded={epicData.stats.total_items > 0}
+            />
+          ))}
 
-            // Initialize empty columns
-            const itemsByColumn: Record<BoardColumn, WorkItem[]> = {
-              backlog: swimlaneData.backlog || [],
-              todo: swimlaneData.todo || [],
-              in_progress: swimlaneData.in_progress || [],
-              in_review: swimlaneData.in_review || [],
-              testing: swimlaneData.testing || [],
-              done: swimlaneData.done || [],
-            };
-
-            const hasItems = Object.values(itemsByColumn).some(
-              (items) => items.length > 0
-            );
-
-            // Only show swimlanes with items (or all if none have items)
-            if (!hasItems && activeSwimlanes.length > 0) return null;
-
-            return (
-              <Swimlane
-                key={type}
-                itemType={type}
-                columns={BOARD_COLUMNS}
-                itemsByColumn={itemsByColumn}
-                hierarchyInfo={hierarchyInfo}
-                onCardClick={onCardClick}
-                onAddCard={(column) => onAddCard?.(column, type)}
-                defaultExpanded={hasItems}
-              />
-            );
-          })}
+          {/* Unassigned Swimlane - only show if there are unassigned items */}
+          {hasUnassignedItems && (
+            <EpicSwimlane
+              epic={null}
+              columns={BOARD_COLUMNS}
+              itemsByColumn={initializeColumns(boardDataWithOptimisticUpdates.unassigned)}
+              stats={unassignedStats}
+              hierarchyInfo={hierarchyInfo}
+              isUnassigned
+              onCardClick={onCardClick}
+              onAddCard={onAddCard}
+              defaultExpanded={true}
+            />
+          )}
 
           {/* Empty Board State */}
           {boardData.total_items === 0 && (

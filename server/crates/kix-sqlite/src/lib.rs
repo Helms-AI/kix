@@ -353,6 +353,36 @@ impl SqliteStore {
     }
 
     // =========================================================================
+    // Epic-based Board Operations
+    // =========================================================================
+
+    /// List all Epics for a project, ordered by position.
+    pub async fn list_epics_for_project(&self, project_id: &str) -> Result<Vec<WorkItemRecord>> {
+        work_items::list_epics_for_project(&self.pool, project_id).await
+    }
+
+    /// Compute Epic assignments for all items in a project.
+    /// Returns a map of item_id -> root_epic_id.
+    pub async fn compute_epic_assignments(&self, project_id: &str) -> Result<std::collections::HashMap<String, String>> {
+        work_items::compute_epic_assignments(&self.pool, project_id).await
+    }
+
+    /// Update Epic swimlane position.
+    pub async fn update_epic_position(&self, epic_id: &str, new_position: i64) -> Result<bool> {
+        work_items::update_epic_position(&self.pool, epic_id, new_position).await
+    }
+
+    /// Shift Epic positions when reordering swimlanes.
+    pub async fn shift_epic_positions(
+        &self,
+        project_id: &str,
+        from_position: i64,
+        to_position: i64,
+    ) -> Result<()> {
+        work_items::shift_epic_positions(&self.pool, project_id, from_position, to_position).await
+    }
+
+    // =========================================================================
     // Project Entry Link Operations
     // =========================================================================
 

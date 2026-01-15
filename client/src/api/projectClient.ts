@@ -17,6 +17,10 @@ import type {
   MoveCardResponse,
   ColumnCountsResponse,
   ChildWorkItemsResponse,
+  // Epic-based board types
+  EpicBoardResponse,
+  ReorderEpicRequest,
+  ReorderEpicResponse,
 } from '../types/project';
 
 const API_BASE = '/api/projects';
@@ -211,6 +215,30 @@ export const projectApi = {
   getChildWorkItems: (projectId: string, parentId: string) =>
     fetchJson<ChildWorkItemsResponse>(
       `${API_BASE}/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(parentId)}/children`
+    ),
+
+  // ============================================================================
+  // Epic-Based Board Operations
+  // ============================================================================
+
+  /**
+   * Get Epic-based board data.
+   * Each Epic becomes a swimlane containing its descendant items.
+   * Items without an Epic ancestor appear in the "unassigned" swimlane.
+   */
+  getEpicBoard: (projectId: string) =>
+    fetchJson<EpicBoardResponse>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/board/epics`
+    ),
+
+  /**
+   * Reorder an Epic swimlane on the board.
+   * Changes the vertical position of the Epic swimlane.
+   */
+  reorderEpic: (projectId: string, request: ReorderEpicRequest) =>
+    postJson<ReorderEpicResponse>(
+      `${API_BASE}/${encodeURIComponent(projectId)}/board/reorder-epic`,
+      request
     ),
 };
 

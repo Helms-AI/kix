@@ -777,6 +777,258 @@ pub async fn get_column_counts(
     Ok(ColumnCounts { counts, total })
 }
 
+// =============================================================================
+// EPIC-BASED BOARD TYPES
+// =============================================================================
+
+/// Statistics for an Epic swimlane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpicStats {
+    pub total_items: usize,
+    pub total_story_points: i64,
+    pub items_by_column: std::collections::HashMap<String, usize>,
+}
+
+/// Data for an Epic swimlane containing all its descendants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpicSwimlaneData {
+    /// The Epic work item itself
+    pub epic: WorkItemSummary,
+    /// All descendants organized by board column
+    pub items_by_column: std::collections::HashMap<String, Vec<WorkItemSummary>>,
+    /// Aggregated statistics
+    pub stats: EpicStats,
+}
+
+/// Epic-based board view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpicBoardView {
+    /// Board columns configuration
+    pub columns: Vec<BoardColumn>,
+    /// Epic swimlanes (ordered by position)
+    pub epics: Vec<EpicSwimlaneData>,
+    /// Items not assigned to any Epic
+    pub unassigned: std::collections::HashMap<String, Vec<WorkItemSummary>>,
+    /// Column counts across all items
+    pub column_counts: std::collections::HashMap<String, usize>,
+    /// Total item count
+    pub total_items: usize,
+}
+
+// =============================================================================
+// EPIC-BASED BOARD SERVICE FUNCTIONS
+// =============================================================================
+
+/// Get the Epic-based board view for a project.
+///
+/// Returns a board organized by Epic swimlanes, where each Epic contains
+/// all its descendant items (Stories, Tasks, Subtasks, Bugs) organized by column.
+///
+/// # Arguments
+/// * `store` - The ProjectStore instance
+/// * `project_id_or_slug` - Project ID or slug
+///
+/// # Returns
+/// Epic-based board view with swimlanes and columns
+pub async fn get_epic_board(
+    store: &Arc<RwLock<ProjectStore>>,
+    project_id_or_slug: &str,
+) -> ServiceResult<EpicBoardView> {
+    info!("Get Epic-based board for project {}", project_id_or_slug);
+
+    let store_guard = store.read().await;
+
+    // Get project to validate it exists
+    let project = store_guard
+        .get_project(project_id_or_slug)
+        .await
+        .map_err(ServiceError::Store)?
+        .ok_or_else(|| ServiceError::not_found("Project", project_id_or_slug))?;
+
+    // Define columns in workflow order
+    let column_ids = ["backlog", "todo", "in_progress", "in_review", "testing", "done"];
+    let columns: Vec<BoardColumn> = column_ids.iter().map(|id| BoardColumn::from_id(id)).collect();
+
+    // Get all Epics ordered by position
+    let epics = store_guard
+        .list_epics_for_project(&project.id)
+        .await
+        .map_err(ServiceError::Store)?;
+
+    // Compute Epic assignments for all items
+    let epic_assignments = store_guard
+        .compute_epic_assignments(&project.id)
+        .await
+        .map_err(ServiceError::Store)?;
+
+    // Get all non-Epic work items
+    let all_items = store_guard
+        .list_work_items(&project.id, None, 10000, 0)
+        .await
+        .map_err(ServiceError::Store)?;
+
+    let non_epic_items: Vec<_> = all_items
+        .iter()
+        .filter(|item| item.item_type != "epic")
+        .collect();
+
+    // Initialize column counts
+    let mut column_counts: std::collections::HashMap<String, usize> = column_ids
+        .iter()
+        .map(|id| (id.to_string(), 0))
+        .collect();
+    let mut total_items = 0;
+
+    // Build Epic swimlanes
+    let mut epic_swimlanes = Vec::new();
+
+    for epic in &epics {
+        // Initialize columns for this Epic
+        let mut items_by_column: std::collections::HashMap<String, Vec<WorkItemSummary>> =
+            column_ids.iter().map(|id| (id.to_string(), Vec::new())).collect();
+
+        let mut epic_total_items = 0;
+        let mut epic_story_points: i64 = 0;
+        let mut epic_items_by_column: std::collections::HashMap<String, usize> = column_ids
+            .iter()
+            .map(|id| (id.to_string(), 0))
+            .collect();
+
+        // Find all items assigned to this Epic
+        for item in &non_epic_items {
+            if let Some(assigned_epic_id) = epic_assignments.get(&item.id) {
+                if assigned_epic_id == &epic.id {
+                    let column = &item.board_column;
+                    if let Some(col_items) = items_by_column.get_mut(column) {
+                        col_items.push(WorkItemSummary::from(*item));
+                        *column_counts.get_mut(column).unwrap() += 1;
+                        *epic_items_by_column.get_mut(column).unwrap() += 1;
+                        epic_total_items += 1;
+                        total_items += 1;
+                        if let Some(sp) = item.story_points {
+                            epic_story_points += sp;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort items within each column by position
+        for col_items in items_by_column.values_mut() {
+            col_items.sort_by_key(|item| item.position);
+        }
+
+        epic_swimlanes.push(EpicSwimlaneData {
+            epic: WorkItemSummary::from(epic),
+            items_by_column,
+            stats: EpicStats {
+                total_items: epic_total_items,
+                total_story_points: epic_story_points,
+                items_by_column: epic_items_by_column,
+            },
+        });
+    }
+
+    // Build unassigned swimlane (items with no Epic ancestor)
+    let mut unassigned: std::collections::HashMap<String, Vec<WorkItemSummary>> =
+        column_ids.iter().map(|id| (id.to_string(), Vec::new())).collect();
+
+    for item in &non_epic_items {
+        if !epic_assignments.contains_key(&item.id) {
+            let column = &item.board_column;
+            if let Some(col_items) = unassigned.get_mut(column) {
+                col_items.push(WorkItemSummary::from(*item));
+                *column_counts.get_mut(column).unwrap() += 1;
+                total_items += 1;
+            }
+        }
+    }
+
+    // Sort unassigned items by position
+    for col_items in unassigned.values_mut() {
+        col_items.sort_by_key(|item| item.position);
+    }
+
+    Ok(EpicBoardView {
+        columns,
+        epics: epic_swimlanes,
+        unassigned,
+        column_counts,
+        total_items,
+    })
+}
+
+/// Reorder an Epic swimlane to a new position.
+///
+/// # Arguments
+/// * `store` - The ProjectStore instance
+/// * `event_bus` - Optional event bus for notifications
+/// * `project_id_or_slug` - Project ID or slug
+/// * `epic_id` - Epic ID to reorder
+/// * `to_position` - Target position
+///
+/// # Returns
+/// Whether reordering succeeded
+pub async fn reorder_epic(
+    store: &Arc<RwLock<ProjectStore>>,
+    event_bus: Option<&SharedEventBus>,
+    project_id_or_slug: &str,
+    epic_id: &str,
+    to_position: i64,
+) -> ServiceResult<bool> {
+    info!(
+        "Reorder Epic {} to position {} in project {}",
+        epic_id, to_position, project_id_or_slug
+    );
+
+    let store_guard = store.write().await;
+
+    // Get project to validate it exists
+    let project = store_guard
+        .get_project(project_id_or_slug)
+        .await
+        .map_err(ServiceError::Store)?
+        .ok_or_else(|| ServiceError::not_found("Project", project_id_or_slug))?;
+
+    // Get the Epic to reorder
+    let epic = store_guard
+        .get_work_item(epic_id)
+        .await
+        .map_err(ServiceError::Store)?
+        .ok_or_else(|| ServiceError::not_found("Epic", epic_id))?;
+
+    // Verify it's an Epic and belongs to this project
+    if epic.item_type != "epic" {
+        return Err(ServiceError::bad_request("Work item is not an Epic"));
+    }
+    if epic.project_id != project.id {
+        return Err(ServiceError::bad_request("Epic does not belong to this project"));
+    }
+
+    let from_position = epic.position;
+
+    // Shift other Epics to make room
+    store_guard
+        .shift_epic_positions(&project.id, from_position, to_position)
+        .await
+        .map_err(ServiceError::Store)?;
+
+    // Update the Epic's position
+    store_guard
+        .update_epic_position(epic_id, to_position)
+        .await
+        .map_err(ServiceError::Store)?;
+
+    drop(store_guard);
+
+    // Emit event
+    if let Some(bus) = event_bus {
+        bus.issue_updated(&project.id, epic_id);
+    }
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

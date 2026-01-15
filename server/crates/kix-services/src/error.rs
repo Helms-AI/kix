@@ -122,6 +122,11 @@ impl ServiceError {
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
     }
+
+    /// Create a bad request error (alias for validation error).
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::Validation(message.into())
+    }
 }
 
 #[cfg(test)]
