@@ -14,6 +14,54 @@ KIX (Knowledge Indexer) - A high-performance Rust-based semantic search and know
 
 ## Common Commands
 
+### NOTE: CRITICAL ( keep through compaction )
+
+**ALWAYS use these specialized agents and skills for UX/UI/frontend work.**
+
+#### Task Agents (via Task tool)
+
+| Agent | Description | When to Use |
+|-------|-------------|-------------|
+| `ux-product:user-researcher` | User research specialist | Designing interview scripts, analyzing user feedback, creating personas, usability test plans |
+| `ux-product:ux-designer` | UX design specialist | Information architecture, wireframes, design system decisions, heuristic evaluations |
+| `ux-product:interaction-designer` | Interaction design specialist | Micro-interactions, animations, state transitions, gesture design, feedback patterns |
+| `ux-product:product-strategist` | Product strategy specialist | Feature prioritization, roadmap planning, competitive analysis, success metrics |
+| `ux-product:accessibility-expert` | Accessibility specialist | WCAG audits, screen reader compatibility, keyboard navigation, color contrast, ARIA |
+
+**How to invoke:**
+```
+Task tool → subagent_type: "ux-product:ux-designer"
+           prompt: "Review this component for usability issues..."
+```
+
+#### Skills (via Skill tool - /command)
+
+| Skill | Description | When to Use |
+|-------|-------------|-------------|
+| `/ux` | UX research & design | Quick UX guidance, design critiques, usability recommendations |
+| `/user-research` | User research & testing | Interview questions, survey design, insight synthesis |
+| `/journey` | User journey mapping | Flow optimization, touchpoint analysis, pain point identification |
+| `/product` | Product strategy | Roadmap decisions, feature scoping, prioritization frameworks |
+| `/frontend-design` | Production-grade UI | **Building new components, pages, or visual interfaces** |
+
+**How to invoke:**
+```
+User types: /frontend-design
+Or: Skill tool → skill: "frontend-design"
+```
+
+#### Decision Guide
+
+| Task Type | Use This |
+|-----------|----------|
+| Building new UI components | `/frontend-design` skill |
+| Evaluating existing UI/UX | `ux-product:ux-designer` agent |
+| Adding animations/transitions | `ux-product:interaction-designer` agent |
+| Accessibility review | `ux-product:accessibility-expert` agent |
+| Feature planning/roadmap | `ux-product:product-strategist` agent |
+| Understanding user needs | `ux-product:user-researcher` agent |
+| Quick UX questions | `/ux` skill |
+
 ### Development
 ```bash
 ./run.sh                                                        # Start all services (auto-builds with SIMD)
