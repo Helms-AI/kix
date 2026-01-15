@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;1,100;1,200;1,300;1,400;1,500;1,600;1,700&family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;1,100;1,200;1,300;1,400;1,500;1,600;1,700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -216,13 +216,15 @@
 }
 
 .font-ui {
-  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
 }
 
 /* Admin container with animated grid */
 .admin-container {
   position: relative;
   min-height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
 
 .admin-container::before {
@@ -263,7 +265,7 @@
 
 /* Admin card with glass effect */
 .admin-card {
-  @apply relative bg-slate-900/60 backdrop-blur-md rounded-2xl border border-slate-700/50;
+  @apply relative bg-slate-900/60 backdrop-blur-md border border-slate-700/50;
   @apply shadow-xl shadow-black/20 overflow-hidden;
 }
 
@@ -287,7 +289,7 @@
 
 /* Metric card with animated gradient border */
 .metric-card {
-  @apply relative bg-slate-900/70 rounded-xl p-5 overflow-hidden;
+  @apply relative bg-slate-900/70 p-5 overflow-hidden;
   @apply border border-slate-700/50;
 }
 
@@ -421,7 +423,7 @@
 
 /* Danger zone styling */
 .danger-zone {
-  @apply relative bg-red-950/30 border-2 border-red-500/30 rounded-xl p-6 overflow-hidden;
+  @apply relative bg-red-950/30 border-2 border-red-500/30 p-6 overflow-hidden;
 }
 
 .danger-zone::before {
@@ -445,7 +447,7 @@
 }
 
 .modal-content {
-  @apply relative bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl;
+  @apply relative bg-slate-900 border border-slate-700 shadow-2xl;
   @apply max-w-md w-full mx-4 overflow-hidden;
   animation: modal-enter 0.3s ease-out;
 }
@@ -509,14 +511,14 @@
 }
 
 .section-header-icon {
-  @apply w-10 h-10 rounded-xl flex items-center justify-center;
+  @apply w-10 h-10 flex items-center justify-center;
   @apply bg-gradient-to-br from-cyan-500/20 to-teal-500/20;
   @apply border border-cyan-500/20;
 }
 
 /* Service status card */
 .service-card {
-  @apply relative bg-slate-800/40 rounded-xl p-4 border border-slate-700/50;
+  @apply relative bg-slate-800/40 p-4 border border-slate-700/50;
   @apply transition-all duration-300;
 }
 
@@ -570,7 +572,7 @@
 
 /* Agent card accent - violet glow on hover */
 .admin-card-agent {
-  @apply relative bg-slate-900/60 backdrop-blur-md rounded-2xl border border-slate-700/50;
+  @apply relative bg-slate-900/60 backdrop-blur-md border border-slate-700/50;
   @apply shadow-xl shadow-black/20 overflow-hidden transition-all duration-300;
 }
 
@@ -590,7 +592,7 @@
 
 /* Hook card accent - amber glow on hover */
 .admin-card-hook {
-  @apply relative bg-slate-900/60 backdrop-blur-md rounded-2xl border border-slate-700/50;
+  @apply relative bg-slate-900/60 backdrop-blur-md border border-slate-700/50;
   @apply shadow-xl shadow-black/20 overflow-hidden transition-all duration-300;
 }
 
@@ -610,13 +612,13 @@
 
 /* Content card icon containers */
 .content-card-icon-agent {
-  @apply w-12 h-12 rounded-xl flex items-center justify-center;
+  @apply w-12 h-12 flex items-center justify-center;
   @apply bg-gradient-to-br from-violet-500/20 to-purple-500/20;
   @apply border border-violet-500/20;
 }
 
 .content-card-icon-hook {
-  @apply w-12 h-12 rounded-xl flex items-center justify-center;
+  @apply w-12 h-12 flex items-center justify-center;
   @apply bg-gradient-to-br from-amber-500/20 to-orange-500/20;
   @apply border border-amber-500/20;
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use kix_api::{create_router, create_indexing_router, create_project_router, AppState, IndexingState, ProjectState};
+use kix_api::{create_router, create_indexing_router, create_project_router, create_explorer_router, AppState, IndexingState, ProjectState, ExplorerState};
 use kix_crawler::file_handler::FileHandler;
 use kix_embeddings::{DocumentChunker, OllamaEmbedder, EmbeddingConfig};
 use kix_jobs::{JobExecutor, ExecutorConfig, JobQueue, QueueConfig};
@@ -565,11 +565,16 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
     // Get token service for MCP server (before project_state is moved)
     let shared_token_service = project_state.token_service().clone();
 
+    // Create explorer state for data explorer
+    let explorer_state = ExplorerState::new(PathBuf::from(db_path));
+    info!("Explorer state initialized for data directory: {}", db_path);
+
     // Create API router
     let main_router = create_router(api_state);
     let indexing_router = create_indexing_router(indexing_state);
     let project_router = create_project_router(project_state);
-    let api_app = main_router.merge(indexing_router).merge(project_router);
+    let explorer_router = create_explorer_router(explorer_state);
+    let api_app = main_router.merge(indexing_router).merge(project_router).merge(explorer_router);
 
     // Create MCP server using the SAME shared store, embedder, and project store
     let mcp_server = KixMcpServer::with_shared(shared_store.clone(), shared_embedder, job_queue)

@@ -40,5 +40,9 @@ axum = { workspace = true }
 # MCP types for error mapping
 rmcp = { workspace = true }
 
+# Database (for data explorer)
+sqlx = { workspace = true }
+hex = "0.4"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

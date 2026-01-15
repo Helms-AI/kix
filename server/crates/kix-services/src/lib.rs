@@ -44,6 +44,7 @@
 //! - [`knowledge`] - Entry linking and project-scoped search (TODO)
 
 pub mod error;
+pub mod explorer;
 pub mod github;
 pub mod indexing;
 pub mod issues;
@@ -100,4 +101,13 @@ pub use knowledge::{
     link_entry, list_linked_entries, unlink_entry, EntrySearchHit, IssueSearchHit,
     LinkedEntry, LinkedEntryFilters, LinkedEntryList, LinkResult, ProjectSearchOptions,
     ProjectSearchResult,
+};
+
+// Re-export data explorer types and functions
+pub use explorer::{
+    discover_databases, execute_sqlite_query, get_query_templates, get_sqlite_schema,
+    get_table_data, ColumnInfo, DataModifyRequest, DataModifyResult, DataOperation,
+    DatabaseInfo, DatabaseStatus, DatabaseType, ForeignKeyInfo, IndexInfo,
+    QueryHistoryEntry, QueryRequest, QueryResult, QueryTemplate, QueryType,
+    TableSchema, TemplateParameter,
 };

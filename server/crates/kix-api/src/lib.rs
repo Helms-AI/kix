@@ -5,12 +5,14 @@
 
 pub mod admin;
 pub mod error;
+pub mod explorer_routes;
 pub mod indexing_routes;
 pub mod project_routes;
 pub mod routes;
 
 pub use admin::admin_routes;
 pub use error::ApiError;
+pub use explorer_routes::{create_explorer_router, ExplorerState};
 pub use indexing_routes::{create_indexing_router, IndexingState};
 pub use project_routes::{create_project_router, ProjectState};
 pub use routes::{create_router, AppState};

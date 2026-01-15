@@ -69,7 +69,7 @@ export default function AdminPage() {
   return (
     <div className="admin-container font-ui">
       {/* Header with glassmorphism effect */}
-      <div className="relative z-10">
+      <div className="relative z-10 flex-shrink-0">
         <div className="bg-slate-900/80 backdrop-blur-xl border-b border-slate-700/50">
           {/* Top Header */}
           <div className="px-8 py-6">
@@ -132,17 +132,19 @@ export default function AdminPage() {
       </div>
 
       {/* Content Area */}
-      <div className="relative z-10 px-8 py-8">
-        <Routes>
-          <Route path="/" element={<Navigate to="/admin/dashboard" replace />} />
-          {tabs.map((tab) => (
-            <Route
-              key={tab.id}
-              path={tab.path}
-              element={<tab.component />}
-            />
-          ))}
-        </Routes>
+      <div className="relative z-10 px-8 py-8 flex-1 min-h-0">
+        <div className="h-full">
+          <Routes>
+            <Route path="/" element={<Navigate to="/admin/dashboard" replace />} />
+            {tabs.map((tab) => (
+              <Route
+                key={tab.id}
+                path={tab.path}
+                element={<tab.component />}
+              />
+            ))}
+          </Routes>
+        </div>
       </div>
     </div>
   );

@@ -16,8 +16,11 @@ import {
   Calendar,
   Filter,
   Loader2,
-  Shield
+  Shield,
+  LayoutDashboard,
+  Search
 } from 'lucide-react';
+import DataExplorer from './DataExplorer';
 
 interface DataStats {
   total_documents: number;
@@ -63,7 +66,7 @@ function ConfirmModal({
           isDangerous ? 'bg-red-500/5' : 'bg-cyan-500/5'
         )}>
           <div className={clsx(
-            'w-12 h-12 rounded-xl flex items-center justify-center',
+            'w-12 h-12 flex items-center justify-center',
             isDangerous ? 'bg-red-500/20' : 'bg-cyan-500/20'
           )}>
             {isDangerous ? (
@@ -77,7 +80,7 @@ function ConfirmModal({
           </div>
           <button
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
+            className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
@@ -124,7 +127,7 @@ interface StatCardProps {
 
 function StatCard({ label, value, icon: Icon }: StatCardProps) {
   return (
-    <div className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/50">
+    <div className="bg-slate-800/40 p-4 border border-slate-700/50">
       <div className="flex items-center gap-3 mb-2">
         <Icon className="w-4 h-4 text-slate-400" />
         <span className="text-sm text-slate-400">{label}</span>
@@ -136,6 +139,7 @@ function StatCard({ label, value, icon: Icon }: StatCardProps) {
 
 export default function AdminDataManagement() {
   const queryClient = useQueryClient();
+  const [activeTab, setActiveTab] = useState<'overview' | 'explorer'>('overview');
   const [confirmModal, setConfirmModal] = useState<{
     isOpen: boolean;
     action: 'clearAll' | 'clearCache' | 'reindex' | null;
@@ -197,11 +201,19 @@ export default function AdminDataManagement() {
     }
   };
 
+  const tabs = [
+    { id: 'overview' as const, label: 'Overview', icon: LayoutDashboard },
+    { id: 'explorer' as const, label: 'Explorer', icon: Search },
+  ];
+
+  // Calculate explorer height: viewport - admin header (~180px) - page header (~100px) - tabs (~50px) - padding (top + bottom)
+  const explorerHeight = 'calc(100vh - 362px)';
+
   return (
-    <div className="space-y-8">
+    <div style={{ fontSize: 'calc(1rem + 2px)' }}>
       {/* Header */}
-      <div className="flex items-center gap-4">
-        <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-cyan-500/20 to-teal-500/20 border border-cyan-500/20 flex items-center justify-center">
+      <div className="flex items-center gap-4 mb-8">
+        <div className="w-12 h-12 bg-gradient-to-br from-cyan-500/20 to-teal-500/20 border border-cyan-500/20 flex items-center justify-center">
           <Database className="w-6 h-6 text-cyan-400" />
         </div>
         <div>
@@ -212,214 +224,245 @@ export default function AdminDataManagement() {
         </div>
       </div>
 
-      {/* Statistics */}
-      <div className="admin-card admin-card-glow p-6">
-        <div className="relative z-10">
-          <div className="section-header">
-            <div className="section-header-icon">
-              <HardDrive className="w-5 h-5 text-cyan-400" />
-            </div>
-            <h3 className="text-lg font-semibold text-white">Index Statistics</h3>
-          </div>
-
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-            <StatCard label="Documents" value={dataStats.total_documents.toLocaleString()} icon={FileText} />
-            <StatCard label="Chunks" value={dataStats.total_chunks.toLocaleString()} icon={Layers} />
-            <StatCard label="Pages" value={dataStats.total_pages.toLocaleString()} icon={FileText} />
-            <StatCard label="Domains" value={dataStats.unique_domains} icon={Globe} />
-            <StatCard label="Storage" value={`${dataStats.storage_size_mb} MB`} icon={HardDrive} />
-            <StatCard label="Updated" value="Just now" icon={Calendar} />
-          </div>
-        </div>
+      {/* Tab Navigation */}
+      <div className="flex gap-2 p-1 bg-slate-800/40 backdrop-blur-sm border border-slate-700/50 border-b-0">
+        {tabs.map(tab => {
+          const Icon = tab.icon;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={clsx(
+                'flex items-center gap-2 px-4 py-2 transition-all duration-300',
+                activeTab === tab.id
+                  ? 'bg-gradient-to-r from-cyan-500/20 to-teal-500/20 text-cyan-400 border border-cyan-500/30 shadow-lg shadow-cyan-950/30'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-700/50'
+              )}
+            >
+              <Icon className="w-4 h-4" />
+              <span className="font-medium font-ui">{tab.label}</span>
+            </button>
+          );
+        })}
       </div>
 
-      {/* Index Operations */}
-      <div className="admin-card admin-card-glow p-6">
-        <div className="relative z-10">
-          <div className="section-header">
-            <div className="section-header-icon">
-              <RefreshCw className="w-5 h-5 text-cyan-400" />
+      {/* Tab Content */}
+      {activeTab === 'overview' ? (
+        <div className="space-y-8 mt-8">
+          {/* Statistics */}
+          <div className="admin-card admin-card-glow p-6">
+            <div className="relative z-10">
+              <div className="section-header">
+                <div className="section-header-icon">
+                  <HardDrive className="w-5 h-5 text-cyan-400" />
+                </div>
+                <h3 className="text-lg font-semibold text-white">Index Statistics</h3>
+              </div>
+
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+                <StatCard label="Documents" value={dataStats.total_documents.toLocaleString()} icon={FileText} />
+                <StatCard label="Chunks" value={dataStats.total_chunks.toLocaleString()} icon={Layers} />
+                <StatCard label="Pages" value={dataStats.total_pages.toLocaleString()} icon={FileText} />
+                <StatCard label="Domains" value={dataStats.unique_domains} icon={Globe} />
+                <StatCard label="Storage" value={`${dataStats.storage_size_mb} MB`} icon={HardDrive} />
+                <StatCard label="Updated" value="Just now" icon={Calendar} />
+              </div>
             </div>
-            <h3 className="text-lg font-semibold text-white">Index Operations</h3>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <button
-              onClick={() => handleAction('clearCache')}
-              className="group flex items-center gap-4 p-5 bg-slate-800/40 hover:bg-slate-800/60 border border-slate-700/50 hover:border-cyan-500/30 rounded-xl transition-all duration-300"
-            >
-              <div className="w-12 h-12 rounded-xl bg-cyan-500/10 flex items-center justify-center group-hover:bg-cyan-500/20 transition-colors">
-                <RefreshCw className="w-6 h-6 text-cyan-400" />
+          {/* Index Operations */}
+          <div className="admin-card admin-card-glow p-6">
+            <div className="relative z-10">
+              <div className="section-header">
+                <div className="section-header-icon">
+                  <RefreshCw className="w-5 h-5 text-cyan-400" />
+                </div>
+                <h3 className="text-lg font-semibold text-white">Index Operations</h3>
               </div>
-              <div className="text-left">
-                <p className="font-semibold text-white">Invalidate Caches</p>
-                <p className="text-sm text-slate-400 mt-0.5">Clear search and embedding caches</p>
-              </div>
-            </button>
 
-            <button
-              onClick={() => handleAction('reindex')}
-              className="group flex items-center gap-4 p-5 bg-slate-800/40 hover:bg-slate-800/60 border border-slate-700/50 hover:border-cyan-500/30 rounded-xl transition-all duration-300"
-            >
-              <div className="w-12 h-12 rounded-xl bg-teal-500/10 flex items-center justify-center group-hover:bg-teal-500/20 transition-colors">
-                <Database className="w-6 h-6 text-teal-400" />
-              </div>
-              <div className="text-left">
-                <p className="font-semibold text-white">Reindex All</p>
-                <p className="text-sm text-slate-400 mt-0.5">Rebuild search index from scratch</p>
-              </div>
-            </button>
-
-            <button
-              disabled
-              className="group flex items-center gap-4 p-5 bg-slate-800/20 border border-slate-700/30 rounded-xl opacity-50 cursor-not-allowed"
-            >
-              <div className="w-12 h-12 rounded-xl bg-slate-700/30 flex items-center justify-center">
-                <Download className="w-6 h-6 text-slate-500" />
-              </div>
-              <div className="text-left">
-                <p className="font-semibold text-slate-400">Export Data</p>
-                <p className="text-sm text-slate-500 mt-0.5">Coming soon</p>
-              </div>
-            </button>
-
-            <button
-              disabled
-              className="group flex items-center gap-4 p-5 bg-slate-800/20 border border-slate-700/30 rounded-xl opacity-50 cursor-not-allowed"
-            >
-              <div className="w-12 h-12 rounded-xl bg-slate-700/30 flex items-center justify-center">
-                <Upload className="w-6 h-6 text-slate-500" />
-              </div>
-              <div className="text-left">
-                <p className="font-semibold text-slate-400">Import Data</p>
-                <p className="text-sm text-slate-500 mt-0.5">Coming soon</p>
-              </div>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Bulk Operations */}
-      <div className="admin-card admin-card-glow p-6">
-        <div className="relative z-10">
-          <div className="section-header">
-            <div className="section-header-icon">
-              <Filter className="w-5 h-5 text-cyan-400" />
-            </div>
-            <h3 className="text-lg font-semibold text-white">Bulk Operations</h3>
-          </div>
-
-          <div className="space-y-6">
-            {/* Delete by Domain */}
-            <div>
-              <label className="block text-sm font-medium text-white mb-3">
-                Delete by Domain
-              </label>
-              <div className="flex gap-3">
-                <input
-                  type="text"
-                  value={domainToDelete}
-                  onChange={(e) => setDomainToDelete(e.target.value)}
-                  placeholder="example.com"
-                  className="admin-input flex-1"
-                />
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <button
-                  disabled={!domainToDelete}
-                  className="btn-admin btn-admin-primary whitespace-nowrap disabled:opacity-50"
+                  onClick={() => handleAction('clearCache')}
+                  className="group flex items-center gap-4 p-5 bg-slate-800/40 hover:bg-slate-800/60 border border-slate-700/50 hover:border-cyan-500/30 transition-all duration-300"
                 >
-                  Delete Domain
+                  <div className="w-12 h-12 bg-cyan-500/10 flex items-center justify-center group-hover:bg-cyan-500/20 transition-colors">
+                    <RefreshCw className="w-6 h-6 text-cyan-400" />
+                  </div>
+                  <div className="text-left">
+                    <p className="font-semibold text-white">Invalidate Caches</p>
+                    <p className="text-sm text-slate-400 mt-0.5">Clear search and embedding caches</p>
+                  </div>
                 </button>
-              </div>
-            </div>
 
-            {/* Delete by Date Range */}
-            <div>
-              <label className="block text-sm font-medium text-white mb-3">
-                Delete by Date Range
-              </label>
-              <div className="flex flex-wrap gap-3 items-center">
-                <input
-                  type="date"
-                  value={dateRange.start}
-                  onChange={(e) => setDateRange({ ...dateRange, start: e.target.value })}
-                  className="admin-input"
-                />
-                <span className="text-slate-500">to</span>
-                <input
-                  type="date"
-                  value={dateRange.end}
-                  onChange={(e) => setDateRange({ ...dateRange, end: e.target.value })}
-                  className="admin-input"
-                />
                 <button
-                  disabled={!dateRange.start || !dateRange.end}
-                  className="btn-admin btn-admin-primary whitespace-nowrap disabled:opacity-50"
+                  onClick={() => handleAction('reindex')}
+                  className="group flex items-center gap-4 p-5 bg-slate-800/40 hover:bg-slate-800/60 border border-slate-700/50 hover:border-cyan-500/30 transition-all duration-300"
                 >
-                  Delete Range
+                  <div className="w-12 h-12 bg-teal-500/10 flex items-center justify-center group-hover:bg-teal-500/20 transition-colors">
+                    <Database className="w-6 h-6 text-teal-400" />
+                  </div>
+                  <div className="text-left">
+                    <p className="font-semibold text-white">Reindex All</p>
+                    <p className="text-sm text-slate-400 mt-0.5">Rebuild search index from scratch</p>
+                  </div>
                 </button>
-              </div>
-            </div>
 
-            {/* Delete by Source Type */}
-            <div>
-              <label className="block text-sm font-medium text-white mb-3">
-                Delete by Source Type
-              </label>
-              <div className="flex gap-3">
-                <select
-                  value={sourceType}
-                  onChange={(e) => setSourceType(e.target.value)}
-                  className="admin-input flex-1"
-                >
-                  <option value="">Select source type</option>
-                  <option value="url">URL</option>
-                  <option value="file">File Upload</option>
-                  <option value="api">API</option>
-                </select>
                 <button
-                  disabled={!sourceType}
-                  className="btn-admin btn-admin-primary whitespace-nowrap disabled:opacity-50"
+                  disabled
+                  className="group flex items-center gap-4 p-5 bg-slate-800/20 border border-slate-700/30 opacity-50 cursor-not-allowed"
                 >
-                  Delete by Type
+                  <div className="w-12 h-12 bg-slate-700/30 flex items-center justify-center">
+                    <Download className="w-6 h-6 text-slate-500" />
+                  </div>
+                  <div className="text-left">
+                    <p className="font-semibold text-slate-400">Export Data</p>
+                    <p className="text-sm text-slate-500 mt-0.5">Coming soon</p>
+                  </div>
+                </button>
+
+                <button
+                  disabled
+                  className="group flex items-center gap-4 p-5 bg-slate-800/20 border border-slate-700/30 opacity-50 cursor-not-allowed"
+                >
+                  <div className="w-12 h-12 bg-slate-700/30 flex items-center justify-center">
+                    <Upload className="w-6 h-6 text-slate-500" />
+                  </div>
+                  <div className="text-left">
+                    <p className="font-semibold text-slate-400">Import Data</p>
+                    <p className="text-sm text-slate-500 mt-0.5">Coming soon</p>
+                  </div>
                 </button>
               </div>
             </div>
           </div>
-        </div>
-      </div>
 
-      {/* Danger Zone */}
-      <div className="danger-zone">
-        <div className="relative z-10">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-10 h-10 rounded-xl bg-red-500/20 flex items-center justify-center">
-              <Shield className="w-5 h-5 text-red-400" />
-            </div>
-            <div>
-              <h3 className="text-lg font-semibold text-red-400">Danger Zone</h3>
-              <p className="text-sm text-red-400/70">
-                Irreversible actions that permanently delete data
-              </p>
+          {/* Bulk Operations */}
+          <div className="admin-card admin-card-glow p-6">
+            <div className="relative z-10">
+              <div className="section-header">
+                <div className="section-header-icon">
+                  <Filter className="w-5 h-5 text-cyan-400" />
+                </div>
+                <h3 className="text-lg font-semibold text-white">Bulk Operations</h3>
+              </div>
+
+              <div className="space-y-6">
+                {/* Delete by Domain */}
+                <div>
+                  <label className="block text-sm font-medium text-white mb-3">
+                    Delete by Domain
+                  </label>
+                  <div className="flex gap-3">
+                    <input
+                      type="text"
+                      value={domainToDelete}
+                      onChange={(e) => setDomainToDelete(e.target.value)}
+                      placeholder="example.com"
+                      className="admin-input flex-1"
+                    />
+                    <button
+                      disabled={!domainToDelete}
+                      className="btn-admin btn-admin-primary whitespace-nowrap disabled:opacity-50"
+                    >
+                      Delete Domain
+                    </button>
+                  </div>
+                </div>
+
+                {/* Delete by Date Range */}
+                <div>
+                  <label className="block text-sm font-medium text-white mb-3">
+                    Delete by Date Range
+                  </label>
+                  <div className="flex flex-wrap gap-3 items-center">
+                    <input
+                      type="date"
+                      value={dateRange.start}
+                      onChange={(e) => setDateRange({ ...dateRange, start: e.target.value })}
+                      className="admin-input"
+                    />
+                    <span className="text-slate-500">to</span>
+                    <input
+                      type="date"
+                      value={dateRange.end}
+                      onChange={(e) => setDateRange({ ...dateRange, end: e.target.value })}
+                      className="admin-input"
+                    />
+                    <button
+                      disabled={!dateRange.start || !dateRange.end}
+                      className="btn-admin btn-admin-primary whitespace-nowrap disabled:opacity-50"
+                    >
+                      Delete Range
+                    </button>
+                  </div>
+                </div>
+
+                {/* Delete by Source Type */}
+                <div>
+                  <label className="block text-sm font-medium text-white mb-3">
+                    Delete by Source Type
+                  </label>
+                  <div className="flex gap-3">
+                    <select
+                      value={sourceType}
+                      onChange={(e) => setSourceType(e.target.value)}
+                      className="admin-input flex-1"
+                    >
+                      <option value="">Select source type</option>
+                      <option value="url">URL</option>
+                      <option value="file">File Upload</option>
+                      <option value="api">API</option>
+                    </select>
+                    <button
+                      disabled={!sourceType}
+                      className="btn-admin btn-admin-primary whitespace-nowrap disabled:opacity-50"
+                    >
+                      Delete by Type
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
-          <div className="flex items-center justify-between p-4 bg-red-500/5 border border-red-500/20 rounded-xl">
-            <div>
-              <p className="font-medium text-white">Clear All Index Data</p>
-              <p className="text-sm text-slate-400 mt-0.5">
-                Permanently delete all documents, chunks, and embeddings
-              </p>
+          {/* Danger Zone */}
+          <div className="danger-zone">
+            <div className="relative z-10">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-10 h-10 bg-red-500/20 flex items-center justify-center">
+                  <Shield className="w-5 h-5 text-red-400" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-red-400">Danger Zone</h3>
+                  <p className="text-sm text-red-400/70">
+                    Irreversible actions that permanently delete data
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between p-4 bg-red-500/5 border border-red-500/20">
+                <div>
+                  <p className="font-medium text-white">Clear All Index Data</p>
+                  <p className="text-sm text-slate-400 mt-0.5">
+                    Permanently delete all documents, chunks, and embeddings
+                  </p>
+                </div>
+                <button
+                  onClick={() => handleAction('clearAll')}
+                  className="btn-admin btn-admin-danger flex items-center gap-2"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Clear All Data
+                </button>
+              </div>
             </div>
-            <button
-              onClick={() => handleAction('clearAll')}
-              className="btn-admin btn-admin-danger flex items-center gap-2"
-            >
-              <Trash2 className="w-4 h-4" />
-              Clear All Data
-            </button>
           </div>
         </div>
-      </div>
+      ) : (
+        <div style={{ height: explorerHeight }}>
+          <DataExplorer />
+        </div>
+      )}
 
       {/* Confirmation Modal */}
       <ConfirmModal
