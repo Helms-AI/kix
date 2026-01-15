@@ -25,6 +25,7 @@
 use kix_parser::EntryChunk;
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, Result as SqliteResult};
 use sqlite_vec::sqlite3_vec_init;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -455,6 +456,38 @@ impl VectorStore {
             |row| row.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// Get chunk counts grouped by chunk_type.
+    ///
+    /// Returns a map of chunk_type -> count (e.g., {"code": 150, "content": 500, ...})
+    pub fn chunk_counts_by_type(&self) -> Result<HashMap<String, usize>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chunk_type, COUNT(*) FROM chunk_metadata GROUP BY chunk_type",
+        )?;
+        let counts = stmt
+            .query_map([], |row| {
+                let chunk_type: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((chunk_type, count as usize))
+            })?
+            .collect::<SqliteResult<HashMap<_, _>>>()?;
+        Ok(counts)
+    }
+
+    /// Get distinct entry IDs that have chunks of a specific type.
+    ///
+    /// Useful for listing all entries that contain code blocks, summaries, etc.
+    pub fn get_entry_ids_with_chunk_type(&self, chunk_type: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT entry_id FROM chunk_metadata WHERE chunk_type = ?",
+        )?;
+        let entry_ids = stmt
+            .query_map([chunk_type], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<String>>>()?;
+        Ok(entry_ids)
     }
 
     /// Clear all chunks (use with caution!).

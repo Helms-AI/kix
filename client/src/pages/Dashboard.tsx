@@ -124,12 +124,12 @@ export default function Dashboard() {
           to="/entries?type=pdf"
         />
         <TypeCard
-          title="Code"
-          value={stats?.code_entries || 0}
+          title="Code Chunks"
+          value={stats?.chunk_stats?.code || 0}
           icon={Code}
           gradient="from-amber-500 to-orange-500"
           hoverBorder="border-amber-500/50"
-          to="/entries?type=code"
+          to="/entries?chunk_type=code"
         />
       </div>
 

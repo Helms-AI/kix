@@ -68,6 +68,7 @@ export const api = {
     category?: string;
     tag?: string;
     entry_type?: string;
+    chunk_type?: string;
     limit?: number;
     offset?: number;
   }) => {
@@ -75,6 +76,7 @@ export const api = {
     if (params?.category) searchParams.set('category', params.category);
     if (params?.tag) searchParams.set('tag', params.tag);
     if (params?.entry_type) searchParams.set('entry_type', params.entry_type);
+    if (params?.chunk_type) searchParams.set('chunk_type', params.chunk_type);
     if (params?.limit) searchParams.set('limit', params.limit.toString());
     if (params?.offset) searchParams.set('offset', params.offset.toString());
     const query = searchParams.toString();

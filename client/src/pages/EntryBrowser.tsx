@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import {
@@ -20,10 +20,14 @@ import {
   Box,
   FileType,
   RefreshCw,
+  Tag,
+  FolderTree,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../api/client';
-import { useEntriesFilters, type ViewMode, type SearchMode, type EntryType } from '../hooks/useEntriesFilters';
+import { useEntriesFilters, type ViewMode, type SearchMode, type EntryType, type GroupByDimension } from '../hooks/useEntriesFilters';
+import { useEntryGroups } from '../hooks/useEntryGroups';
+import { GroupedEntryView } from '../components/GroupedEntryView';
 import type { Entry, SearchResult } from '../types';
 
 // Helper to format dates nicely
@@ -74,6 +78,15 @@ const TYPE_PILLS: { value: EntryType; label: string; icon: React.ReactNode; colo
   { value: 'article', label: 'Article', icon: <FileText className="w-3.5 h-3.5" />, colors: { bg: 'bg-emerald-500/15', text: 'text-emerald-400', border: 'border-emerald-500/30' } },
   { value: 'pdf', label: 'PDF', icon: <FileType className="w-3.5 h-3.5" />, colors: { bg: 'bg-rose-500/15', text: 'text-rose-400', border: 'border-rose-500/30' } },
   { value: 'code', label: 'Code', icon: <Code className="w-3.5 h-3.5" />, colors: { bg: 'bg-amber-500/15', text: 'text-amber-400', border: 'border-amber-500/30' } },
+];
+
+// Group By pill configuration
+const GROUP_BY_PILLS: { value: GroupByDimension; label: string; icon: React.ReactNode; colors: { bg: string; text: string; border: string } }[] = [
+  { value: 'source_domain', label: 'Source', icon: <Globe className="w-3.5 h-3.5" />, colors: { bg: 'bg-teal-500/15', text: 'text-teal-400', border: 'border-teal-500/30' } },
+  { value: 'entry_type', label: 'Type', icon: <FileText className="w-3.5 h-3.5" />, colors: { bg: 'bg-blue-500/15', text: 'text-blue-400', border: 'border-blue-500/30' } },
+  { value: 'source_type', label: 'Format', icon: <FileType className="w-3.5 h-3.5" />, colors: { bg: 'bg-purple-500/15', text: 'text-purple-400', border: 'border-purple-500/30' } },
+  { value: 'tag', label: 'Tag', icon: <Tag className="w-3.5 h-3.5" />, colors: { bg: 'bg-amber-500/15', text: 'text-amber-400', border: 'border-amber-500/30' } },
+  { value: 'none', label: 'None', icon: <List className="w-3.5 h-3.5" />, colors: { bg: 'bg-slate-500/15', text: 'text-slate-400', border: 'border-slate-500/30' } },
 ];
 
 // Domain badge component
@@ -368,6 +381,32 @@ function TypePill({
   );
 }
 
+// Group By pill component
+function GroupByPill({
+  pill,
+  isActive,
+  onClick,
+}: {
+  pill: typeof GROUP_BY_PILLS[0];
+  isActive: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={clsx(
+        'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all whitespace-nowrap border',
+        isActive
+          ? `${pill.colors.bg} ${pill.colors.text} ${pill.colors.border}`
+          : 'bg-slate-800/40 text-slate-500 border-slate-700/30 hover:text-slate-300 hover:bg-slate-800/60 hover:border-slate-700/50'
+      )}
+    >
+      {pill.icon}
+      <span>{pill.label}</span>
+    </button>
+  );
+}
+
 // View mode toggle component
 function ViewModeToggle({ mode, onChange }: { mode: ViewMode; onChange: (mode: ViewMode) => void }) {
   return (
@@ -466,10 +505,12 @@ export default function EntryBrowser() {
 
   // Fetch filtered entries (browse mode)
   const { data: entriesData, isLoading: entriesLoading } = useQuery({
-    queryKey: ['entries', filters.type],
+    queryKey: ['entries', filters.type, filters.chunk_type],
     queryFn: () =>
       api.getEntries({
-        entry_type: filters.type === 'all' ? undefined : filters.type,
+        // When chunk_type is set, use it; otherwise fall back to entry_type
+        entry_type: filters.chunk_type ? undefined : (filters.type === 'all' ? undefined : filters.type),
+        chunk_type: filters.chunk_type || undefined,
       }),
     enabled: !isSearchMode,
   });
@@ -522,6 +563,33 @@ export default function EntryBrowser() {
 
     return result;
   }, [filteredEntries, filters.domain]);
+
+  // Compute groups based on selected groupBy dimension
+  const entryGroups = useEntryGroups(entries, filters.groupBy);
+
+  // Handle clicking on a group to filter to that group
+  const handleGroupClick = useCallback((groupKey: string) => {
+    // Set the appropriate filter based on current groupBy dimension
+    switch (filters.groupBy) {
+      case 'source_domain':
+        setFilter('domain', groupKey);
+        break;
+      case 'entry_type':
+        setFilter('type', groupKey.toLowerCase() as EntryType);
+        break;
+      case 'tag':
+        setFilter('tag', groupKey);
+        break;
+      // source_type filtering would need backend support
+      default:
+        break;
+    }
+  }, [filters.groupBy, setFilter]);
+
+  // Render entry callback for grouped view
+  const renderEntry = useCallback((entry: Entry, viewMode: ViewMode) => {
+    return <EntryCard entry={entry} viewMode={viewMode} />;
+  }, []);
 
   // Handle search submit - triggers semantic search
   const handleSearchSubmit = (e: React.FormEvent) => {
@@ -588,6 +656,24 @@ export default function EntryBrowser() {
             onClick={() => setFilter('type', pill.value)}
           />
         ))}
+      </div>
+
+      {/* Group By Pills */}
+      <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
+          <FolderTree className="w-4 h-4 text-slate-500" />
+          <span className="text-xs font-medium text-slate-500 uppercase tracking-wider">Group by</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          {GROUP_BY_PILLS.map((pill) => (
+            <GroupByPill
+              key={pill.value}
+              pill={pill}
+              isActive={filters.groupBy === pill.value}
+              onClick={() => setFilter('groupBy', pill.value)}
+            />
+          ))}
+        </div>
       </div>
 
       {/* Collapsible Filter Panel */}
@@ -767,24 +853,14 @@ export default function EntryBrowser() {
               </button>
             )}
           </div>
-        ) : filters.view === 'grid' ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {entries.map((entry) => (
-              <EntryCard key={entry.id} entry={entry} viewMode="grid" />
-            ))}
-          </div>
-        ) : filters.view === 'list' ? (
-          <div className="space-y-3">
-            {entries.map((entry) => (
-              <EntryCard key={entry.id} entry={entry} viewMode="list" />
-            ))}
-          </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            {entries.map((entry) => (
-              <EntryCard key={entry.id} entry={entry} viewMode="compact" />
-            ))}
-          </div>
+          <GroupedEntryView
+            groups={entryGroups}
+            groupBy={filters.groupBy}
+            viewMode={filters.view}
+            onGroupClick={handleGroupClick}
+            renderEntry={renderEntry}
+          />
         )}
       </div>
     </div>

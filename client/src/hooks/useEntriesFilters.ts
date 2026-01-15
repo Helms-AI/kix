@@ -4,23 +4,29 @@ import { useCallback, useMemo } from 'react';
 export type SearchMode = 'fts' | 'vector' | 'hybrid';
 export type ViewMode = 'grid' | 'list' | 'compact';
 export type EntryType = 'all' | 'document' | 'article' | 'pdf' | 'code';
+export type ChunkTypeFilter = '' | 'code' | 'content' | 'summary' | 'header';
+export type GroupByDimension = 'source_domain' | 'entry_type' | 'source_type' | 'tag' | 'none';
 
 export interface EntriesFilters {
   q: string;
   type: EntryType;
+  chunk_type: ChunkTypeFilter;
   mode: SearchMode;
   view: ViewMode;
   domain: string;
   tag: string;
+  groupBy: GroupByDimension;
 }
 
 const DEFAULT_FILTERS: EntriesFilters = {
   q: '',
   type: 'all',
+  chunk_type: '',
   mode: 'hybrid',
   view: 'grid',
   domain: '',
   tag: '',
+  groupBy: 'source_domain',
 };
 
 export function useEntriesFilters() {
@@ -29,10 +35,12 @@ export function useEntriesFilters() {
   const filters: EntriesFilters = useMemo(() => ({
     q: searchParams.get('q') || DEFAULT_FILTERS.q,
     type: (searchParams.get('type') as EntryType) || DEFAULT_FILTERS.type,
+    chunk_type: (searchParams.get('chunk_type') as ChunkTypeFilter) || DEFAULT_FILTERS.chunk_type,
     mode: (searchParams.get('mode') as SearchMode) || DEFAULT_FILTERS.mode,
     view: (searchParams.get('view') as ViewMode) || DEFAULT_FILTERS.view,
     domain: searchParams.get('domain') || DEFAULT_FILTERS.domain,
     tag: searchParams.get('tag') || DEFAULT_FILTERS.tag,
+    groupBy: (searchParams.get('groupBy') as GroupByDimension) || DEFAULT_FILTERS.groupBy,
   }), [searchParams]);
 
   const setFilter = useCallback(<K extends keyof EntriesFilters>(
@@ -82,6 +90,7 @@ export function useEntriesFilters() {
     return (
       filters.q !== '' ||
       filters.type !== 'all' ||
+      filters.chunk_type !== '' ||
       filters.domain !== '' ||
       filters.tag !== ''
     );
@@ -91,6 +100,7 @@ export function useEntriesFilters() {
     let count = 0;
     if (filters.q) count++;
     if (filters.type !== 'all') count++;
+    if (filters.chunk_type) count++;
     if (filters.domain) count++;
     if (filters.tag) count++;
     return count;

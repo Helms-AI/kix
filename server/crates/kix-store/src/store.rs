@@ -366,6 +366,24 @@ impl KixStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Get chunk counts grouped by chunk_type.
+    ///
+    /// Returns a map of chunk_type -> count (e.g., {"code": 150, "content": 500, ...})
+    pub fn chunk_counts_by_type(&self) -> Result<std::collections::HashMap<String, usize>, StoreError> {
+        self.vectors
+            .chunk_counts_by_type()
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Get distinct entry IDs that have chunks of a specific type.
+    ///
+    /// Useful for listing all entries that contain code blocks, summaries, etc.
+    pub fn get_entry_ids_with_chunk_type(&self, chunk_type: &str) -> Result<Vec<String>, StoreError> {
+        self.vectors
+            .get_entry_ids_with_chunk_type(chunk_type)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     // =========================================================================
     // Two-Layer Storage
     // =========================================================================

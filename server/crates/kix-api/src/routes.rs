@@ -86,6 +86,21 @@ pub fn create_router(state: AppState) -> Router {
 
 // === Response Types ===
 
+/// Chunk type statistics for dashboard.
+#[derive(Serialize)]
+pub struct ChunkTypeStats {
+    /// Total number of chunks across all types
+    pub total: usize,
+    /// Number of code block chunks
+    pub code: usize,
+    /// Number of content chunks
+    pub content: usize,
+    /// Number of summary chunks
+    pub summary: usize,
+    /// Number of header chunks
+    pub header: usize,
+}
+
 /// Dashboard statistics response.
 #[derive(Serialize)]
 pub struct StatsResponse {
@@ -97,6 +112,8 @@ pub struct StatsResponse {
     pub total_chunks: usize,
     pub total_documents: usize,
     pub categories: Vec<CategoryCount>,
+    /// Chunk statistics grouped by type
+    pub chunk_stats: ChunkTypeStats,
 }
 
 /// Category count for stats.
@@ -276,6 +293,8 @@ pub struct HealthResponse {
 pub struct ListEntriesQuery {
     pub category: Option<String>,
     pub entry_type: Option<String>,
+    /// Filter entries by chunk type (e.g., "code" to find entries containing code blocks)
+    pub chunk_type: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -360,9 +379,22 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
         .map(|(name, count)| CategoryCount { name, count })
         .collect();
 
-    // Get total chunks (estimate from entry count * avg chunks per entry)
-    let total_chunks = all_entries.len() * 3; // Rough estimate
+    // Get actual chunk counts by type
+    let chunk_type_counts = store.chunk_counts_by_type().map_err(|e| {
+        error!("Failed to get chunk type stats: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let total_chunks: usize = chunk_type_counts.values().sum();
     let total_documents = all_entries.len();
+
+    let chunk_stats = ChunkTypeStats {
+        total: total_chunks,
+        code: *chunk_type_counts.get("code").unwrap_or(&0),
+        content: *chunk_type_counts.get("content").unwrap_or(&0),
+        summary: *chunk_type_counts.get("summary").unwrap_or(&0),
+        header: *chunk_type_counts.get("header").unwrap_or(&0),
+    };
 
     Ok(Json(StatsResponse {
         total_entries: all_entries.len(),
@@ -373,6 +405,7 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
         total_chunks,
         total_documents,
         categories,
+        chunk_stats,
     }))
 }
 
@@ -382,13 +415,30 @@ async fn list_entries(
     Query(query): Query<ListEntriesQuery>,
 ) -> Result<Json<EntryListResponse>, StatusCode> {
     info!(
-        "Listing entries - category: {:?}, type: {:?}",
-        query.category, query.entry_type
+        "Listing entries - category: {:?}, type: {:?}, chunk_type: {:?}",
+        query.category, query.entry_type, query.chunk_type
     );
 
     let store = state.store.read().await;
 
-    let patterns = if let Some(ref category) = query.category {
+    let patterns = if let Some(ref chunk_type) = query.chunk_type {
+        // Get entry IDs that have this chunk type
+        let entry_ids = store
+            .get_entry_ids_with_chunk_type(chunk_type)
+            .map_err(|e| {
+                error!("Failed to get entry IDs with chunk type {}: {}", chunk_type, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Fetch those entries
+        let mut entries = Vec::new();
+        for id in entry_ids {
+            if let Ok(Some(pattern)) = store.get_pattern_by_id(&id).await {
+                entries.push(pattern);
+            }
+        }
+        entries
+    } else if let Some(ref category) = query.category {
         store
             .list_by_category(category)
             .await

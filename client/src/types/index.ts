@@ -1,4 +1,19 @@
 // API response types
+
+/** Chunk type statistics for dashboard */
+export interface ChunkTypeStats {
+  /** Total number of chunks across all types */
+  total: number;
+  /** Number of code block chunks */
+  code: number;
+  /** Number of content chunks */
+  content: number;
+  /** Number of summary chunks */
+  summary: number;
+  /** Number of header chunks */
+  header: number;
+}
+
 export interface StatsResponse {
   total_entries: number;
   document_entries: number;
@@ -8,6 +23,8 @@ export interface StatsResponse {
   total_chunks: number;
   total_documents: number;
   categories: CategoryCount[];
+  /** Chunk statistics grouped by type */
+  chunk_stats: ChunkTypeStats;
 }
 
 export interface CategoryCount {
