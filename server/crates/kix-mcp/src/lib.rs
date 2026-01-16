@@ -2,7 +2,7 @@
 //!
 //! This crate provides an MCP server that exposes search and retrieval
 //! tools to AI assistants, plus project management tools for AI-assisted
-//! project planning with GitHub integration.
+//! project planning.
 
 pub mod error;
 pub mod project_tools;

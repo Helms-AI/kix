@@ -26,10 +26,6 @@ pub enum ServiceError {
     #[error("Store error: {0}")]
     Store(#[from] StoreError),
 
-    /// GitHub API error.
-    #[error("GitHub error: {0}")]
-    GitHub(String),
-
     /// Authentication/authorization error.
     #[error("Auth error: {0}")]
     Auth(String),
@@ -61,7 +57,6 @@ impl From<&ServiceError> for StatusCode {
             ServiceError::NotFound(_) => StatusCode::NOT_FOUND,
             ServiceError::Validation(_) => StatusCode::BAD_REQUEST,
             ServiceError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServiceError::GitHub(_) => StatusCode::BAD_GATEWAY,
             ServiceError::Auth(_) => StatusCode::UNAUTHORIZED,
             ServiceError::External(_) => StatusCode::BAD_GATEWAY,
             ServiceError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -103,11 +98,6 @@ impl ServiceError {
         Self::Validation(format!("Invalid {}: {}", field, reason))
     }
 
-    /// Create a GitHub API error.
-    pub fn github(message: impl Into<String>) -> Self {
-        Self::GitHub(message.into())
-    }
-
     /// Create an internal error.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
@@ -143,12 +133,6 @@ mod tests {
     fn test_validation_to_status_code() {
         let err = ServiceError::invalid_field("name", "cannot be empty");
         assert_eq!(StatusCode::from(&err), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn test_github_to_status_code() {
-        let err = ServiceError::github("Rate limit exceeded");
-        assert_eq!(StatusCode::from(&err), StatusCode::BAD_GATEWAY);
     }
 
     #[test]

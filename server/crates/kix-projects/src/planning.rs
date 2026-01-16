@@ -211,9 +211,6 @@ pub struct ProjectContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// GitHub repository
-    pub github_repo: String,
-
     /// Linked knowledge entries
     pub knowledge: Vec<KnowledgeReference>,
 

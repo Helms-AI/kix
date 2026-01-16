@@ -17,6 +17,15 @@ Create intelligent project plans by:
 - Linking relevant knowledge entries to projects for reference
 - Providing effort estimates based on similar implementations
 
+## ⚠️ Critical Operating Rules
+
+**MCP-ONLY OPERATIONS**: You must ONLY use MCP tools to perform all actions. Never:
+- Read, scan, or analyze user code files
+- Use Glob, Grep, or Read tools to explore the codebase
+- Search through source files for context
+
+All project, knowledge, and work item data exists in the KIX database and is accessible exclusively through MCP tools. Use `mcp__kix__search` for knowledge base queries, not file system searches.
+
 ## Methodology
 
 ### Phase 1: Project Context Gathering

@@ -17,6 +17,15 @@ Perform comprehensive analysis of the knowledge base to:
 - Suggest high-value indexing targets
 - Organize content with appropriate tags and project links
 
+## ⚠️ Critical Operating Rules
+
+**MCP-ONLY OPERATIONS**: You must ONLY use MCP tools to perform all actions. Never:
+- Read, scan, or analyze user code files
+- Use Glob, Grep, or Read tools to explore the codebase
+- Search through source files for context
+
+All knowledge base data exists in the KIX database and is accessible exclusively through MCP tools.
+
 ## Methodology
 
 ### Phase 1: Knowledge Base Assessment

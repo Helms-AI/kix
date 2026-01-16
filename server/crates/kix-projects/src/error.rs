@@ -17,26 +17,6 @@ pub enum ProjectError {
     #[error("Issue not found: project={project}, issue={issue}")]
     IssueNotFound { project: String, issue: String },
 
-    /// GitHub repository required but not configured
-    #[error("GitHub repository required for this operation")]
-    GitHubRepoRequired,
-
-    /// GitHub token not found
-    #[error("GitHub token not found for project: {0}")]
-    GitHubTokenNotFound(String),
-
-    /// GitHub API error
-    #[error("GitHub API error: {0}")]
-    GitHubApi(String),
-
-    /// GitHub GraphQL error
-    #[error("GitHub GraphQL error: {message}")]
-    GitHubGraphQL { message: String },
-
-    /// General GitHub error (REST or GraphQL)
-    #[error("GitHub error: {0}")]
-    GitHub(String),
-
     /// Token storage error
     #[error("Token storage error: {0}")]
     TokenStorage(String),
@@ -70,7 +50,7 @@ impl From<anyhow::Error> for ProjectError {
 
 impl From<reqwest::Error> for ProjectError {
     fn from(err: reqwest::Error) -> Self {
-        ProjectError::GitHubApi(err.to_string())
+        ProjectError::Internal(format!("HTTP error: {}", err))
     }
 }
 

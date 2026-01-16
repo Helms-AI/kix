@@ -95,10 +95,6 @@ pub struct IssueSearchResult {
 
     /// Search score (relevance)
     pub score: f32,
-
-    /// GitHub URL (if synced)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub github_url: Option<String>,
 }
 
 /// A knowledge entry search result.
@@ -342,7 +338,6 @@ mod tests {
                 state: "open".to_string(),
                 labels: vec![],
                 score: 0.8,
-                github_url: None,
             },
             IssueSearchResult {
                 id: "2".to_string(),
@@ -352,7 +347,6 @@ mod tests {
                 state: "open".to_string(),
                 labels: vec![],
                 score: 0.5,
-                github_url: None,
             },
         ]);
 
@@ -393,7 +387,6 @@ mod tests {
                 state: "open".to_string(),
                 labels: vec![],
                 score: 0.8,
-                github_url: None,
             },
             IssueSearchResult {
                 id: "2".to_string(),
@@ -403,7 +396,6 @@ mod tests {
                 state: "open".to_string(),
                 labels: vec![],
                 score: 0.5,
-                github_url: None,
             },
         ]);
 

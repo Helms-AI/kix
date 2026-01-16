@@ -39,16 +39,6 @@ pub enum ProjectEventType {
     EntryLinked,
     /// Knowledge entry was unlinked
     EntryUnlinked,
-    /// GitHub sync started
-    GitHubSyncStarted,
-    /// GitHub sync completed successfully
-    GitHubSyncCompleted,
-    /// GitHub sync failed
-    GitHubSyncFailed,
-    /// GitHub project created
-    GitHubProjectCreated,
-    /// Issue added to GitHub project
-    IssueAddedToProject,
 }
 
 impl std::fmt::Display for ProjectEventType {
@@ -66,11 +56,6 @@ impl std::fmt::Display for ProjectEventType {
             Self::IssueReopened => write!(f, "issue.reopened"),
             Self::EntryLinked => write!(f, "entry.linked"),
             Self::EntryUnlinked => write!(f, "entry.unlinked"),
-            Self::GitHubSyncStarted => write!(f, "github.sync.started"),
-            Self::GitHubSyncCompleted => write!(f, "github.sync.completed"),
-            Self::GitHubSyncFailed => write!(f, "github.sync.failed"),
-            Self::GitHubProjectCreated => write!(f, "github.project.created"),
-            Self::IssueAddedToProject => write!(f, "issue.added_to_project"),
         }
     }
 }
@@ -267,48 +252,6 @@ impl ProjectEventBus {
     pub fn entry_unlinked(&self, project_id: &str, entry_id: &str) {
         self.emit_with_resource(ProjectEventType::EntryUnlinked, project_id, entry_id);
     }
-
-    /// Emit GitHub sync started event.
-    pub fn github_sync_started(&self, project_id: &str) {
-        self.emit(ProjectEventType::GitHubSyncStarted, project_id);
-    }
-
-    /// Emit GitHub sync completed event.
-    pub fn github_sync_completed(&self, project_id: &str, created: usize, updated: usize) {
-        self.publish(
-            ProjectEvent::new(ProjectEventType::GitHubSyncCompleted, project_id)
-                .with_data(serde_json::json!({
-                    "created": created,
-                    "updated": updated,
-                })),
-        );
-    }
-
-    /// Emit GitHub sync failed event.
-    pub fn github_sync_failed(&self, project_id: &str, error: &str) {
-        self.publish(
-            ProjectEvent::new(ProjectEventType::GitHubSyncFailed, project_id)
-                .with_data(serde_json::json!({ "error": error })),
-        );
-    }
-
-    /// Emit GitHub project created event.
-    pub fn github_project_created(&self, project_id: &str, gh_project_id: &str, title: &str) {
-        self.publish(
-            ProjectEvent::new(ProjectEventType::GitHubProjectCreated, project_id)
-                .with_resource(gh_project_id)
-                .with_data(serde_json::json!({ "title": title })),
-        );
-    }
-
-    /// Emit issue added to GitHub project event.
-    pub fn issue_added_to_project(&self, project_id: &str, issue_id: &str, gh_project_id: &str) {
-        self.publish(
-            ProjectEvent::new(ProjectEventType::IssueAddedToProject, project_id)
-                .with_resource(issue_id)
-                .with_data(serde_json::json!({ "github_project_id": gh_project_id })),
-        );
-    }
 }
 
 #[cfg(test)]
@@ -319,7 +262,7 @@ mod tests {
     fn test_event_type_display() {
         assert_eq!(ProjectEventType::ProjectCreated.to_string(), "project.created");
         assert_eq!(ProjectEventType::IssueUpdated.to_string(), "issue.updated");
-        assert_eq!(ProjectEventType::GitHubSyncCompleted.to_string(), "github.sync.completed");
+        assert_eq!(ProjectEventType::EntryLinked.to_string(), "entry.linked");
     }
 
     #[test]

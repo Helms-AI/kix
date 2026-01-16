@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Project management system for Kix with GitHub integration"
+description = "Project management system for Kix"
 
 [dependencies]
 # Internal crates
@@ -29,7 +29,7 @@ anyhow = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
-# HTTP client for GitHub API
+# HTTP client
 reqwest = { workspace = true }
 
 # Date/time

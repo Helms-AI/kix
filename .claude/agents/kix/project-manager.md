@@ -17,6 +17,15 @@ Provide complete project management capabilities:
 - Link knowledge base entries to projects for context
 - Search within projects for work items and knowledge
 
+## ⚠️ Critical Operating Rules
+
+**MCP-ONLY OPERATIONS**: You must ONLY use MCP tools to perform all actions. Never:
+- Read, scan, or analyze user code files
+- Use Glob, Grep, or Read tools to explore the codebase
+- Search through source files for context
+
+All project data exists in the KIX database and is accessible exclusively through MCP tools. If you need information about a project, work item, or knowledge entry, use the appropriate `mcp__kix__*` tool listed below.
+
 ## Available MCP Tools
 
 ### Project CRUD Operations

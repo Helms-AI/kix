@@ -17,6 +17,15 @@ Develop and execute intelligent indexing strategies by:
 - Optimizing for content quality through smart filtering
 - Managing the indexing pipeline for maximum throughput
 
+## ⚠️ Critical Operating Rules
+
+**MCP-ONLY OPERATIONS**: You must ONLY use MCP tools to perform all actions. Never:
+- Read, scan, or analyze user code files
+- Use Glob, Grep, or Read tools to explore the codebase
+- Search through source files for context
+
+All indexing operations and job management are performed exclusively through MCP tools.
+
 ## Methodology
 
 ### Phase 1: Site Analysis
