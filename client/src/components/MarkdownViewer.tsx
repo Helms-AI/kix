@@ -33,10 +33,14 @@ export default function MarkdownViewer({
   return (
     <div className={clsx('relative group', className)}>
       {/* Mode Toggle - Compact pill design */}
-      <div className="absolute -top-1 right-0 z-10 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
+      <div
+        className="absolute top-0 right-0 z-20 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200"
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center bg-slate-800/90 backdrop-blur-sm rounded-full p-0.5 border border-slate-700/50 shadow-lg shadow-black/20">
           <button
-            onClick={() => setViewMode('rendered')}
+            onClick={(e) => { e.stopPropagation(); setViewMode('rendered'); }}
             className={clsx(
               'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-all duration-200',
               viewMode === 'rendered'
@@ -50,7 +54,7 @@ export default function MarkdownViewer({
             <span className="sr-only sm:not-sr-only">View</span>
           </button>
           <button
-            onClick={() => setViewMode('code')}
+            onClick={(e) => { e.stopPropagation(); setViewMode('code'); }}
             className={clsx(
               'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-all duration-200',
               viewMode === 'code'

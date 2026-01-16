@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -15,10 +15,15 @@ import {
   Trash2,
   Clock,
   Edit3,
-  X,
   BookOpen,
   Link2,
+  Zap,
+  Bug,
+  Layers,
+  ListTodo,
+  ChevronRight,
 } from 'lucide-react';
+import MarkdownViewer from '../../components/MarkdownViewer';
 import clsx from 'clsx';
 import { projectApi, formatRelativeTime, getPriorityColor } from '../../api/projectClient';
 import type {
@@ -59,8 +64,25 @@ function StateIcon({ state }: { state: WorkItemState }) {
   }
 }
 
-// Create/Edit Work Item Modal
-function WorkItemModal({
+// Work Item Type Icons
+function WorkItemTypeIcon({ type, className }: { type: WorkItemType; className?: string }) {
+  const iconClass = className || 'w-4 h-4';
+  switch (type) {
+    case 'epic':
+      return <Zap className={clsx(iconClass, 'text-purple-400')} />;
+    case 'story':
+      return <BookOpen className={clsx(iconClass, 'text-emerald-400')} />;
+    case 'bug':
+      return <Bug className={clsx(iconClass, 'text-red-400')} />;
+    case 'subtask':
+      return <Layers className={clsx(iconClass, 'text-slate-400')} />;
+    default:
+      return <ListTodo className={clsx(iconClass, 'text-cyan-400')} />;
+  }
+}
+
+// Slide-Over Panel for Work Item Create/Edit
+function WorkItemSlideOver({
   isOpen,
   onClose,
   projectId,
@@ -83,11 +105,47 @@ function WorkItemModal({
     item_type: item?.item_type || 'task',
   });
   const [error, setError] = useState<string | null>(null);
+  const [isEditingBody, setIsEditingBody] = useState(!item?.body);
+
+  // Reset form when item changes
+  useEffect(() => {
+    if (isOpen) {
+      setFormData({
+        title: item?.title || '',
+        body: item?.body || '',
+        state: item?.state || 'open',
+        priority: item?.priority,
+        labels: item?.labels || [],
+        item_type: item?.item_type || 'task',
+      });
+      setIsEditingBody(!item?.body);
+      setError(null);
+    }
+  }, [isOpen, item]);
+
+  // ESC key handler
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      onClose();
+    }
+  }, [onClose]);
+
+  useEffect(() => {
+    if (isOpen) {
+      document.addEventListener('keydown', handleKeyDown);
+      document.body.style.overflow = 'hidden';
+    }
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      document.body.style.overflow = '';
+    };
+  }, [isOpen, handleKeyDown]);
 
   const createMutation = useMutation({
     mutationFn: (data: CreateWorkItemRequest) => projectApi.createWorkItem(projectId, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project', projectId, 'items'] });
+      queryClient.invalidateQueries({ queryKey: ['project', projectId, 'board'] });
       queryClient.invalidateQueries({ queryKey: ['project', projectId] });
       onClose();
     },
@@ -99,13 +157,22 @@ function WorkItemModal({
       projectApi.updateWorkItem(projectId, item!.id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project', projectId, 'items'] });
+      queryClient.invalidateQueries({ queryKey: ['project', projectId, 'board'] });
       queryClient.invalidateQueries({ queryKey: ['project', projectId] });
       onClose();
     },
     onError: (err) => setError(err instanceof Error ? err.message : 'Failed to update work item'),
   });
 
-  if (!isOpen) return null;
+  const deleteMutation = useMutation({
+    mutationFn: () => projectApi.deleteWorkItem(projectId, item!.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['project', projectId, 'items'] });
+      queryClient.invalidateQueries({ queryKey: ['project', projectId, 'board'] });
+      queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+      onClose();
+    },
+  });
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -119,135 +186,237 @@ function WorkItemModal({
   const isPending = createMutation.isPending || updateMutation.isPending;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-2xl mx-4 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl max-h-[90vh] overflow-y-auto">
-        <div className="sticky top-0 p-6 border-b border-slate-800 bg-slate-900/95 backdrop-blur z-10">
-          <div className="flex items-center justify-between">
-            <h2 className="text-xl font-semibold text-white">
-              {isEdit ? 'Edit Work Item' : 'Create Work Item'}
-            </h2>
+    <>
+      {/* Backdrop */}
+      <div
+        className={clsx(
+          'fixed inset-0 z-40 bg-black/50 backdrop-blur-sm transition-opacity duration-300',
+          isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        )}
+        onClick={onClose}
+        aria-hidden="true"
+      />
+
+      {/* Slide-Over Panel */}
+      <div
+        className={clsx(
+          'fixed inset-y-0 right-0 z-50 flex flex-col',
+          'w-full sm:w-[50vw] lg:w-[42vw] xl:max-w-2xl',
+          'bg-gradient-to-b from-slate-900 via-slate-900 to-slate-950',
+          'border-l border-slate-800/80',
+          'shadow-2xl shadow-black/50',
+          'transition-transform duration-300 ease-out',
+          isOpen ? 'translate-x-0' : 'translate-x-full'
+        )}
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800/80 bg-slate-900/80 backdrop-blur-sm">
+          <div className="flex items-center gap-3">
             <button
               onClick={onClose}
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700"
+              className="p-1.5 -ml-1.5 rounded-lg text-slate-500 hover:text-white hover:bg-slate-800 transition-colors"
+              aria-label="Close panel"
             >
-              <X className="w-5 h-5" />
+              <ChevronRight className="w-5 h-5" />
             </button>
+
+            <div className="flex items-center gap-2">
+              <WorkItemTypeIcon type={formData.item_type || 'task'} className="w-5 h-5" />
+              <span className="text-sm font-medium text-slate-300">
+                {isEdit ? (
+                  <>
+                    <span className="text-slate-500">#</span>
+                    {item?.number}
+                  </>
+                ) : (
+                  'New Work Item'
+                )}
+              </span>
+            </div>
           </div>
+
+          {isEdit && (
+            <button
+              onClick={() => {
+                if (confirm('Delete this work item? This cannot be undone.')) {
+                  deleteMutation.mutate();
+                }
+              }}
+              disabled={deleteMutation.isPending}
+              className="p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+              aria-label="Delete work item"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          )}
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 space-y-5">
-          {error && (
-            <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
-              {error}
-            </div>
-          )}
-
-          <div>
-            <label className="block text-sm font-medium text-slate-300 mb-2">Title</label>
-            <input
-              type="text"
-              value={formData.title}
-              onChange={(e) => setFormData({ ...formData, title: e.target.value })}
-              className="w-full px-4 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500"
-              placeholder="Work item title..."
-              required
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-slate-300 mb-2">Description</label>
-            <textarea
-              value={formData.body || ''}
-              onChange={(e) => setFormData({ ...formData, body: e.target.value })}
-              className="w-full px-4 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 resize-none"
-              placeholder="Describe the work item..."
-              rows={6}
-            />
-          </div>
-
-          <div className="grid grid-cols-3 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">Type</label>
-              <select
-                value={formData.item_type}
-                onChange={(e) =>
-                  setFormData({ ...formData, item_type: e.target.value as WorkItemType })
-                }
-                className="w-full px-4 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500"
-              >
-                <option value="task">Task</option>
-                <option value="story">Story</option>
-                <option value="epic">Epic</option>
-                <option value="bug">Bug</option>
-                <option value="subtask">Subtask</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">State</label>
-              <select
-                value={formData.state}
-                onChange={(e) =>
-                  setFormData({ ...formData, state: e.target.value as WorkItemState })
-                }
-                className="w-full px-4 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500"
-              >
-                <option value="open">Open</option>
-                <option value="in_progress">In Progress</option>
-                <option value="blocked">Blocked</option>
-                <option value="closed">Closed</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">Priority</label>
-              <select
-                value={formData.priority || ''}
-                onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    priority: e.target.value ? (e.target.value as WorkItemPriority) : undefined,
-                  })
-                }
-                className="w-full px-4 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500"
-              >
-                <option value="">No priority</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="critical">Critical</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="flex justify-end gap-3 pt-4">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-sm font-medium text-slate-400 hover:text-white"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={isPending}
-              className="px-4 py-2 text-sm font-medium bg-cyan-500 text-white rounded-lg hover:bg-cyan-400 disabled:opacity-50 flex items-center gap-2"
-            >
-              {isPending ? (
-                <>
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                  {isEdit ? 'Saving...' : 'Creating...'}
-                </>
-              ) : (
-                <>
-                  {isEdit ? <Edit3 className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-                  {isEdit ? 'Save Changes' : 'Create Work Item'}
-                </>
+        {/* Scrollable Content */}
+        <form onSubmit={handleSubmit} className="flex-1 flex flex-col overflow-hidden">
+          <div className="flex-1 overflow-y-auto">
+            <div className="p-6 space-y-6">
+              {/* Error Message */}
+              {error && (
+                <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  {error}
+                </div>
               )}
-            </button>
+
+              {/* Title */}
+              <div>
+                <input
+                  type="text"
+                  value={formData.title}
+                  onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                  className="w-full px-0 py-2 bg-transparent border-0 border-b-2 border-slate-700/50 text-xl font-semibold text-white placeholder-slate-600 focus:border-cyan-500 focus:ring-0 transition-colors"
+                  placeholder="Work item title..."
+                  required
+                  autoFocus={!isEdit}
+                />
+              </div>
+
+              {/* Metadata Row */}
+              <div className="flex flex-wrap gap-3">
+                {/* Type */}
+                <div className="flex-1 min-w-[120px]">
+                  <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider mb-1.5">
+                    Type
+                  </label>
+                  <select
+                    value={formData.item_type}
+                    onChange={(e) =>
+                      setFormData({ ...formData, item_type: e.target.value as WorkItemType })
+                    }
+                    className="w-full px-3 py-2 bg-slate-800/50 border border-slate-700/50 rounded-lg text-sm text-white focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30 transition-colors"
+                  >
+                    <option value="task">Task</option>
+                    <option value="story">Story</option>
+                    <option value="epic">Epic</option>
+                    <option value="bug">Bug</option>
+                    <option value="subtask">Subtask</option>
+                  </select>
+                </div>
+
+                {/* State */}
+                <div className="flex-1 min-w-[120px]">
+                  <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider mb-1.5">
+                    State
+                  </label>
+                  <select
+                    value={formData.state}
+                    onChange={(e) =>
+                      setFormData({ ...formData, state: e.target.value as WorkItemState })
+                    }
+                    className="w-full px-3 py-2 bg-slate-800/50 border border-slate-700/50 rounded-lg text-sm text-white focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30 transition-colors"
+                  >
+                    <option value="open">Open</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="blocked">Blocked</option>
+                    <option value="closed">Closed</option>
+                  </select>
+                </div>
+
+                {/* Priority */}
+                <div className="flex-1 min-w-[120px]">
+                  <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider mb-1.5">
+                    Priority
+                  </label>
+                  <select
+                    value={formData.priority || ''}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        priority: e.target.value ? (e.target.value as WorkItemPriority) : undefined,
+                      })
+                    }
+                    className="w-full px-3 py-2 bg-slate-800/50 border border-slate-700/50 rounded-lg text-sm text-white focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30 transition-colors"
+                  >
+                    <option value="">None</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="critical">Critical</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Description */}
+              <div>
+                <label className="block text-xs font-medium text-slate-500 uppercase tracking-wider mb-2">
+                  Description
+                </label>
+                {isEditingBody ? (
+                  <textarea
+                    value={formData.body || ''}
+                    onChange={(e) => setFormData({ ...formData, body: e.target.value })}
+                    onBlur={() => formData.body && setIsEditingBody(false)}
+                    autoFocus
+                    className="w-full px-4 py-3 bg-slate-800/50 border border-slate-700/50 rounded-lg text-sm text-white placeholder-slate-600 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30 resize-none transition-colors font-mono"
+                    placeholder="Describe the work item... (Markdown supported)"
+                    rows={12}
+                  />
+                ) : (
+                  <div
+                    onClick={() => setIsEditingBody(true)}
+                    className="w-full min-h-[200px] px-4 py-3 bg-slate-800/30 border border-slate-700/30 rounded-lg cursor-text hover:bg-slate-800/50 hover:border-slate-600/50 transition-all group"
+                  >
+                    {formData.body ? (
+                      <MarkdownViewer content={formData.body} />
+                    ) : (
+                      <p className="text-slate-600 text-sm italic">
+                        Click to add description...
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Footer */}
+          <div className="flex items-center justify-between gap-4 px-6 py-4 border-t border-slate-800/80 bg-slate-900/80 backdrop-blur-sm">
+            <span className="text-xs text-slate-600">
+              Press <kbd className="px-1.5 py-0.5 bg-slate-800 rounded text-slate-400 font-mono">Esc</kbd> to close
+            </span>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-4 py-2 text-sm font-medium text-slate-400 hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isPending || !formData.title.trim()}
+                className={clsx(
+                  'px-5 py-2 text-sm font-medium rounded-lg transition-all',
+                  'bg-cyan-500 text-white hover:bg-cyan-400',
+                  'disabled:opacity-50 disabled:cursor-not-allowed',
+                  'flex items-center gap-2',
+                  'shadow-lg shadow-cyan-500/20 hover:shadow-cyan-500/30'
+                )}
+              >
+                {isPending ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    {isEdit ? 'Saving...' : 'Creating...'}
+                  </>
+                ) : (
+                  <>
+                    {isEdit ? <Edit3 className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                    {isEdit ? 'Save Changes' : 'Create'}
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </form>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -354,10 +523,16 @@ function WorkItemRow({
 }
 
 // Work Items Tab Content with Board/List View Toggle
-function WorkItemsTab({ project }: { project: Project }) {
+function WorkItemsTab({
+  project,
+  onCreateItem,
+  onEditItem,
+}: {
+  project: Project;
+  onCreateItem: () => void;
+  onEditItem: (item: WorkItem) => void;
+}) {
   const queryClient = useQueryClient();
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [editingItem, setEditingItem] = useState<WorkItem | undefined>();
   const [stateFilter, setStateFilter] = useState<string>('');
   const [viewMode, setViewMode] = useState<'board' | 'list'>('board'); // Default to board
 
@@ -388,12 +563,12 @@ function WorkItemsTab({ project }: { project: Project }) {
 
   // Handle card click in board view
   const handleCardClick = (item: WorkItem) => {
-    setEditingItem(item);
+    onEditItem(item);
   };
 
   // Handle add card from board
   const handleAddCard = (_column: BoardColumn, _itemType?: WorkItemType) => {
-    setShowCreateModal(true);
+    onCreateItem();
     // Could pre-fill the column and type in the modal
   };
 
@@ -416,7 +591,7 @@ function WorkItemsTab({ project }: { project: Project }) {
           columnCounts={columnCounts as Record<BoardColumn, number>}
           viewMode={viewMode}
           onViewModeChange={setViewMode}
-          onCreateItem={() => setShowCreateModal(true)}
+          onCreateItem={() => onCreateItem()}
           onRefresh={handleBoardUpdate}
           isLoading={isBoardLoading}
         />
@@ -454,7 +629,7 @@ function WorkItemsTab({ project }: { project: Project }) {
             </select>
           </div>
           <button
-            onClick={() => setShowCreateModal(true)}
+            onClick={() => onCreateItem()}
             className="flex items-center gap-2 px-3 py-1.5 bg-cyan-500 text-white rounded-lg hover:bg-cyan-400 text-sm font-medium"
           >
             <Plus className="w-4 h-4" />
@@ -503,7 +678,7 @@ function WorkItemsTab({ project }: { project: Project }) {
                     key={item.id}
                     item={item}
                     projectId={project.id}
-                    onEdit={(item) => setEditingItem(item)}
+                    onEdit={(item) => onEditItem(item)}
                   />
                 ))}
               </div>
@@ -512,7 +687,7 @@ function WorkItemsTab({ project }: { project: Project }) {
                 <AlertCircle className="w-12 h-12 text-slate-600 mx-auto mb-4" />
                 <p className="text-slate-400">No work items found</p>
                 <button
-                  onClick={() => setShowCreateModal(true)}
+                  onClick={() => onCreateItem()}
                   className="mt-4 text-cyan-400 hover:text-cyan-300 text-sm"
                 >
                   Create the first work item
@@ -523,20 +698,6 @@ function WorkItemsTab({ project }: { project: Project }) {
         )}
       </div>
 
-      {/* Modals */}
-      <WorkItemModal
-        isOpen={showCreateModal}
-        onClose={() => setShowCreateModal(false)}
-        projectId={project.id}
-      />
-      {editingItem && (
-        <WorkItemModal
-          isOpen={true}
-          onClose={() => setEditingItem(undefined)}
-          projectId={project.id}
-          item={editingItem}
-        />
-      )}
     </div>
   );
 }
@@ -671,6 +832,8 @@ function SettingsTab({ project }: { project: Project }) {
 export default function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const [activeTab, setActiveTab] = useState<TabId>('items');
+  const [showCreatePanel, setShowCreatePanel] = useState(false);
+  const [editingItem, setEditingItem] = useState<WorkItem | undefined>();
 
   const { data: project, isLoading, error, refetch } = useQuery({
     queryKey: ['project', id],
@@ -802,10 +965,27 @@ export default function ProjectDetail() {
 
       {/* Tab Content */}
       <div className="card p-6">
-        {activeTab === 'items' && <WorkItemsTab project={project} />}
+        {activeTab === 'items' && (
+          <WorkItemsTab
+            project={project}
+            onCreateItem={() => setShowCreatePanel(true)}
+            onEditItem={(item) => setEditingItem(item)}
+          />
+        )}
         {activeTab === 'knowledge' && <KnowledgeTab project={project} />}
         {activeTab === 'settings' && <SettingsTab project={project} />}
       </div>
+
+      {/* Work Item Slide-Over Panel (rendered at page level for proper fixed positioning) */}
+      <WorkItemSlideOver
+        isOpen={showCreatePanel || !!editingItem}
+        onClose={() => {
+          setShowCreatePanel(false);
+          setEditingItem(undefined);
+        }}
+        projectId={project.id}
+        item={editingItem}
+      />
     </div>
   );
 }

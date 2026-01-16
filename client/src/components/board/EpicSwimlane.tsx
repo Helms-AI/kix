@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { WorkItem, BoardColumn, BoardColumnInfo, EpicStats } from '../../types/project';
 import { BoardColumn as BoardColumnComponent } from './BoardColumn';
 import type { HierarchyInfo } from './KanbanBoard';
+import MarkdownViewer from '../MarkdownViewer';
 
 interface EpicSwimlaneProps {
   /** The Epic work item (null for unassigned swimlane) */
@@ -199,9 +200,7 @@ export function EpicSwimlane({
           {epicDescription && !isUnassigned && (
             <div className="px-4 pl-8 pb-3">
               <div className="p-3 bg-slate-800/30 rounded-lg border border-slate-700/30">
-                <p className="text-sm text-slate-300 whitespace-pre-wrap">
-                  {epicDescription}
-                </p>
+                <MarkdownViewer content={epicDescription} />
               </div>
             </div>
           )}
