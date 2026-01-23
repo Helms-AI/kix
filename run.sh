@@ -210,7 +210,7 @@ run_local_mode() {
     # Start unified server (API + MCP with shared store) in background
     echo ""
     echo "Starting unified server (API + MCP with shared KixStore)..."
-    $BINARY run --api-port 3001 --mcp-port 3002 &
+    $BINARY run --api-port 3001 --mcp-port 3002 --stdio &
     UNIFIED_PID=$!
 
     # Give server a moment to start
@@ -220,14 +220,15 @@ run_local_mode() {
     echo "Starting client dev server on port 3000..."
     echo ""
     echo "=== Services Running (Local - Unified Mode) ==="
-    echo "  Web UI:   http://localhost:3000"
-    echo "  API:      http://localhost:3001 (proxied via /api)"
-    echo "  Indexing: http://localhost:3001/api/indexing/* (with SSE)"
-    echo "  MCP:      http://localhost:3002/mcp (proxied via /mcp)"
-    echo "  Ollama:   http://localhost:11434"
+    echo "  Web UI:     http://localhost:3000"
+    echo "  API:        http://localhost:3001 (proxied via /api)"
+    echo "  Indexing:   http://localhost:3001/api/indexing/* (with SSE)"
+    echo "  MCP HTTP:   http://localhost:3002/mcp (proxied via /mcp)"
+    echo "  MCP stdio:  enabled (for IDE integration)"
+    echo "  Ollama:     http://localhost:11434"
     echo ""
-    echo "API and MCP servers share a single KixStore instance."
-    echo "Data indexed via MCP is immediately searchable via API."
+    echo "All servers share a single KixStore instance."
+    echo "Data indexed via any transport is immediately searchable."
     echo ""
     if [ "$ARCH" = "arm64" ]; then
         echo "GPU: Apple Silicon Metal acceleration enabled"

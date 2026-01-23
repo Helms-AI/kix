@@ -76,6 +76,10 @@ enum Commands {
         /// Host to bind to
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Enable MCP stdio transport (for IDE integration)
+        #[arg(long, default_value = "false")]
+        stdio: bool,
     },
 
     /// Test search from command line
@@ -152,8 +156,8 @@ async fn main() -> Result<()> {
         Commands::Serve => {
             run_serve(&db_path_str).await?;
         }
-        Commands::Run { api_port, mcp_port, host } => {
-            run_unified(&db_path_str, &host, api_port, mcp_port).await?;
+        Commands::Run { api_port, mcp_port, host, stdio } => {
+            run(&db_path_str, &host, api_port, mcp_port, stdio).await?;
         }
         Commands::Search {
             query,
@@ -441,7 +445,8 @@ async fn run_serve(db_path: &str) -> Result<()> {
 /// Start both API and MCP servers in a single process with shared stores.
 /// This is the recommended mode for single-node deployments as it ensures
 /// data indexed via MCP is immediately visible to API searches.
-async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) -> Result<()> {
+/// Optionally enables stdio transport for IDE integration.
+async fn run(db_path: &str, host: &str, api_port: u16, mcp_port: u16, enable_stdio: bool) -> Result<()> {
     info!("Starting unified server (API + MCP with shared store)...");
 
     // Initialize store - SINGLE SHARED INSTANCE
@@ -561,11 +566,37 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
     let explorer_router = create_explorer_router(explorer_state);
     let api_app = main_router.merge(indexing_router).merge(project_router).merge(explorer_router);
 
+    // Create stdio MCP server BEFORE HTTP closure moves the Arcs (if enabled)
+    let stdio_mcp_server = if enable_stdio {
+        Some(KixMcpServer::with_shared(
+            shared_store.clone(),
+            shared_embedder.clone(),
+            job_queue.clone(),
+        )
+        .with_project_store(shared_project_store.clone())
+        .with_event_bus(event_bus.clone()))
+    } else {
+        None
+    };
+
     // Create MCP server using the SAME shared store, embedder, and project store
     let mcp_server = KixMcpServer::with_shared(shared_store.clone(), shared_embedder, job_queue)
         .with_project_store(shared_project_store)
         .with_event_bus(event_bus);
     info!("MCP server initialized with project management enabled");
+
+    // Spawn stdio transport task if enabled
+    let stdio_handle = stdio_mcp_server.map(|server| {
+        tokio::spawn(async move {
+            info!("Starting MCP stdio transport...");
+            let transport = rmcp::transport::io::stdio();
+            let running = rmcp::serve_server(server, transport).await
+                .context("Failed to start stdio transport")?;
+            running.waiting().await.context("stdio transport error")?;
+            info!("MCP stdio transport closed");
+            Ok::<(), anyhow::Error>(())
+        })
+    });
 
     // Create the MCP streamable HTTP service
     let mcp_service = StreamableHttpService::new(
@@ -596,12 +627,15 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
     let mcp_listener = tokio::net::TcpListener::bind(mcp_addr).await?;
 
     println!("=== Unified Server (Shared Store) ===");
-    println!("  REST API:  http://{}", api_addr);
-    println!("  MCP:       http://{}/mcp", mcp_addr);
-    println!("");
-    println!("Both servers share a single KixStore instance.");
-    println!("Data indexed via MCP is immediately searchable via API.");
-    info!("Unified server started - API on {}, MCP on {}", api_addr, mcp_addr);
+    println!("  REST API:    http://{}", api_addr);
+    println!("  MCP HTTP:    http://{}/mcp", mcp_addr);
+    if enable_stdio {
+        println!("  MCP stdio:   enabled (reading from stdin)");
+    }
+    println!();
+    println!("All servers share a single KixStore instance.");
+    println!("Data indexed via any transport is immediately searchable.");
+    info!("Unified server started - API: {}, MCP HTTP: {}, stdio: {}", api_addr, mcp_addr, enable_stdio);
 
     // Create shutdown signal
     let shutdown = async {
@@ -611,7 +645,7 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
         info!("Shutting down unified server...");
     };
 
-    // Run both servers concurrently
+    // Run all servers concurrently
     tokio::select! {
         result = axum::serve(api_listener, api_app.into_make_service_with_connect_info::<SocketAddr>()) => {
             if let Err(e) = result {
@@ -620,7 +654,19 @@ async fn run_unified(db_path: &str, host: &str, api_port: u16, mcp_port: u16) ->
         }
         result = axum::serve(mcp_listener, mcp_app) => {
             if let Err(e) = result {
-                error!("MCP server error: {}", e);
+                error!("MCP HTTP server error: {}", e);
+            }
+        }
+        result = async {
+            match stdio_handle {
+                Some(handle) => handle.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            match result {
+                Ok(Ok(())) => info!("MCP stdio transport closed normally"),
+                Ok(Err(e)) => error!("MCP stdio transport error: {}", e),
+                Err(e) => error!("MCP stdio task panicked: {}", e),
             }
         }
         _ = shutdown => {

@@ -73,8 +73,10 @@ cargo test --manifest-path server/Cargo.toml -p kix-parser      # Run tests for 
 
 ### CLI Usage
 ```bash
-./server/target/release/kix api --api-port 3001 --mcp-port 3002 # Start REST API
-./server/target/release/kix serve                               # Start MCP server (HTTP)
+./server/target/release/kix run                                 # Start unified server (API + MCP HTTP)
+./server/target/release/kix run --stdio                         # Start unified server with stdio transport
+./server/target/release/kix run --api-port 3001 --mcp-port 3002 # Custom ports
+./server/target/release/kix serve                               # Start MCP server (stdio only, legacy)
 ./server/target/release/kix search "query" --limit 5            # CLI search
 ./server/target/release/kix stats                               # Show index statistics
 ```
@@ -457,11 +459,21 @@ Vite proxy configuration:
 
 ## Port Allocation
 
-| Service | Port |
-|---------|------|
-| Web UI  | 3000 |
-| REST API | 3001 |
-| MCP HTTP | 3002 |
+| Service | Port | Notes |
+|---------|------|-------|
+| Web UI  | 3000 | Vite dev server |
+| REST API | 3001 | Axum REST endpoints |
+| MCP HTTP | 3002 | Streamable HTTP transport |
+| MCP stdio | N/A | Enabled with `--stdio` flag |
+
+### MCP Transport Options
+
+KIX supports dual MCP transports for maximum compatibility:
+
+- **HTTP Transport** (default): Available at `http://localhost:3002/mcp` - best for web clients and remote connections
+- **stdio Transport** (opt-in): Enabled with `--stdio` flag - best for IDE integrations (Claude Desktop, direct binary integration)
+
+When using `./run.sh`, both transports are enabled automatically.
 
 ## New Features (Spider Migration)
 

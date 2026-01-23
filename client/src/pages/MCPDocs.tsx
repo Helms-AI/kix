@@ -23,6 +23,10 @@ import {
   MessageSquare,
   Bell,
   Globe,
+  Network,
+  CheckCircle2,
+  Server,
+  Layers,
 } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -30,16 +34,129 @@ import clsx from 'clsx';
 // DATA STRUCTURES
 // ============================================
 
-// Client configuration data for Installation tab
-const clients = [
+// Transport types
+type TransportType = 'http' | 'stdio' | 'both';
+
+// Transport support for each client
+interface TransportSupport {
+  supported: boolean;
+  recommended?: boolean;
+  note?: string;
+}
+
+interface ClientTransports {
+  http?: TransportSupport;
+  stdio?: TransportSupport;
+}
+
+// LucideIcon type alias
+type LucideIcon = React.ComponentType<{ className?: string }>;
+
+// Transport options data
+const transportOptions = [
+  {
+    id: 'unified' as const,
+    name: 'Unified',
+    subtitle: 'HTTP + stdio',
+    icon: Layers,
+    color: 'emerald',
+    description: 'Run both transports simultaneously',
+    command: './run.sh',
+    altCommand: 'kix run --stdio',
+    features: ['Web dashboard access', 'IDE integration', 'Full API + MCP'],
+    recommended: true,
+    ports: ['REST API: 3001', 'MCP HTTP: 3002', 'stdio: enabled'],
+  },
+  {
+    id: 'http' as const,
+    name: 'HTTP Only',
+    subtitle: 'Network transport',
+    icon: Globe,
+    color: 'cyan',
+    description: 'For web clients and remote connections',
+    command: 'kix run',
+    altCommand: 'kix run --api-port 3001 --mcp-port 3002',
+    features: ['Web browser clients', 'Remote connections', 'CORS support via proxy'],
+    recommended: false,
+    ports: ['REST API: 3001', 'MCP HTTP: 3002'],
+  },
+  {
+    id: 'stdio' as const,
+    name: 'stdio Only',
+    subtitle: 'Direct process',
+    icon: Terminal,
+    color: 'violet',
+    description: 'For desktop apps and CLI tools',
+    command: 'kix serve',
+    altCommand: null,
+    features: ['No network overhead', 'Direct IPC', 'Claude Desktop'],
+    recommended: false,
+    ports: ['stdio: stdin/stdout'],
+  },
+];
+
+// Client configuration data with multi-transport support
+interface ClientConfig {
+  id: string;
+  name: string;
+  icon: LucideIcon;
+  description: string;
+  transports: ClientTransports;
+  cliCommands?: {
+    http?: string;
+    stdio?: string;
+  };
+  configPath: string;
+  configPathAlt?: string;
+  configs: {
+    http?: string;
+    stdio?: string;
+  };
+  note?: string;
+}
+
+const clients: ClientConfig[] = [
+  {
+    id: 'claude-desktop',
+    name: 'Claude Desktop',
+    icon: Monitor,
+    description: 'Desktop application',
+    transports: {
+      stdio: { supported: true, recommended: true },
+    },
+    cliCommands: {
+      stdio: 'claude mcp add kix -- kix run --stdio',
+    },
+    configPath: '~/Library/Application Support/Claude/claude_desktop_config.json',
+    configPathAlt: '%APPDATA%\\Claude\\claude_desktop_config.json (Windows)',
+    configs: {
+      stdio: `{
+  "mcpServers": {
+    "kix": {
+      "command": "kix",
+      "args": ["run", "--stdio"]
+    }
+  }
+}`,
+    },
+    note: 'Requires stdio transport - direct process communication',
+  },
   {
     id: 'claude-code',
     name: 'Claude Code',
     icon: Terminal,
     description: 'Anthropic CLI tool',
-    cliCommand: 'claude mcp add kix --transport http http://localhost:3000/mcp',
+    transports: {
+      http: { supported: true, recommended: true, note: 'Best for remote connections' },
+      stdio: { supported: true, note: 'Best for direct binary integration' },
+    },
+    cliCommands: {
+      http: 'claude mcp add kix --transport http http://localhost:3000/mcp',
+      stdio: 'claude mcp add kix -- kix run --stdio',
+    },
     configPath: '~/.claude/settings.json',
-    config: `{
+    configs: {
+      http: `{
   "mcpServers": {
     "kix": {
       "type": "http",
@@ -47,71 +164,112 @@ const clients = [
     }
   }
 }`,
-  },
-  {
-    id: 'claude-desktop',
-    name: 'Claude Desktop',
-    icon: Monitor,
-    description: 'Desktop application',
-    cliCommand: 'claude mcp add kix -- kix serve',
-    configPath: '~/Library/Application Support/Claude/claude_desktop_config.json',
-    configPathAlt: '%APPDATA%\\Claude\\claude_desktop_config.json (Windows)',
-    config: `{
+      stdio: `{
   "mcpServers": {
     "kix": {
       "command": "kix",
-      "args": ["serve"]
+      "args": ["run", "--stdio"]
     }
   }
 }`,
-    note: 'Uses stdio transport for direct binary integration',
+    },
   },
   {
     id: 'cursor',
     name: 'Cursor',
     icon: Code2,
     description: 'AI-first code editor',
-    cliCommand: 'cursor --add-mcp kix http://localhost:3000/mcp',
+    transports: {
+      http: { supported: true, recommended: true },
+      stdio: { supported: true, note: 'Via command configuration' },
+    },
+    cliCommands: {
+      http: 'cursor --add-mcp kix http://localhost:3000/mcp',
+    },
     configPath: '.cursor/mcp.json',
-    config: `{
+    configs: {
+      http: `{
   "mcpServers": {
     "kix": {
       "url": "http://localhost:3000/mcp"
     }
   }
 }`,
+      stdio: `{
+  "mcpServers": {
+    "kix": {
+      "command": "kix",
+      "args": ["run", "--stdio"]
+    }
+  }
+}`,
+    },
   },
   {
     id: 'windsurf',
     name: 'Windsurf',
     icon: Sparkles,
     description: 'Codeium IDE',
-    cliCommand: 'windsurf --add-mcp kix http://localhost:3000/mcp',
+    transports: {
+      http: { supported: true, recommended: true },
+    },
+    cliCommands: {
+      http: 'windsurf --add-mcp kix http://localhost:3000/mcp',
+    },
     configPath: '~/.codeium/windsurf/mcp_config.json',
-    config: `{
+    configs: {
+      http: `{
   "mcpServers": {
     "kix": {
       "serverUrl": "http://localhost:3000/mcp"
     }
   }
 }`,
+    },
   },
   {
     id: 'vscode',
     name: 'VS Code',
     icon: Code2,
     description: 'With MCP extension',
+    transports: {
+      http: { supported: true, recommended: true },
+      stdio: { supported: true, note: 'Extension-dependent' },
+    },
     configPath: '.vscode/settings.json',
-    config: `{
+    configs: {
+      http: `{
   "mcp.servers": {
     "kix": {
       "url": "http://localhost:3000/mcp"
     }
   }
 }`,
+      stdio: `{
+  "mcp.servers": {
+    "kix": {
+      "command": "kix",
+      "args": ["run", "--stdio"]
+    }
+  }
+}`,
+    },
     note: 'Requires MCP extension to be installed',
   },
 ];
+
+// Helper to get primary transport for a client
+function getPrimaryTransport(transports: ClientTransports): 'http' | 'stdio' {
+  if (transports.http?.recommended) return 'http';
+  if (transports.stdio?.recommended) return 'stdio';
+  if (transports.http?.supported) return 'http';
+  return 'stdio';
+}
+
+// Helper to check if client supports multiple transports
+function hasMultipleTransports(transports: ClientTransports): boolean {
+  return !!(transports.http?.supported && transports.stdio?.supported);
+}
 
 // Tool categories for Installation tab
 const toolCategories = [
@@ -146,28 +304,42 @@ const toolCategories = [
   },
 ];
 
-// Troubleshooting items
+// Troubleshooting items - expanded with transport-specific issues
 const troubleshooting = [
   {
-    issue: 'Connection refused',
-    solution: 'Ensure KIX server is running. Start with ./run.sh or kix serve-http --port 3002',
+    issue: 'HTTP connection refused',
+    solution: 'Ensure KIX server is running: ./run.sh or kix run --api-port 3001 --mcp-port 3002',
+    transport: 'http',
   },
   {
-    issue: 'CORS errors',
+    issue: 'stdio transport not working',
+    solution: 'Verify kix binary is in PATH (which kix) and server started with --stdio flag',
+    transport: 'stdio',
+  },
+  {
+    issue: 'CORS errors in browser',
     solution: 'Use the proxied endpoint at port 3000 instead of direct connection to port 3002',
+    transport: 'http',
+  },
+  {
+    issue: 'Claude Desktop not connecting',
+    solution: 'Check config uses ["run", "--stdio"] args. Ensure kix binary is accessible.',
+    transport: 'stdio',
   },
   {
     issue: 'Tools not appearing',
-    solution: 'Restart your AI client after making configuration changes. Check config file syntax.',
+    solution: 'Restart your AI client after config changes. Verify JSON syntax is valid.',
+    transport: 'both',
   },
   {
-    issue: 'Slow responses',
-    solution: 'First request may be slow as embedding models initialize. Subsequent requests are faster.',
+    issue: 'Slow first response',
+    solution: 'Normal - embedding models initialize on first request. Subsequent calls are fast.',
+    transport: 'both',
   },
 ];
 
-// Agent tools for sub-tabs (subset of clients without Desktop)
-const agentTools = clients.filter(c => c.id !== 'claude-desktop');
+// Agent tools for sub-tabs (subset of clients without Desktop for HTTP-based agents)
+const agentTools = clients.filter(c => c.transports.http?.supported);
 
 // Agent content templates per tool
 const agentContent: Record<string, {
@@ -550,15 +722,6 @@ const hooksContent: Record<string, {
         "mode": "\${mode}",
         "timestamp": "\${timestamp}"
       }
-    },
-    "on_delete": {
-      "url": "https://your-server.com/hooks/kix/deleted",
-      "method": "POST",
-      "payload": {
-        "event": "delete",
-        "document_ids": "\${deleted_ids}",
-        "timestamp": "\${timestamp}"
-      }
     }
   }
 }`,
@@ -605,11 +768,6 @@ const hooksContent: Record<string, {
       "enabled": true,
       "type": "progress",
       "show_percentage": true
-    },
-    "error": {
-      "enabled": true,
-      "type": "error",
-      "duration": 5000
     }
   }
 }`,
@@ -648,10 +806,6 @@ const hooksContent: Record<string, {
     "kix:search_complete": {
       "action": "update_context_panel",
       "show_sources": true
-    },
-    "kix:error": {
-      "action": "show_error_panel",
-      "offer_retry": true
     }
   }
 }`,
@@ -672,10 +826,6 @@ const hooksContent: Record<string, {
       "pattern": "**/*.{ts,tsx,js,jsx,py}",
       "action": "search_related_docs",
       "show_in_sidebar": true
-    },
-    "onCommand:kix.search": {
-      "action": "open_search_panel",
-      "focus": true
     }
   }
 }`,
@@ -692,14 +842,6 @@ const hooksContent: Record<string, {
     "kix.searchComplete": {
       "handler": "updateWebviewPanel",
       "panel": "kixResults"
-    },
-    "kix.crawlProgress": {
-      "handler": "updateStatusBarItem",
-      "showPercentage": true
-    },
-    "kix.error": {
-      "handler": "showErrorMessage",
-      "args": ["KIX Error: \${error.message}"]
     }
   }
 }`,
@@ -711,8 +853,151 @@ const hooksContent: Record<string, {
 // COMPONENTS
 // ============================================
 
+// Transport badge component
+function TransportBadge({
+  transport,
+  size = 'sm',
+  recommended = false,
+  showLabel = true,
+}: {
+  transport: TransportType;
+  size?: 'sm' | 'md';
+  recommended?: boolean;
+  showLabel?: boolean;
+}) {
+  const config = {
+    http: { label: 'HTTP', color: 'cyan', icon: Globe },
+    stdio: { label: 'stdio', color: 'violet', icon: Terminal },
+    both: { label: 'Both', color: 'emerald', icon: Layers },
+  }[transport];
+
+  const Icon = config.icon;
+
+  // Visual hierarchy: solid style for recommended, outline for alternative
+  if (recommended) {
+    return (
+      <span
+        className={clsx(
+          'inline-flex items-center gap-1 font-medium rounded-full border',
+          size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1 text-sm',
+          config.color === 'cyan' && 'bg-cyan-500/20 border-cyan-500/30 text-cyan-300',
+          config.color === 'violet' && 'bg-violet-500/20 border-violet-500/30 text-violet-300',
+          config.color === 'emerald' && 'bg-emerald-500/20 border-emerald-500/30 text-emerald-300'
+        )}
+      >
+        <Icon className={size === 'sm' ? 'w-3 h-3' : 'w-3.5 h-3.5'} />
+        {showLabel && config.label}
+        <span className="text-[10px] opacity-70">★</span>
+      </span>
+    );
+  }
+
+  // Alternative transport: outline style with muted colors
+  return (
+    <span
+      className={clsx(
+        'inline-flex items-center gap-1 font-medium rounded-full border bg-transparent',
+        size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1 text-sm',
+        config.color === 'cyan' && 'border-cyan-500/20 text-cyan-400/70 hover:border-cyan-500/40',
+        config.color === 'violet' && 'border-violet-500/20 text-violet-400/70 hover:border-violet-500/40',
+        config.color === 'emerald' && 'border-emerald-500/20 text-emerald-400/70 hover:border-emerald-500/40'
+      )}
+    >
+      <Icon className={size === 'sm' ? 'w-3 h-3' : 'w-3.5 h-3.5'} />
+      {showLabel && config.label}
+    </span>
+  );
+}
+
+// Component to display all transport badges for a client
+function ClientTransportBadges({
+  transports,
+  size = 'sm',
+}: {
+  transports: ClientTransports;
+  size?: 'sm' | 'md';
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      {transports.http?.supported && (
+        <TransportBadge
+          transport="http"
+          size={size}
+          recommended={transports.http.recommended}
+        />
+      )}
+      {transports.stdio?.supported && (
+        <TransportBadge
+          transport="stdio"
+          size={size}
+          recommended={transports.stdio.recommended}
+        />
+      )}
+    </div>
+  );
+}
+
+// Transport config switcher for clients with multiple transports
+function TransportConfigSwitcher({
+  client,
+  selectedTransport,
+  onTransportChange,
+}: {
+  client: ClientConfig;
+  selectedTransport: 'http' | 'stdio';
+  onTransportChange: (transport: 'http' | 'stdio') => void;
+}) {
+  const hasMultiple = hasMultipleTransports(client.transports);
+
+  if (!hasMultiple) {
+    return null;
+  }
+
+  return (
+    <div className="flex items-center gap-4 p-3 bg-slate-800/50 rounded-lg border border-slate-700/50">
+      <span className="text-sm text-slate-400">Transport:</span>
+      <div className="flex gap-2">
+        {client.transports.http?.supported && (
+          <button
+            onClick={() => onTransportChange('http')}
+            className={clsx(
+              'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-all',
+              selectedTransport === 'http'
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                : 'text-slate-400 hover:text-slate-300 border border-transparent hover:border-slate-700'
+            )}
+          >
+            <Globe className="w-3.5 h-3.5" />
+            HTTP
+            {client.transports.http.recommended && (
+              <span className="text-[10px] text-cyan-400/70">★ Recommended</span>
+            )}
+          </button>
+        )}
+        {client.transports.stdio?.supported && (
+          <button
+            onClick={() => onTransportChange('stdio')}
+            className={clsx(
+              'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-all',
+              selectedTransport === 'stdio'
+                ? 'bg-violet-500/20 text-violet-300 border border-violet-500/40'
+                : 'text-slate-400 hover:text-slate-300 border border-transparent hover:border-slate-700'
+            )}
+          >
+            <Terminal className="w-3.5 h-3.5" />
+            stdio
+            {client.transports.stdio.recommended && (
+              <span className="text-[10px] text-violet-400/70">★ Recommended</span>
+            )}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Code block component with copy functionality
-function CodeBlock({ code, filename }: { code: string; filename?: string }) {
+function CodeBlock({ code, filename, compact = false }: { code: string; filename?: string; compact?: boolean }) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
@@ -721,7 +1006,6 @@ function CodeBlock({ code, filename }: { code: string; filename?: string }) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // Fallback for older browsers
       const textarea = document.createElement('textarea');
       textarea.value = code;
       document.body.appendChild(textarea);
@@ -748,7 +1032,7 @@ function CodeBlock({ code, filename }: { code: string; filename?: string }) {
         <button
           onClick={handleCopy}
           className={clsx(
-            'absolute top-3 right-3 p-2 rounded-lg transition-all duration-200',
+            'absolute top-2 right-2 p-1.5 rounded-md transition-all duration-200',
             'opacity-0 group-hover:opacity-100 focus:opacity-100',
             copied
               ? 'bg-emerald-500/20 text-emerald-400'
@@ -756,27 +1040,32 @@ function CodeBlock({ code, filename }: { code: string; filename?: string }) {
           )}
           title={copied ? 'Copied!' : 'Copy to clipboard'}
         >
-          {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+          {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
         </button>
-        <pre className="p-4 overflow-x-auto max-h-96">
-          <code className="text-sm font-mono text-slate-300 leading-relaxed whitespace-pre-wrap">{code}</code>
+        <pre className={clsx('overflow-x-auto', compact ? 'p-3' : 'p-4', !compact && 'max-h-96')}>
+          <code className={clsx(
+            'font-mono text-slate-300 leading-relaxed whitespace-pre-wrap',
+            compact ? 'text-xs' : 'text-sm'
+          )}>{code}</code>
         </pre>
       </div>
     </div>
   );
 }
 
-// Client/Tool tab component
+// Client/Tool tab component with optional transport badge
 function TabButton({
   name,
   icon: Icon,
   isActive,
   onClick,
+  transports,
 }: {
   name: string;
   icon: React.ComponentType<{ className?: string }>;
   isActive: boolean;
   onClick: () => void;
+  transports?: ClientTransports;
 }) {
   return (
     <button
@@ -784,7 +1073,7 @@ function TabButton({
       role="tab"
       aria-selected={isActive}
       className={clsx(
-        'flex items-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm transition-all duration-200',
+        'flex items-center gap-2 px-3 py-2 rounded-lg font-medium text-sm transition-all duration-200',
         isActive
           ? 'bg-cyan-600 text-white shadow-lg shadow-cyan-500/20'
           : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
@@ -792,6 +1081,9 @@ function TabButton({
     >
       <Icon className="w-4 h-4" />
       <span className="hidden sm:inline">{name}</span>
+      {transports && !isActive && (
+        <ClientTransportBadges transports={transports} size="sm" />
+      )}
     </button>
   );
 }
@@ -826,16 +1118,21 @@ function ContentCard({
 }) {
   return (
     <div className={clsx(
-      'p-6',
-      variant === 'agent' ? 'admin-card-agent' : 'admin-card-hook'
+      'p-6 rounded-xl border',
+      variant === 'agent'
+        ? 'bg-gradient-to-br from-violet-500/5 to-transparent border-violet-500/20'
+        : 'bg-gradient-to-br from-amber-500/5 to-transparent border-amber-500/20'
     )}>
       <div className="relative z-10">
         <div className="flex items-start gap-4 mb-4">
           <div className={clsx(
-            variant === 'agent' ? 'content-card-icon-agent' : 'content-card-icon-hook'
+            'p-2 rounded-lg border',
+            variant === 'agent'
+              ? 'bg-violet-500/10 border-violet-500/20'
+              : 'bg-amber-500/10 border-amber-500/20'
           )}>
             <Icon className={clsx(
-              'w-6 h-6',
+              'w-5 h-5',
               variant === 'agent' ? 'text-violet-400' : 'text-amber-400'
             )} />
           </div>
@@ -881,8 +1178,10 @@ function MainTabNav({
             id={`tab-${tab.id}`}
             onClick={() => onTabChange(tab.id)}
             className={clsx(
-              'admin-tab admin-tab-with-icon',
-              activeTab === tab.id && 'admin-tab-active'
+              'flex items-center gap-2 px-4 py-2.5 rounded-lg font-medium text-sm transition-all duration-200',
+              activeTab === tab.id
+                ? 'bg-slate-700 text-white'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
             )}
           >
             <Icon className="w-4 h-4" />
@@ -894,66 +1193,213 @@ function MainTabNav({
   );
 }
 
+// Transport Option Card Component
+function TransportCard({
+  option,
+  isSelected,
+  onSelect,
+}: {
+  option: typeof transportOptions[number];
+  isSelected: boolean;
+  onSelect: () => void;
+}) {
+  const Icon = option.icon;
+  const colorClasses = {
+    emerald: {
+      bg: 'from-emerald-500/10 to-emerald-500/5',
+      border: isSelected ? 'border-emerald-500/50 ring-2 ring-emerald-500/20' : 'border-emerald-500/20 hover:border-emerald-500/40',
+      icon: 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400',
+      badge: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+    },
+    cyan: {
+      bg: 'from-cyan-500/10 to-cyan-500/5',
+      border: isSelected ? 'border-cyan-500/50 ring-2 ring-cyan-500/20' : 'border-cyan-500/20 hover:border-cyan-500/40',
+      icon: 'bg-cyan-500/10 border-cyan-500/20 text-cyan-400',
+      badge: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+    },
+    violet: {
+      bg: 'from-violet-500/10 to-violet-500/5',
+      border: isSelected ? 'border-violet-500/50 ring-2 ring-violet-500/20' : 'border-violet-500/20 hover:border-violet-500/40',
+      icon: 'bg-violet-500/10 border-violet-500/20 text-violet-400',
+      badge: 'bg-violet-500/20 text-violet-400 border-violet-500/30',
+    },
+  }[option.color as 'emerald' | 'cyan' | 'violet'];
+
+  return (
+    <button
+      onClick={onSelect}
+      className={clsx(
+        'relative p-5 rounded-xl border text-left transition-all duration-200',
+        'bg-gradient-to-br',
+        colorClasses.bg,
+        colorClasses.border
+      )}
+    >
+      {option.recommended && (
+        <span className="absolute -top-2.5 left-4 px-2 py-0.5 text-xs font-medium rounded-full bg-emerald-500 text-white">
+          Recommended
+        </span>
+      )}
+
+      <div className="flex items-start gap-3 mb-3">
+        <div className={clsx('p-2 rounded-lg border', colorClasses.icon)}>
+          <Icon className="w-5 h-5" />
+        </div>
+        <div>
+          <h3 className="font-semibold text-white">{option.name}</h3>
+          <p className="text-xs text-slate-400">{option.subtitle}</p>
+        </div>
+        {isSelected && (
+          <CheckCircle2 className="w-5 h-5 text-emerald-400 ml-auto" />
+        )}
+      </div>
+
+      <p className="text-sm text-slate-400 mb-3">{option.description}</p>
+
+      <div className="space-y-1.5">
+        {option.features.map((feature, idx) => (
+          <div key={idx} className="flex items-center gap-2 text-xs text-slate-500">
+            <ChevronRight className="w-3 h-3" />
+            <span>{feature}</span>
+          </div>
+        ))}
+      </div>
+    </button>
+  );
+}
+
+// Quick Start Tabbed Section
+function QuickStartSection({ selectedTransport }: { selectedTransport: typeof transportOptions[number]['id'] }) {
+  const option = transportOptions.find(o => o.id === selectedTransport) || transportOptions[0];
+
+  return (
+    <section className="card p-6">
+      <div className="flex items-center gap-3 mb-6">
+        <div className="p-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+          <Zap className="w-5 h-5 text-amber-400" />
+        </div>
+        <div>
+          <h2 className="text-xl font-semibold text-white">Quick Start</h2>
+          <p className="text-sm text-slate-400">Get KIX running in seconds</p>
+        </div>
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        {/* Command */}
+        <div>
+          <h3 className="text-sm font-medium text-slate-300 mb-3 flex items-center gap-2">
+            <span className="flex items-center justify-center w-5 h-5 rounded-full bg-slate-700 text-xs text-slate-300">1</span>
+            Start the server
+          </h3>
+          <CodeBlock code={option.command} compact />
+          {option.altCommand && (
+            <p className="text-xs text-slate-500 mt-2">
+              Or: <code className="text-cyan-400/80">{option.altCommand}</code>
+            </p>
+          )}
+        </div>
+
+        {/* Running Services */}
+        <div>
+          <h3 className="text-sm font-medium text-slate-300 mb-3 flex items-center gap-2">
+            <span className="flex items-center justify-center w-5 h-5 rounded-full bg-slate-700 text-xs text-slate-300">2</span>
+            Services running
+          </h3>
+          <div className="p-4 rounded-lg bg-slate-900/80 border border-slate-700/50 space-y-2">
+            {option.ports.map((port, idx) => (
+              <div key={idx} className="flex items-center gap-2">
+                <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <code className="text-xs font-mono text-slate-300">{port}</code>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* MCP Endpoint */}
+      {selectedTransport !== 'stdio' && (
+        <div className="mt-6 p-4 rounded-lg bg-slate-800/50 border border-slate-700/30">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-slate-300">MCP HTTP Endpoint</p>
+              <code className="text-sm font-mono text-cyan-400">http://localhost:3000/mcp</code>
+            </div>
+            <span className="px-2 py-0.5 text-xs rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+              via proxy
+            </span>
+          </div>
+          <p className="text-xs text-slate-500 mt-2">
+            Uses web server proxy for CORS handling. Direct: <code className="text-slate-400">http://localhost:3002/mcp</code>
+          </p>
+        </div>
+      )}
+    </section>
+  );
+}
+
 // Installation Tab Content
-function InstallationTab({ activeClient, onClientChange }: {
+function InstallationTab({
+  activeClient,
+  onClientChange,
+  selectedTransport,
+  onTransportChange,
+  configTransport,
+  onConfigTransportChange,
+}: {
   activeClient: string;
   onClientChange: (client: string) => void;
+  selectedTransport: typeof transportOptions[number]['id'];
+  onTransportChange: (transport: typeof transportOptions[number]['id']) => void;
+  configTransport: Record<string, 'http' | 'stdio'>;
+  onConfigTransportChange: (clientId: string, transport: 'http' | 'stdio') => void;
 }) {
   const selectedClient = clients.find((c) => c.id === activeClient) || clients[0];
+  const currentTransport = configTransport[selectedClient.id] || getPrimaryTransport(selectedClient.transports);
+
+  // Filter troubleshooting based on selected transport
+  const filteredTroubleshooting = troubleshooting.filter(
+    t => t.transport === 'both' || t.transport === selectedTransport || selectedTransport === 'unified'
+  );
 
   return (
     <div className="space-y-8">
-      {/* Quick Start Section */}
+      {/* Transport Selection */}
       <section className="card p-6">
         <div className="flex items-center gap-3 mb-6">
-          <div className="p-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
-            <Zap className="w-5 h-5 text-amber-400" />
+          <div className="p-2 rounded-lg bg-teal-500/10 border border-teal-500/20">
+            <Network className="w-5 h-5 text-teal-400" />
           </div>
-          <h2 className="text-xl font-semibold text-white">Quick Start</h2>
+          <div>
+            <h2 className="text-xl font-semibold text-white">Choose Transport</h2>
+            <p className="text-sm text-slate-400">Select how clients connect to KIX</p>
+          </div>
         </div>
 
-        <div className="grid gap-6 md:grid-cols-2">
-          <div>
-            <h3 className="text-sm font-medium text-slate-300 mb-3 flex items-center gap-2">
-              <span className="flex items-center justify-center w-5 h-5 rounded-full bg-slate-700 text-xs text-slate-300">1</span>
-              Start the KIX server
-            </h3>
-            <CodeBlock code="./run.sh" />
-            <p className="text-xs text-slate-500 mt-2">
-              Or manually: <code className="text-cyan-400/80">kix serve-http --port 3002</code>
-            </p>
-          </div>
-
-          <div>
-            <h3 className="text-sm font-medium text-slate-300 mb-3 flex items-center gap-2">
-              <span className="flex items-center justify-center w-5 h-5 rounded-full bg-slate-700 text-xs text-slate-300">2</span>
-              MCP Endpoint
-            </h3>
-            <div className="p-4 rounded-lg bg-slate-900/80 border border-slate-700/50">
-              <div className="flex items-center justify-between">
-                <code className="text-sm font-mono text-cyan-400">http://localhost:3000/mcp</code>
-                <span className="px-2 py-0.5 text-xs rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
-                  recommended
-                </span>
-              </div>
-              <p className="text-xs text-slate-500 mt-2">
-                Uses the web server proxy for CORS handling
-              </p>
-            </div>
-          </div>
+        <div className="grid gap-4 md:grid-cols-3">
+          {transportOptions.map((option) => (
+            <TransportCard
+              key={option.id}
+              option={option}
+              isSelected={selectedTransport === option.id}
+              onSelect={() => onTransportChange(option.id)}
+            />
+          ))}
         </div>
       </section>
+
+      {/* Quick Start */}
+      <QuickStartSection selectedTransport={selectedTransport} />
 
       {/* Client Configuration Section */}
       <section className="card p-6">
         <div className="flex items-center gap-3 mb-6">
           <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
-            <Terminal className="w-5 h-5 text-cyan-400" />
+            <Server className="w-5 h-5 text-cyan-400" />
           </div>
           <h2 className="text-xl font-semibold text-white">Client Configuration</h2>
         </div>
 
-        {/* Client tabs */}
+        {/* Client tabs with transport badges */}
         <div className="flex flex-wrap gap-2 mb-6 p-1 bg-slate-800/30 rounded-xl border border-slate-700/30" role="tablist">
           {clients.map((client) => (
             <TabButton
@@ -962,6 +1408,7 @@ function InstallationTab({ activeClient, onClientChange }: {
               icon={client.icon}
               isActive={activeClient === client.id}
               onClick={() => onClientChange(client.id)}
+              transports={client.transports}
             />
           ))}
         </div>
@@ -969,37 +1416,74 @@ function InstallationTab({ activeClient, onClientChange }: {
         {/* Selected client config */}
         <div className="space-y-4">
           <div className="flex items-start justify-between">
-            <div>
-              <h3 className="text-lg font-medium text-white flex items-center gap-2">
-                {(() => {
-                  const Icon = selectedClient.icon;
-                  return <Icon className="w-5 h-5 text-cyan-400" />;
-                })()}
-                {selectedClient.name}
-              </h3>
-              <p className="text-sm text-slate-400">{selectedClient.description}</p>
+            <div className="flex items-center gap-3">
+              {(() => {
+                const Icon = selectedClient.icon;
+                return (
+                  <div className="p-2 rounded-lg bg-slate-800 border border-slate-700">
+                    <Icon className="w-5 h-5 text-cyan-400" />
+                  </div>
+                );
+              })()}
+              <div>
+                <h3 className="text-lg font-medium text-white flex items-center gap-2">
+                  {selectedClient.name}
+                  <ClientTransportBadges transports={selectedClient.transports} size="sm" />
+                </h3>
+                <p className="text-sm text-slate-400">{selectedClient.description}</p>
+              </div>
             </div>
           </div>
 
+          {/* Transport switcher for multi-transport clients */}
+          <TransportConfigSwitcher
+            client={selectedClient}
+            selectedTransport={currentTransport}
+            onTransportChange={(transport) => onConfigTransportChange(selectedClient.id, transport)}
+          />
+
+          {/* Transport-specific note */}
+          {selectedClient.transports[currentTransport]?.note && (
+            <p className="text-xs text-slate-500 italic flex items-center gap-1">
+              <ChevronRight className="w-3 h-3" />
+              {selectedClient.transports[currentTransport]?.note}
+            </p>
+          )}
+
+          {/* stdio requirement warning for stdio-only clients */}
+          {!selectedClient.transports.http?.supported && selectedClient.transports.stdio?.supported && (
+            <div className="flex items-start gap-3 p-4 rounded-lg bg-violet-500/10 border border-violet-500/20">
+              <Terminal className="w-5 h-5 text-violet-400 flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-medium text-violet-300">stdio Transport Required</p>
+                <p className="text-sm text-violet-400/80 mt-1">
+                  Server must be started with <code className="bg-violet-500/20 px-1 rounded">--stdio</code> flag
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* CLI Command Option */}
-          {selectedClient.cliCommand && (
+          {selectedClient.cliCommands?.[currentTransport] && (
             <div className="space-y-2">
               <h4 className="text-sm font-medium text-slate-300 flex items-center gap-2">
                 <Terminal className="w-4 h-4 text-emerald-400" />
                 Quick Add (CLI)
               </h4>
-              <CodeBlock code={selectedClient.cliCommand} />
+              <CodeBlock code={selectedClient.cliCommands[currentTransport]!} compact />
             </div>
           )}
 
           {/* Manual Configuration */}
-          <div className="space-y-2">
-            <h4 className="text-sm font-medium text-slate-300 flex items-center gap-2">
-              <Code2 className="w-4 h-4 text-cyan-400" />
-              Manual Configuration
-            </h4>
-            <CodeBlock code={selectedClient.config} filename={selectedClient.configPath} />
-          </div>
+          {selectedClient.configs[currentTransport] && (
+            <div className="space-y-2">
+              <h4 className="text-sm font-medium text-slate-300 flex items-center gap-2">
+                <Code2 className="w-4 h-4 text-cyan-400" />
+                Configuration File
+              </h4>
+              <CodeBlock code={selectedClient.configs[currentTransport]!} filename={selectedClient.configPath} />
+            </div>
+          )}
 
           {selectedClient.configPathAlt && (
             <p className="text-xs text-slate-500 flex items-center gap-1">
@@ -1009,9 +1493,9 @@ function InstallationTab({ activeClient, onClientChange }: {
           )}
 
           {selectedClient.note && (
-            <div className="flex items-start gap-2 p-3 rounded-lg bg-violet-500/10 border border-violet-500/20">
-              <AlertCircle className="w-4 h-4 text-violet-400 flex-shrink-0 mt-0.5" />
-              <p className="text-sm text-violet-300">{selectedClient.note}</p>
+            <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
+              <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+              <p className="text-sm text-amber-300">{selectedClient.note}</p>
             </div>
           )}
         </div>
@@ -1027,7 +1511,7 @@ function InstallationTab({ activeClient, onClientChange }: {
           <span className="ml-auto text-sm text-slate-500">8 tools</span>
         </div>
 
-        <div className="space-y-8">
+        <div className="space-y-6">
           {toolCategories.map((category) => {
             const Icon = category.icon;
             const colorClasses = {
@@ -1038,7 +1522,7 @@ function InstallationTab({ activeClient, onClientChange }: {
 
             return (
               <div key={category.name}>
-                <div className="flex items-center gap-2 mb-4">
+                <div className="flex items-center gap-2 mb-3">
                   <div className={clsx('p-1.5 rounded-lg border', colorClasses)}>
                     <Icon className="w-4 h-4" />
                   </div>
@@ -1065,13 +1549,18 @@ function InstallationTab({ activeClient, onClientChange }: {
           <h2 className="text-xl font-semibold text-white">Troubleshooting</h2>
         </div>
 
-        <div className="grid gap-4 sm:grid-cols-2">
-          {troubleshooting.map((item, index) => (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {filteredTroubleshooting.map((item, index) => (
             <div
               key={index}
               className="p-4 rounded-lg bg-slate-800/30 border border-slate-700/30"
             >
-              <h4 className="font-medium text-white text-sm mb-2">{item.issue}</h4>
+              <div className="flex items-center gap-2 mb-2">
+                <h4 className="font-medium text-white text-sm">{item.issue}</h4>
+                {item.transport !== 'both' && (
+                  <TransportBadge transport={item.transport as TransportType} size="sm" />
+                )}
+              </div>
               <p className="text-sm text-slate-400 leading-relaxed">{item.solution}</p>
             </div>
           ))}
@@ -1138,7 +1627,7 @@ function AgentsTab({ activeTool, onToolChange }: {
       </div>
 
       {/* Content cards */}
-      <div className="grid gap-6 lg:grid-cols-1">
+      <div className="grid gap-6">
         <ContentCard
           title={content.claudeMd.title}
           description={content.claudeMd.description}
@@ -1206,7 +1695,7 @@ function HooksTab({ activeTool, onToolChange }: {
       </div>
 
       {/* Content cards */}
-      <div className="grid gap-6 lg:grid-cols-1">
+      <div className="grid gap-6">
         <ContentCard
           title={content.claudeHooks.title}
           description={content.claudeHooks.description}
@@ -1238,16 +1727,36 @@ export default function MCPDocs() {
 
   // Get active states from URL params
   const activeMainTab = (searchParams.get('tab') as 'installation' | 'agents' | 'hooks') || 'installation';
-  const activeClient = searchParams.get('client') || 'claude-code';
+  const activeClient = searchParams.get('client') || 'claude-desktop';
+  const selectedTransport = (searchParams.get('transport') as typeof transportOptions[number]['id']) || 'unified';
 
-  // Update URL when tab changes
+  // Config transport state - tracks which transport config to show for each client
+  const [configTransport, setConfigTransport] = useState<Record<string, 'http' | 'stdio'>>(() => {
+    // Initialize with recommended transport for each client
+    const initial: Record<string, 'http' | 'stdio'> = {};
+    clients.forEach(client => {
+      initial[client.id] = getPrimaryTransport(client.transports);
+    });
+    return initial;
+  });
+
+  // Update URL when states change
   const setActiveMainTab = useCallback((tab: 'installation' | 'agents' | 'hooks') => {
-    setSearchParams({ tab, client: activeClient });
-  }, [activeClient, setSearchParams]);
+    setSearchParams({ tab, client: activeClient, transport: selectedTransport });
+  }, [activeClient, selectedTransport, setSearchParams]);
 
   const setActiveClient = useCallback((client: string) => {
-    setSearchParams({ tab: activeMainTab, client });
-  }, [activeMainTab, setSearchParams]);
+    setSearchParams({ tab: activeMainTab, client, transport: selectedTransport });
+  }, [activeMainTab, selectedTransport, setSearchParams]);
+
+  const setSelectedTransport = useCallback((transport: typeof transportOptions[number]['id']) => {
+    setSearchParams({ tab: activeMainTab, client: activeClient, transport });
+  }, [activeMainTab, activeClient, setSearchParams]);
+
+  // Update config transport for a specific client
+  const handleConfigTransportChange = useCallback((clientId: string, transport: 'http' | 'stdio') => {
+    setConfigTransport(prev => ({ ...prev, [clientId]: transport }));
+  }, []);
 
   return (
     <div className="space-y-8 pb-12">
@@ -1256,38 +1765,41 @@ export default function MCPDocs() {
         {/* Decorative background elements */}
         <div className="absolute inset-0 overflow-hidden pointer-events-none">
           <div className="absolute top-0 right-0 w-96 h-96 bg-cyan-500/5 rounded-full blur-3xl" />
-          <div className="absolute bottom-0 left-0 w-64 h-64 bg-teal-500/5 rounded-full blur-3xl" />
+          <div className="absolute bottom-0 left-0 w-64 h-64 bg-violet-500/5 rounded-full blur-3xl" />
         </div>
 
         <div className="relative">
-          <div className="flex items-center gap-3 mb-4">
+          <div className="flex items-center gap-4 mb-4">
             <div className="p-3 rounded-xl bg-gradient-to-br from-cyan-500/20 to-teal-500/20 border border-cyan-500/20">
               <Plug2 className="w-8 h-8 text-cyan-400" />
             </div>
             <div>
-              <h1 className="text-4xl font-bold text-white">MCP Integration</h1>
-              <p className="text-slate-400 mt-1">Model Context Protocol</p>
+              <h1 className="text-3xl font-bold text-white">MCP Integration</h1>
+              <p className="text-slate-400">Model Context Protocol</p>
             </div>
           </div>
 
           <p className="text-lg text-slate-300 max-w-2xl leading-relaxed">
             Connect your AI assistant to KIX for semantic search and knowledge management.
-            MCP enables AI tools to query your indexed content using natural language.
           </p>
 
           {/* Quick stats */}
-          <div className="flex flex-wrap gap-6 mt-6">
-            <div className="flex items-center gap-2 text-sm">
+          <div className="flex flex-wrap gap-4 mt-5">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/50 border border-slate-700/50 text-sm">
               <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-slate-400">8 tools available</span>
+              <span className="text-slate-300">8 tools</span>
             </div>
-            <div className="flex items-center gap-2 text-sm">
-              <div className="w-2 h-2 rounded-full bg-cyan-400" />
-              <span className="text-slate-400">HTTP & stdio transports</span>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/50 border border-slate-700/50 text-sm">
+              <Globe className="w-3.5 h-3.5 text-cyan-400" />
+              <span className="text-slate-300">HTTP transport</span>
             </div>
-            <div className="flex items-center gap-2 text-sm">
-              <div className="w-2 h-2 rounded-full bg-violet-400" />
-              <span className="text-slate-400">Hybrid search (vector + FTS)</span>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/50 border border-slate-700/50 text-sm">
+              <Terminal className="w-3.5 h-3.5 text-violet-400" />
+              <span className="text-slate-300">stdio transport</span>
+            </div>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/50 border border-slate-700/50 text-sm">
+              <Search className="w-3.5 h-3.5 text-amber-400" />
+              <span className="text-slate-300">Hybrid search</span>
             </div>
           </div>
         </div>
@@ -1307,6 +1819,10 @@ export default function MCPDocs() {
           <InstallationTab
             activeClient={activeClient}
             onClientChange={setActiveClient}
+            selectedTransport={selectedTransport}
+            onTransportChange={setSelectedTransport}
+            configTransport={configTransport}
+            onConfigTransportChange={handleConfigTransportChange}
           />
         )}
         {activeMainTab === 'agents' && (
