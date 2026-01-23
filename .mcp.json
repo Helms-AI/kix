@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "kix": {
+      "type": "stdio",
+      "command": "./server/target/release/kix",
+      "args": ["run", "--stdio"],
+      "env": {}
+    }
+  }
+}
